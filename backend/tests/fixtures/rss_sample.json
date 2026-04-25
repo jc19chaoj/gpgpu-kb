@@ -1,0 +1,48 @@
+{
+  "valid_feed": {
+    "bozo": false,
+    "bozo_exception": null,
+    "entries": [
+      {
+        "title": "Understanding GPU Memory Hierarchies",
+        "link": "https://example-blog.com/gpu-memory",
+        "author": "Jane Dev",
+        "summary": "A deep dive into L1/L2 cache behavior on modern GPUs and its impact on kernel performance.",
+        "published_parsed": [2026, 4, 25, 10, 0, 0, 4, 115, 0],
+        "tags": []
+      },
+      {
+        "title": "Triton vs CUDA: Productivity Tradeoffs",
+        "link": "https://example-blog.com/triton-vs-cuda",
+        "author": "John Dev",
+        "summary": "Comparing Triton and CUDA for writing custom kernels for ML workloads.",
+        "published_parsed": [2026, 4, 25, 8, 0, 0, 4, 115, 0],
+        "tags": []
+      }
+    ]
+  },
+  "old_feed": {
+    "bozo": false,
+    "bozo_exception": null,
+    "entries": [
+      {
+        "title": "Old Post Outside Cutoff",
+        "link": "https://example-blog.com/old-post",
+        "author": "Old Author",
+        "summary": "This post is older than the cutoff.",
+        "published_parsed": [2026, 4, 10, 10, 0, 0, 4, 100, 0],
+        "tags": []
+      }
+    ]
+  },
+  "malformed_feed": {
+    "bozo": true,
+    "bozo_exception": "URLError: connection refused",
+    "entries": []
+  },
+  "empty_feed": {
+    "bozo": false,
+    "bozo_exception": null,
+    "entries": []
+  }
+}

@@ -1,0 +1,29 @@
+[
+  {
+    "entry_id": "https://arxiv.org/abs/2401.00001",
+    "title": "Fast CUDA Kernels for Transformer Attention",
+    "summary": "We present optimized CUDA kernels for multi-head attention that achieve 2x speedup over baseline implementations on H100 GPUs.",
+    "authors": ["Alice Smith", "Bob Jones"],
+    "categories": ["cs.LG", "cs.AR"],
+    "pdf_url": "https://arxiv.org/pdf/2401.00001",
+    "published_offset_days": 0
+  },
+  {
+    "entry_id": "https://arxiv.org/abs/2401.00002",
+    "title": "Quantization Techniques for Large Language Models",
+    "summary": "This paper surveys quantization methods for LLMs, covering INT4 and FP8 formats with benchmarks on modern accelerators.",
+    "authors": ["Carol White"],
+    "categories": ["cs.CL"],
+    "pdf_url": "https://arxiv.org/pdf/2401.00002",
+    "published_offset_days": 0
+  },
+  {
+    "entry_id": "https://arxiv.org/abs/2401.00003",
+    "title": "Old Paper Outside Cutoff",
+    "summary": "This paper was published before the cutoff and should be filtered out.",
+    "authors": ["Dave Brown"],
+    "categories": ["cs.AI"],
+    "pdf_url": "https://arxiv.org/pdf/2401.00003",
+    "published_offset_days": 10
+  }
+]

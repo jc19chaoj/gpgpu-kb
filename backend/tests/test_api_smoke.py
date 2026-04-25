@@ -50,3 +50,40 @@ def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
+
+
+# ─── Chat auth (Step 0 of next-step plan) ─────────────────────────
+
+def test_chat_open_when_token_unset(client):
+    """Default behavior: /api/chat is reachable (validation may still 422)
+    when KB_CHAT_TOKEN is unset. We assert it does NOT 401."""
+    r = client.post("/api/chat", json={"query": "hi", "top_k": 1})
+    assert r.status_code != 401, r.text
+
+
+def test_chat_rejects_unauthenticated_when_token_set(client, monkeypatch):
+    """When a chat token is configured, anonymous calls must be rejected."""
+    from kb import config
+
+    monkeypatch.setattr(config.settings, "chat_token", "s3cret-test-token")
+    try:
+        r = client.post("/api/chat", json={"query": "hi", "top_k": 1})
+        assert r.status_code == 401, r.text
+
+        r = client.post(
+            "/api/chat",
+            json={"query": "hi", "top_k": 1},
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert r.status_code == 401, r.text
+
+        # Correct token: must NOT be 401 (could be 200 or 5xx depending on LLM
+        # availability, but never the auth layer's 401).
+        r = client.post(
+            "/api/chat",
+            json={"query": "hi", "top_k": 1},
+            headers={"Authorization": "Bearer s3cret-test-token"},
+        )
+        assert r.status_code != 401, r.text
+    finally:
+        monkeypatch.setattr(config.settings, "chat_token", None)

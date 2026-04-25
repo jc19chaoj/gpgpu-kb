@@ -1,9 +1,10 @@
 # kb/main.py
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Header, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -61,6 +62,22 @@ app.add_middleware(
 def _escape_like(value: str) -> str:
     """Escape SQL LIKE wildcards so user queries containing % or _ behave literally."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def verify_chat_token(authorization: str | None = Header(default=None)) -> None:
+    """Bearer-token guard for `/api/chat`.
+
+    If `KB_CHAT_TOKEN` is unset, the endpoint is open (frictionless local dev).
+    Otherwise, the request must carry `Authorization: Bearer <token>` matching
+    the configured value (compared in constant time)."""
+    expected = settings.chat_token
+    if not expected:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+    presented = authorization.removeprefix("Bearer ").strip()
+    if not hmac.compare_digest(presented, expected):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
 
 
 # ─── Papers ───────────────────────────────────────────
@@ -159,7 +176,7 @@ def get_paper(paper_id: int, db: Session = Depends(get_db)):
 
 # ─── Chat (RAG) ───────────────────────────────────────
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(verify_chat_token)])
 def chat(req: ChatRequest, db: Session = Depends(get_db)):
     store = get_embedding_store()
     results = store.search(req.query, top_k=req.top_k)

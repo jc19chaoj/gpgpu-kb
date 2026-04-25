@@ -21,6 +21,12 @@ os.environ.setdefault("KB_DATA_DIR", _TMP_DIR)
 os.environ.setdefault("KB_LLM_PROVIDER", "hermes")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _init_db() -> None:
+    from kb.database import init_db
+    init_db()
+
+
 @pytest.fixture(scope="session")
 def client() -> Iterator:
     from fastapi.testclient import TestClient

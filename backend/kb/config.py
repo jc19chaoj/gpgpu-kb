@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     chat_query_max_len: int = 2000
     chat_top_k_max: int = 20
 
+    # Optional bearer token guarding /api/chat. When None, the endpoint is
+    # open (preserves frictionless local dev). When set, callers must send
+    # `Authorization: Bearer <token>` or get 401.
+    chat_token: str | None = None
+
 
 settings = Settings(
     # Allow standard provider envs without KB_ prefix as a convenience

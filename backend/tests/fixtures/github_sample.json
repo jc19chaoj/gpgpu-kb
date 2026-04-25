@@ -1,0 +1,39 @@
+{
+  "success_response": {
+    "total_count": 2,
+    "incomplete_results": false,
+    "items": [
+      {
+        "full_name": "org/cuda-kernels",
+        "html_url": "https://github.com/org/cuda-kernels",
+        "description": "Optimized CUDA kernels for transformer models",
+        "pushed_at": "2026-04-25T10:00:00Z",
+        "owner": {
+          "login": "org",
+          "type": "Organization"
+        },
+        "topics": ["cuda", "gpu", "deep-learning"]
+      },
+      {
+        "full_name": "user/triton-experiments",
+        "html_url": "https://github.com/user/triton-experiments",
+        "description": "Experiments with OpenAI Triton for custom ops",
+        "pushed_at": "2026-04-25T09:00:00Z",
+        "owner": {
+          "login": "user",
+          "type": "User"
+        },
+        "topics": ["triton", "gpu"]
+      }
+    ]
+  },
+  "rate_limit_response": {
+    "message": "API rate limit exceeded for ...",
+    "documentation_url": "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting"
+  },
+  "empty_response": {
+    "total_count": 0,
+    "incomplete_results": false,
+    "items": []
+  }
+}
