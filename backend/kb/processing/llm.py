@@ -5,6 +5,7 @@ Providers (selected via KB_LLM_PROVIDER):
 - "hermes"    : default — calls the local `hermes` CLI in non-interactive mode
 - "anthropic" : uses the `anthropic` SDK (lazy-imported)
 - "openai"    : uses the `openai` SDK (lazy-imported)
+- "deepseek"  : uses the `openai` SDK against DeepSeek's OpenAI-compatible API
 """
 import json
 import logging
@@ -76,10 +77,33 @@ def _call_openai(prompt: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+def _call_deepseek(prompt: str) -> str:
+    if not settings.deepseek_api_key:
+        logger.error("KB_LLM_PROVIDER=deepseek but no DEEPSEEK_API_KEY is set")
+        return ""
+    try:
+        import openai  # type: ignore
+    except ImportError:
+        logger.error("openai SDK not installed (required for deepseek); pip install -e '.[llm-cloud]'")
+        return ""
+    client = openai.OpenAI(
+        api_key=settings.deepseek_api_key,
+        base_url=settings.deepseek_base_url,
+    )
+    resp = client.chat.completions.create(
+        model=settings.deepseek_model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        timeout=settings.llm_timeout_seconds,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
 _PROVIDERS = {
     "hermes": _call_hermes,
     "anthropic": _call_anthropic,
     "openai": _call_openai,
+    "deepseek": _call_deepseek,
 }
 
 
