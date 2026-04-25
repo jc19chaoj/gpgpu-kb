@@ -1,0 +1,31 @@
+[project]
+name = "gpgpu-kb"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sqlalchemy>=2.0.0",
+    "feedparser>=6.0.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "arxiv>=2.1.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+]
+llm-cloud = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.28.0",
+    "ruff>=0.6.0",
+]
