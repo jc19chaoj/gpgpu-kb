@@ -171,9 +171,16 @@ def test_sanitize_empty_string_returns_empty():
 
 
 def _make_paper(db):
-    """Insert a minimal Paper and return it."""
+    """Insert a minimal Paper and return it.
+
+    URL must be process-unique because the session-scoped test DB persists
+    across tests and Paper.url has a unique index. `id(db)` was previously
+    used here but Python re-uses memory addresses after GC, occasionally
+    producing collisions across multiple _make_paper() calls in the same run.
+    """
     from kb.models import Paper, SourceType
     import datetime
+    import uuid
 
     paper = Paper(
         title="Test Paper Title",
@@ -182,7 +189,7 @@ def _make_paper(db):
         organizations=["Uni A"],
         source_type=SourceType.PAPER,
         source_name="arxiv",
-        url=f"https://example.com/paper/{id(db)}",
+        url=f"https://example.com/paper/{uuid.uuid4()}",
         published_date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
     )
     db.add(paper)
@@ -231,12 +238,54 @@ def test_summarize_and_score_happy_path():
         db.close()
 
 
-def test_summarize_and_score_non_json_llm_output_falls_back():
-    """When the scoring call returns non-JSON, scores default to 5.0/5.0."""
+def test_summarize_and_score_non_json_leaves_pending_for_retry():
+    """When the scoring LLM returns non-JSON, the paper must NOT be classified
+    with default 5.0/5.0 (which would be a permanent misjudgment). Instead
+    is_processed stays 0 so the next batch can retry."""
     from kb.database import SessionLocal
     from kb.processing import llm as llm_mod
 
     call_responses = ["Summary text.", "NOT JSON AT ALL"]
+
+    def fake_call_llm(prompt):
+        return call_responses.pop(0)
+
+    db = SessionLocal()
+    try:
+        paper = _make_paper(db)
+        paper_id = paper.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        success = llm_mod.summarize_and_score(paper_id)
+
+    assert success is False
+
+    db = SessionLocal()
+    try:
+        from kb.models import Paper
+        updated = db.query(Paper).filter(Paper.id == paper_id).first()
+        assert updated.is_processed == 0
+        # Score fields untouched (still column defaults)
+        assert updated.summary == ""
+        assert updated.originality_score == pytest.approx(0.0)
+        assert updated.impact_score == pytest.approx(0.0)
+    finally:
+        db.close()
+
+
+def test_summarize_and_score_low_quality_marks_skipped():
+    """max(originality, impact) < threshold (default 7.0) → is_processed=2."""
+    from kb.database import SessionLocal
+    from kb.processing import llm as llm_mod
+
+    low_json = json.dumps({
+        "originality_score": 4.0,
+        "impact_score": 5.5,
+        "impact_rationale": "Niche follow-up work."
+    })
+    call_responses = ["Summary text.", low_json]
 
     def fake_call_llm(prompt):
         return call_responses.pop(0)
@@ -257,9 +306,46 @@ def test_summarize_and_score_non_json_llm_output_falls_back():
     try:
         from kb.models import Paper
         updated = db.query(Paper).filter(Paper.id == paper_id).first()
-        assert updated.is_processed == 1
-        assert updated.originality_score == pytest.approx(5.0)
-        assert updated.impact_score == pytest.approx(5.0)
+        assert updated.is_processed == 2  # quarantined as low-quality
+        assert updated.impact_score == pytest.approx(5.5)
+    finally:
+        db.close()
+
+
+def test_summarize_and_score_threshold_uses_max_of_two_dimensions(monkeypatch):
+    """A paper that is novel (high originality) but from an unknown author
+    (low impact) should still pass the gate — max(o,i) >= threshold."""
+    from kb import config
+    from kb.database import SessionLocal
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "quality_score_threshold", 7.0)
+
+    high_orig_low_impact = json.dumps({
+        "originality_score": 8.5,
+        "impact_score": 4.0,
+        "impact_rationale": "Novel idea but unknown lab."
+    })
+    call_responses = ["Summary.", high_orig_low_impact]
+
+    def fake_call_llm(prompt):
+        return call_responses.pop(0)
+
+    db = SessionLocal()
+    try:
+        paper = _make_paper(db)
+        paper_id = paper.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        llm_mod.summarize_and_score(paper_id)
+
+    db = SessionLocal()
+    try:
+        from kb.models import Paper
+        updated = db.query(Paper).filter(Paper.id == paper_id).first()
+        assert updated.is_processed == 1  # passes via originality
     finally:
         db.close()
 

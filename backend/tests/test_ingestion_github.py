@@ -185,6 +185,24 @@ class TestFetchTrendingRepos:
         headers_sent = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers", {})
         assert "Authorization" not in headers_sent
 
+    def test_days_back_param_shifts_pushed_cutoff(self):
+        """fetch_trending_repos(days_back=N) sets `pushed:>(today-N days)` in
+        the search query — letting the orchestrator widen the window after
+        long gaps."""
+        resp = _mock_response(200, {"total_count": 0, "items": []})
+        expected_cutoff = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=10)
+        ).strftime("%Y-%m-%d")
+
+        with patch("kb.ingestion.github_trending.KEYWORDS", ["cuda"]):
+            with patch("kb.ingestion.github_trending.time.sleep"):
+                with _patch_httpx_client([resp]) as mock_client:
+                    fetch_trending_repos(days_back=10)
+
+        call_kwargs = mock_client.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert f"pushed:>{expected_cutoff}" in params["q"]
+
 
 # ---------------------------------------------------------------------------
 # save_repos
@@ -221,3 +239,8 @@ class TestSaveRepos:
     def test_skips_entry_without_url(self):
         count = save_repos([self._repo_dict("")])
         assert count == 0
+
+    def test_intra_batch_duplicate_does_not_raise(self):
+        url = "https://github.com/org/repo-gh-batchdup"
+        count = save_repos([self._repo_dict(url), self._repo_dict(url)])
+        assert count == 1

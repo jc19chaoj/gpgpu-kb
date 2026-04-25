@@ -4,6 +4,7 @@
 
 import logging
 
+from kb.database import init_db
 from kb.ingestion.run import run_ingestion
 from kb.processing.llm import run_processing
 from kb.processing.embeddings import index_unindexed_papers
@@ -17,8 +18,14 @@ def run_daily_pipeline() -> None:
     print("  GPGPU Knowledge Base - Daily Pipeline")
     print("=" * 60)
 
+    # Ensure schema exists. The FastAPI lifespan calls this for the API,
+    # but the cron entrypoint runs without lifespan — the first DB hit
+    # (now `_compute_days_back` in run_ingestion) would otherwise crash
+    # on a fresh checkout.
+    init_db()
+
     print("\n[1/4] INGESTION")
-    results = run_ingestion(days_back=1)
+    results = run_ingestion()
 
     print("\n[2/4] PROCESSING (Summarization + Scoring)")
     processed = run_processing(batch_size=30)

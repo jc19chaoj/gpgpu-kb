@@ -37,11 +37,16 @@ def _build_headers() -> dict[str, str]:
     return headers
 
 
-def fetch_trending_repos() -> list[dict]:
-    """Search GitHub for relevant repos pushed recently."""
+def fetch_trending_repos(days_back: int = 2) -> list[dict]:
+    """Search GitHub for relevant repos pushed recently.
+
+    `days_back` controls the `pushed:>YYYY-MM-DD` cutoff (default 2 keeps
+    the original 2-day buffer for direct callers; the orchestrator passes
+    the gap-derived value).
+    """
     repos: list[dict] = []
-    yesterday = (
-        datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=2)
+    cutoff = (
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days_back)
     ).strftime("%Y-%m-%d")
     headers = _build_headers()
 
@@ -51,7 +56,7 @@ def fetch_trending_repos() -> list[dict]:
                 resp = client.get(
                     GITHUB_SEARCH_URL,
                     params={
-                        "q": f"{keyword} pushed:>{yesterday}",
+                        "q": f"{keyword} pushed:>{cutoff}",
                         "sort": "stars",
                         "order": "desc",
                         "per_page": 5,
@@ -98,14 +103,17 @@ def save_repos(repos: list[dict]) -> int:
     """Save GitHub repos to DB, skip duplicates."""
     db = SessionLocal()
     new_count = 0
+    seen: set[str] = set()
     try:
         for r in repos:
-            if not r.get("url"):
+            url = r.get("url")
+            if not url or url in seen:
                 continue
-            existing = db.query(Paper).filter(Paper.url == r["url"]).first()
+            existing = db.query(Paper).filter(Paper.url == url).first()
             if existing:
                 continue
             db.add(Paper(**r))
+            seen.add(url)
             new_count += 1
         db.commit()
     except Exception:

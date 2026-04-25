@@ -33,7 +33,10 @@ def test_stats_shape(client):
     r = client.get("/api/stats")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) >= {"total_papers", "processed", "by_type", "top_impact"}
+    assert set(body) >= {
+        "total_papers", "processed", "skipped_low_quality", "pending",
+        "by_type", "top_impact",
+    }
 
 
 def test_chat_request_validation_rejects_huge_top_k(client):
@@ -87,3 +90,119 @@ def test_chat_rejects_unauthenticated_when_token_set(client, monkeypatch):
         assert r.status_code != 401, r.text
     finally:
         monkeypatch.setattr(config.settings, "chat_token", None)
+
+
+# ─── Quality gate (is_processed=2 hidden by default) ──────────────
+
+def _seed_quality_papers(prefix: str) -> tuple[int, int, int]:
+    """Insert one each of pending(0)/active(1)/low-quality(2) papers.
+
+    Returns (pending_id, active_id, low_id). URLs are namespaced so multiple
+    test runs on the shared session-scoped DB don't collide.
+    """
+    import datetime
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+
+    db = SessionLocal()
+    try:
+        rows = []
+        for i, state in enumerate([0, 1, 2]):
+            p = Paper(
+                title=f"qg-{prefix}-{state}",
+                abstract="abs",
+                summary="sum" if state else "",
+                authors=["A"],
+                organizations=[],
+                source_type=SourceType.PAPER,
+                source_name="arxiv",
+                url=f"https://example.test/qg/{prefix}/{i}",
+                published_date=datetime.datetime(2026, 4, 25, tzinfo=datetime.UTC),
+                impact_score=8.0 if state == 1 else (3.0 if state == 2 else 0.0),
+                originality_score=8.0 if state == 1 else (3.0 if state == 2 else 0.0),
+                is_processed=state,
+            )
+            db.add(p)
+            rows.append(p)
+        db.commit()
+        for p in rows:
+            db.refresh(p)
+        return rows[0].id, rows[1].id, rows[2].id
+    finally:
+        db.close()
+
+
+def test_list_papers_default_hides_low_quality_and_pending(client):
+    pending_id, active_id, low_id = _seed_quality_papers("list-default")
+
+    r = client.get("/api/papers", params={"page_size": 100})
+    assert r.status_code == 200
+    ids = {p["id"] for p in r.json()["papers"]}
+
+    assert active_id in ids
+    assert low_id not in ids
+    assert pending_id not in ids
+
+
+def test_list_papers_include_low_quality_returns_all_states(client):
+    pending_id, active_id, low_id = _seed_quality_papers("list-incl")
+
+    r = client.get("/api/papers", params={"page_size": 100, "include_low_quality": "true"})
+    assert r.status_code == 200
+    ids = {p["id"] for p in r.json()["papers"]}
+
+    assert {pending_id, active_id, low_id}.issubset(ids)
+
+
+def test_get_paper_detail_works_for_low_quality(client):
+    """Direct /api/papers/{id} must NOT filter — needed for inspecting
+    why a particular paper was quarantined."""
+    _, _, low_id = _seed_quality_papers("detail-low")
+
+    r = client.get(f"/api/papers/{low_id}")
+    assert r.status_code == 200
+    assert r.json()["id"] == low_id
+
+
+def test_search_keyword_default_hides_low_quality(client):
+    _, active_id, low_id = _seed_quality_papers("search-kw")
+
+    # semantic=false to force the keyword path; both rows match the prefix
+    r = client.get(
+        "/api/papers/search",
+        params={"q": "qg-search-kw", "semantic": "false", "page_size": 100},
+    )
+    assert r.status_code == 200
+    ids = {p["id"] for p in r.json()["papers"]}
+    assert active_id in ids
+    assert low_id not in ids
+
+
+def test_search_keyword_include_low_quality(client):
+    _, active_id, low_id = _seed_quality_papers("search-incl")
+
+    r = client.get(
+        "/api/papers/search",
+        params={
+            "q": "qg-search-incl",
+            "semantic": "false",
+            "include_low_quality": "true",
+            "page_size": 100,
+        },
+    )
+    assert r.status_code == 200
+    ids = {p["id"] for p in r.json()["papers"]}
+    assert {active_id, low_id}.issubset(ids)
+
+
+def test_stats_counts_split_by_processing_state(client):
+    pending_id, active_id, low_id = _seed_quality_papers("stats")
+
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    body = r.json()
+    # All counts are >= 1 because we just inserted one of each (other tests
+    # may have inserted more, but the seeded rows guarantee a lower bound).
+    assert body["processed"] >= 1
+    assert body["skipped_low_quality"] >= 1
+    assert body["pending"] >= 1

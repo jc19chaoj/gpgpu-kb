@@ -1,4 +1,5 @@
 # kb/main.py
+import asyncio
 import hmac
 import logging
 import os
@@ -24,6 +25,22 @@ from kb.schemas import (
 logger = logging.getLogger(__name__)
 
 
+async def _prewarm_embedding_store() -> None:
+    """Load SentenceTransformer in a thread so startup (and /api/health) is not blocked."""
+    try:
+
+        def _sync() -> None:
+            store = get_embedding_store()
+            if store.available:
+                logger.info("Embedding store pre-warmed")
+            else:
+                logger.info("Embedding store unavailable (ML deps not installed)")
+
+        await asyncio.to_thread(_sync)
+    except Exception:
+        logger.exception("Embedding store pre-warm failed; semantic search will degrade gracefully")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(
@@ -32,16 +49,8 @@ async def lifespan(app: FastAPI):
     )
     os.makedirs(settings.data_dir, exist_ok=True)
     init_db()
-    # Pre-warm the embedding store so the first /api/chat or /api/papers/search
-    # request doesn't pay the 5-10s SentenceTransformer load cost.
-    try:
-        store = get_embedding_store()
-        if store.available:
-            logger.info("Embedding store pre-warmed")
-        else:
-            logger.info("Embedding store unavailable (ML deps not installed)")
-    except Exception:
-        logger.exception("Embedding store pre-warm failed; semantic search will degrade gracefully")
+    # Pre-warm in the background so uvicorn can bind and /api/health responds immediately.
+    asyncio.create_task(_prewarm_embedding_store())
     yield
     # nothing to clean up on shutdown
 
@@ -94,9 +103,14 @@ def list_papers(
         pattern="^(published_date|impact_score|originality_score|ingested_date)$",
     ),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
+    include_low_quality: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     q = db.query(Paper)
+    if not include_low_quality:
+        # Hide low-quality (is_processed=2) and pending (0) by default;
+        # the quality gate decides what counts as "active".
+        q = q.filter(Paper.is_processed == 1)
     if source_type:
         q = q.filter(Paper.source_type == source_type)
 
@@ -120,13 +134,17 @@ def search_papers(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     semantic: bool = Query(True),
+    include_low_quality: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     if semantic:
         store = get_embedding_store()
         results = store.search(q, top_k=page * page_size)
 
-        # Fallback to keyword search if semantic returns nothing
+        # Fallback to keyword search if semantic returns nothing.
+        # Note: ChromaDB only contains is_processed=1 papers (see
+        # index_unindexed_papers), so semantic results are inherently
+        # quality-gated regardless of include_low_quality.
         if results:
             paper_ids = [r["paper_id"] for r in results]
             papers_by_id: dict[int, Paper] = {}
@@ -151,6 +169,8 @@ def search_papers(
         (Paper.abstract.ilike(pattern, escape="\\")) |
         (Paper.summary.ilike(pattern, escape="\\"))
     )
+    if not include_low_quality:
+        base = base.filter(Paper.is_processed == 1)
     total = base.count()
     paged = (
         base.order_by(Paper.impact_score.desc())
@@ -236,6 +256,8 @@ def get_report(report_id: int, db: Session = Depends(get_db)):
 def get_stats(db: Session = Depends(get_db)):
     total = db.query(Paper).count()
     processed = db.query(Paper).filter(Paper.is_processed == 1).count()
+    skipped_low_quality = db.query(Paper).filter(Paper.is_processed == 2).count()
+    pending = db.query(Paper).filter(Paper.is_processed == 0).count()
     by_type = {}
     for st in SourceType:
         count = db.query(Paper).filter(Paper.source_type == st).count()
@@ -250,6 +272,8 @@ def get_stats(db: Session = Depends(get_db)):
     return {
         "total_papers": total,
         "processed": processed,
+        "skipped_low_quality": skipped_low_quality,
+        "pending": pending,
         "by_type": by_type,
         "top_impact": [
             {"id": p.id, "title": p.title, "impact_score": p.impact_score}

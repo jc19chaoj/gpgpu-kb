@@ -141,7 +141,17 @@ def _sanitize(text: str | None, max_len: int = 8000) -> str:
 
 def summarize_and_score(paper_id: int) -> bool:
     """Summarize a paper and score its originality/impact.
-    Returns True on success, False on failure.
+
+    On success, sets `is_processed`:
+      - 1 if max(originality, impact) >= settings.quality_score_threshold
+      - 2 otherwise (low quality; hidden from default views but kept so the
+        URL-unique index and non-zero state prevent re-ingestion / re-scoring)
+
+    On scoring failure (LLM returned no parseable JSON), leaves
+    `is_processed=0` so the next run can retry — failures are usually
+    transient and shouldn't be permanently misclassified as 5.0/5.0.
+
+    Returns True if scoring completed (bucket 1 or 2), False otherwise.
     """
     db = SessionLocal()
     try:
@@ -219,7 +229,7 @@ Consider: author track record, organization prestige, venue quality, problem imp
 Output ONLY a JSON object on a single line:
 {{"originality_score": <float>, "impact_score": <float>, "impact_rationale": "<2-3 sentences explaining the impact score>"}}"""
 
-        result_json = {"originality_score": 5.0, "impact_score": 5.0, "impact_rationale": "Assessment failed."}
+        result_json: dict | None = None
         try:
             result_text = call_llm(impact_prompt)
             start = result_text.find("{")
@@ -233,12 +243,23 @@ Output ONLY a JSON object on a single line:
         except Exception:
             logger.exception("Scoring failed for paper %d", paper_id)
 
-        paper.summary = summary
-        paper.originality_score = _clamp_score(result_json.get("originality_score"))
-        paper.impact_score = _clamp_score(result_json.get("impact_score"))
+        if result_json is None:
+            # Don't write partial state. Leave is_processed=0 so a future run
+            # can retry; transient LLM failures shouldn't be permanently
+            # misclassified as 5.0/5.0.
+            return False
+
+        originality = _clamp_score(result_json.get("originality_score"))
+        impact = _clamp_score(result_json.get("impact_score"))
         rationale = result_json.get("impact_rationale", "")
+
+        paper.summary = summary
+        paper.originality_score = originality
+        paper.impact_score = impact
         paper.impact_rationale = str(rationale)[:2000] if rationale else ""
-        paper.is_processed = 1
+        paper.is_processed = (
+            1 if max(originality, impact) >= settings.quality_score_threshold else 2
+        )
 
         db.commit()
         return True

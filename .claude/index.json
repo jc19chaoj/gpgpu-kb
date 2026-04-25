@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "generated_at": "2026-04-25T09:59:45Z",
+  "generated_at": "2026-04-25T15:26:48Z",
   "generator": "init-architect (adaptive)",
   "project": {
     "name": "gpgpu-kb",
@@ -11,7 +11,8 @@
       "FastAPI", "SQLAlchemy 2", "Pydantic 2",
       "ChromaDB", "sentence-transformers",
       "Next.js 16 (App Router)", "React 19",
-      "Tailwind v4", "shadcn/ui"
+      "Tailwind v4", "shadcn/ui",
+      "Playwright (e2e)"
     ]
   },
   "modules": [
@@ -29,7 +30,7 @@
         "GET /api/papers",
         "GET /api/papers/search",
         "GET /api/papers/{paper_id}",
-        "POST /api/chat",
+        "POST /api/chat (optional Bearer token via KB_CHAT_TOKEN)",
         "GET /api/reports",
         "GET /api/reports/{report_id}",
         "GET /api/stats",
@@ -38,7 +39,11 @@
       "data_models": ["Paper (papers)", "DailyReport (daily_reports)"],
       "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env)",
       "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev)",
-      "tests": "backend/tests/",
+      "tests": "backend/tests/ (~75 tests, coverage ~74%, see tests/README.md)",
+      "llm_providers": ["hermes", "anthropic", "openai", "deepseek"],
+      "auth": {
+        "chat_endpoint": "Optional Bearer token via KB_CHAT_TOKEN; compared via hmac.compare_digest in verify_chat_token"
+      },
       "important_paths": [
         "backend/kb/ingestion/arxiv.py",
         "backend/kb/ingestion/rss.py",
@@ -49,16 +54,19 @@
         "backend/kb/reports.py",
         "backend/kb/database.py",
         "backend/kb/models.py",
-        "backend/kb/schemas.py"
+        "backend/kb/schemas.py",
+        "backend/tests/README.md",
+        "backend/tests/test_api_smoke.py",
+        "backend/tests/test_processing_llm.py"
       ],
       "claude_md": "backend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 13,
+        "scanned_files": 17,
         "high_confidence": true,
         "gaps": [
-          "未读取 backend/tests/* 实际用例文件，无法判断已有覆盖范围",
-          "未读取 .env / .env.example（若存在）",
-          "未读取 backend/kb/ingestion/__init__.py、processing/__init__.py（应仅是空模块导出）"
+          "未读取 backend/tests/conftest.py、test_processing_llm.py 等具体源代码（仅依赖 README 描述）",
+          "未读取 backend/.env / .env.example（若存在）",
+          "未读取 ingestion/__init__.py、processing/__init__.py（应仅是空模块导出）"
         ]
       }
     },
@@ -81,25 +89,36 @@
       ],
       "api_client": "frontend/src/lib/api.ts",
       "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py)",
-      "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*",
-      "tests": null,
+      "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*, playwright.config.ts",
+      "tests": "frontend/tests/e2e/ (Playwright, chromium-only, mocked backend)",
+      "scripts": {
+        "dev": "next dev",
+        "build": "next build",
+        "start": "next start",
+        "lint": "eslint",
+        "test:e2e": "playwright test"
+      },
       "important_paths": [
         "frontend/AGENTS.md",
+        "frontend/playwright.config.ts",
+        "frontend/tests/e2e/",
         "frontend/src/app/chat/page.tsx",
         "frontend/src/components/layout/",
         "frontend/src/components/ui/",
         "frontend/src/components/paper-card.tsx",
-        "frontend/src/components/search-bar.tsx"
+        "frontend/src/components/search-bar.tsx",
+        "frontend/src/lib/api.ts"
       ],
       "claude_md": "frontend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 5,
+        "scanned_files": 6,
         "high_confidence": true,
         "gaps": [
           "未深入 src/components/ui/* 各 shadcn 原语",
           "未读取 src/app/paper/[id]/page.tsx、reports/[id]/page.tsx、stats/page.tsx 内部细节",
           "未读取 next.config.*、eslint.config.*、tsconfig.json 具体配置",
-          "未确认 Sidebar / Header 内部菜单项"
+          "未枚举 tests/e2e/ 下具体测试用例文件",
+          "前端 api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON"
         ]
       }
     }
@@ -108,43 +127,53 @@
     "claude_md": "CLAUDE.md",
     "readme": "README.md",
     "start_script": "start.sh",
+    "ci_workflow": ".github/workflows/ci.yml (3 jobs: backend pytest+cov / frontend tsc+eslint / frontend playwright)",
     "docs_dir": "docs/ (present but empty/minimal)",
-    "omc_state": ".omc/"
+    "omc_state": ".omc/",
+    "gitignore": ".gitignore (covers .venv, backend/data/, node_modules/, .next/, .omc state files)"
   },
   "ignore_strategy": {
-    "source": "default (no .gitignore inspected for index — assumed standard)",
+    "source": "merged with .gitignore",
     "patterns": [
       "node_modules/**", ".git/**", ".github/**",
       "dist/**", "build/**", ".next/**",
       "__pycache__/**", "*.lock", "*.log",
       "*.bin", "*.pdf", "*.png", "*.jpg", "*.jpeg",
       "*.gif", "*.mp4", "*.zip", "*.tar", "*.gz",
-      "backend/.venv/**", "backend/data/**", "backend/data/chroma/**"
+      "backend/.venv/**", "backend/data/**", "backend/data/chroma/**",
+      ".pytest_cache/**", ".ruff_cache/**", ".mypy_cache/**",
+      "**/.omc/state/**", "**/.omc/sessions/**", "**/.omc/logs/**"
     ]
   },
   "coverage_summary": {
     "modules_total": 2,
     "modules_with_claude_md": 2,
-    "files_read": 23,
+    "files_read_this_run": 13,
+    "files_read_cumulative": 23,
     "estimated_repo_files": "n/a (not enumerated by Glob in this run)",
-    "coverage_percent_estimate": 70,
+    "coverage_percent_estimate": 78,
     "truncated": false,
-    "notes": "Two modules (backend, frontend) are well-characterized via README, pyproject, package.json, entry points, key route handlers, ingestion/processing units, API client, and root pages. Internal shadcn/ui primitives and tests directories were not enumerated."
+    "notes": "Incremental refresh confirmed prior structure remains accurate; main deltas absorbed: deepseek provider, /api/chat bearer guard, GitHub Actions CI workflow, Playwright e2e suite. backend/tests/README.md verified to match described test layout."
   },
   "next_steps": [
-    "枚举并阅读 backend/tests/* 以记录测试覆盖矩阵，并对应补齐 backend/CLAUDE.md 的测试章节",
+    "枚举 frontend/tests/e2e/ 实际用例并在 frontend/CLAUDE.md 中列出场景矩阵（chat / browse / search 等）",
     "扫描 frontend/src/components/ui/* 以列出已落地的 shadcn 原语清单",
-    "扫描 frontend/src/components/layout/{sidebar,header}.tsx 与 paper-card / search-bar 以补充交互细节",
-    "读取 frontend/next.config.*、tsconfig.json、eslint.config.* 以记录构建/类型/lint 约定",
-    "若存在 backend/.env.example，纳入 README/CLAUDE 的环境变量章节",
+    "读取 frontend/next.config.* / eslint.config.* / tsconfig.json 以记录构建/类型/lint 约定",
+    "若后端开启 KB_CHAT_TOKEN，在 frontend/src/lib/api.ts 增加 Bearer 注入并补 e2e 用例",
+    "扫描 backend/tests/conftest.py 与 test_api_smoke.py 验证 `/api/chat` 三态测试是否覆盖 deepseek provider 路由",
     "为 docs/ 目录补充实际内容或在根 CLAUDE.md 中标注其用途",
-    "未来若引入 CI（GitHub Actions / 其它），把 lint+pytest+tsc 流水线写入 CLAUDE.md 的测试策略章节"
+    "如果引入 hermes cron 调度作业到生产，整理 ops/runbook 并链接进 backend/CLAUDE.md"
   ],
   "changelog": [
     {
       "timestamp": "2026-04-25T09:59:45Z",
       "action": "init",
       "summary": "Created root CLAUDE.md, backend/CLAUDE.md, frontend/CLAUDE.md, and .claude/index.json"
+    },
+    {
+      "timestamp": "2026-04-25T15:26:48Z",
+      "action": "incremental_refresh",
+      "summary": "Synced docs with code deltas since 09:59:45: (1) added deepseek LLM provider docs (config.py + llm.py _call_deepseek, KB_DEEPSEEK_*); (2) documented /api/chat Bearer Token guard via verify_chat_token + hmac.compare_digest (KB_CHAT_TOKEN); (3) added .github/workflows/ci.yml description (3-job CI); (4) added Playwright e2e block (playwright.config.ts, tests/e2e/, npm run test:e2e, @playwright/test devDep); (5) reflected backend/tests/README.md (~75 tests, ~74% coverage); (6) standardised module breadcrumbs to '[← 返回根]'."
     }
   ]
 }

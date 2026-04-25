@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     github_token: str | None = None
     arxiv_per_category: int = 50
 
+    # Quality gate. After scoring, papers whose max(originality, impact) is
+    # below this threshold are marked is_processed=2 ("low quality, hidden")
+    # instead of 1 ("active"). The row is kept so the URL-unique index
+    # prevents re-ingestion and the non-zero is_processed prevents re-scoring.
+    quality_score_threshold: float = 7.0
+
     # API limits
     chat_query_max_len: int = 2000
     chat_top_k_max: int = 20
