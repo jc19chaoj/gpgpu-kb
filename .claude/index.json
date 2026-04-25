@@ -1,0 +1,150 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-04-25T09:59:45Z",
+  "generator": "init-architect (adaptive)",
+  "project": {
+    "name": "gpgpu-kb",
+    "summary": "Self-updating GPGPU chip-architecture research knowledge base with semantic search and RAG chat over ArXiv papers, curated RSS blogs, and trending GitHub projects.",
+    "type": "monorepo (backend + frontend)",
+    "primary_languages": ["Python 3.12", "TypeScript 5"],
+    "stack": [
+      "FastAPI", "SQLAlchemy 2", "Pydantic 2",
+      "ChromaDB", "sentence-transformers",
+      "Next.js 16 (App Router)", "React 19",
+      "Tailwind v4", "shadcn/ui"
+    ]
+  },
+  "modules": [
+    {
+      "id": "backend",
+      "path": "backend",
+      "language": "python",
+      "framework": "fastapi",
+      "entry_points": [
+        "backend/kb/main.py",
+        "backend/kb/daily.py",
+        "backend/run_api.sh"
+      ],
+      "api_routes": [
+        "GET /api/papers",
+        "GET /api/papers/search",
+        "GET /api/papers/{paper_id}",
+        "POST /api/chat",
+        "GET /api/reports",
+        "GET /api/reports/{report_id}",
+        "GET /api/stats",
+        "GET /api/health"
+      ],
+      "data_models": ["Paper (papers)", "DailyReport (daily_reports)"],
+      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env)",
+      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev)",
+      "tests": "backend/tests/",
+      "important_paths": [
+        "backend/kb/ingestion/arxiv.py",
+        "backend/kb/ingestion/rss.py",
+        "backend/kb/ingestion/github_trending.py",
+        "backend/kb/ingestion/run.py",
+        "backend/kb/processing/llm.py",
+        "backend/kb/processing/embeddings.py",
+        "backend/kb/reports.py",
+        "backend/kb/database.py",
+        "backend/kb/models.py",
+        "backend/kb/schemas.py"
+      ],
+      "claude_md": "backend/CLAUDE.md",
+      "coverage": {
+        "scanned_files": 13,
+        "high_confidence": true,
+        "gaps": [
+          "未读取 backend/tests/* 实际用例文件，无法判断已有覆盖范围",
+          "未读取 .env / .env.example（若存在）",
+          "未读取 backend/kb/ingestion/__init__.py、processing/__init__.py（应仅是空模块导出）"
+        ]
+      }
+    },
+    {
+      "id": "frontend",
+      "path": "frontend",
+      "language": "typescript",
+      "framework": "next.js 16 (app router) / react 19",
+      "entry_points": [
+        "frontend/src/app/layout.tsx",
+        "frontend/src/app/page.tsx"
+      ],
+      "pages": [
+        "/ (Browse + Search)",
+        "/chat (RAG)",
+        "/paper/[id]",
+        "/reports",
+        "/reports/[id]",
+        "/stats"
+      ],
+      "api_client": "frontend/src/lib/api.ts",
+      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py)",
+      "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*",
+      "tests": null,
+      "important_paths": [
+        "frontend/AGENTS.md",
+        "frontend/src/app/chat/page.tsx",
+        "frontend/src/components/layout/",
+        "frontend/src/components/ui/",
+        "frontend/src/components/paper-card.tsx",
+        "frontend/src/components/search-bar.tsx"
+      ],
+      "claude_md": "frontend/CLAUDE.md",
+      "coverage": {
+        "scanned_files": 5,
+        "high_confidence": true,
+        "gaps": [
+          "未深入 src/components/ui/* 各 shadcn 原语",
+          "未读取 src/app/paper/[id]/page.tsx、reports/[id]/page.tsx、stats/page.tsx 内部细节",
+          "未读取 next.config.*、eslint.config.*、tsconfig.json 具体配置",
+          "未确认 Sidebar / Header 内部菜单项"
+        ]
+      }
+    }
+  ],
+  "root_artifacts": {
+    "claude_md": "CLAUDE.md",
+    "readme": "README.md",
+    "start_script": "start.sh",
+    "docs_dir": "docs/ (present but empty/minimal)",
+    "omc_state": ".omc/"
+  },
+  "ignore_strategy": {
+    "source": "default (no .gitignore inspected for index — assumed standard)",
+    "patterns": [
+      "node_modules/**", ".git/**", ".github/**",
+      "dist/**", "build/**", ".next/**",
+      "__pycache__/**", "*.lock", "*.log",
+      "*.bin", "*.pdf", "*.png", "*.jpg", "*.jpeg",
+      "*.gif", "*.mp4", "*.zip", "*.tar", "*.gz",
+      "backend/.venv/**", "backend/data/**", "backend/data/chroma/**"
+    ]
+  },
+  "coverage_summary": {
+    "modules_total": 2,
+    "modules_with_claude_md": 2,
+    "files_read": 23,
+    "estimated_repo_files": "n/a (not enumerated by Glob in this run)",
+    "coverage_percent_estimate": 70,
+    "truncated": false,
+    "notes": "Two modules (backend, frontend) are well-characterized via README, pyproject, package.json, entry points, key route handlers, ingestion/processing units, API client, and root pages. Internal shadcn/ui primitives and tests directories were not enumerated."
+  },
+  "next_steps": [
+    "枚举并阅读 backend/tests/* 以记录测试覆盖矩阵，并对应补齐 backend/CLAUDE.md 的测试章节",
+    "扫描 frontend/src/components/ui/* 以列出已落地的 shadcn 原语清单",
+    "扫描 frontend/src/components/layout/{sidebar,header}.tsx 与 paper-card / search-bar 以补充交互细节",
+    "读取 frontend/next.config.*、tsconfig.json、eslint.config.* 以记录构建/类型/lint 约定",
+    "若存在 backend/.env.example，纳入 README/CLAUDE 的环境变量章节",
+    "为 docs/ 目录补充实际内容或在根 CLAUDE.md 中标注其用途",
+    "未来若引入 CI（GitHub Actions / 其它），把 lint+pytest+tsc 流水线写入 CLAUDE.md 的测试策略章节"
+  ],
+  "changelog": [
+    {
+      "timestamp": "2026-04-25T09:59:45Z",
+      "action": "init",
+      "summary": "Created root CLAUDE.md, backend/CLAUDE.md, frontend/CLAUDE.md, and .claude/index.json"
+    }
+  ]
+}
