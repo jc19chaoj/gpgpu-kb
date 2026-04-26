@@ -10,21 +10,24 @@ from kb.models import Paper, SourceType
 logger = logging.getLogger(__name__)
 
 # Feeds verified active as of 2026-04. Update this list when feeds rot.
+# Removed: AnandTech (site shut down in 2024, /rss redirects to forums HTML);
+#          Meta AI Blog (ai.meta.com/blog/feed/ returns 404, no public RSS).
 FEEDS = [
     # Chip / Architecture
     ("https://semiengineering.com/feed/", "Semiconductor Engineering"),
     ("https://chipsandcheese.com/feed/", "Chips and Cheese"),
-    ("https://www.anandtech.com/rss", "AnandTech"),
     ("https://fuse.wikichip.org/feed/", "WikiChip Fuse"),
-    ("https://www.semianalysis.com/feed", "SemiAnalysis"),
+    # SemiAnalysis migrated to Substack in late 2025; the wp.com feed stopped at 2025-09.
+    ("https://semianalysis.substack.com/feed", "SemiAnalysis"),
     # AI / ML labs
     ("https://openai.com/news/rss.xml", "OpenAI"),
     ("https://blog.google/technology/ai/rss/", "Google AI Blog"),
-    ("https://ai.meta.com/blog/feed/", "Meta AI Blog"),
     ("https://huggingface.co/blog/feed.xml", "Hugging Face Blog"),
     ("https://developer.nvidia.com/blog/feed", "NVIDIA Developer Blog"),
+    ("https://research.nvidia.com/rss.xml", "NVIDIA Research"),
     # Systems / Performance personalities
-    ("https://lilianweng.github.io/feed.xml", "Lilian Weng"),
+    # lilianweng.github.io serves the Atom feed at /index.xml, not /feed.xml.
+    ("https://lilianweng.github.io/index.xml", "Lilian Weng"),
     ("https://karpathy.github.io/feed.xml", "Andrej Karpathy"),
     ("https://www.interconnects.ai/feed", "Interconnects (Nathan Lambert)"),
 ]

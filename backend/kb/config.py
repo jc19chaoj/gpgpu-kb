@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
     chroma_dir: str = "./data/chroma"
 
+    # Output language for LLM-generated content (summaries, scores, daily reports).
+    # Options: "en" (default), "zh" (简体中文). Other values silently degrade to English.
+    language: str = "en"
+
     # LLM provider abstraction
     # Options: "hermes" (default — uses local hermes CLI), "anthropic", "openai", "deepseek"
     llm_provider: str = "hermes"
@@ -49,6 +53,15 @@ class Settings(BaseSettings):
     # Ingestion
     github_token: str | None = None
     arxiv_per_category: int = 50
+
+    # Lookback window for the orchestrator (kb.ingestion.run._compute_days_back).
+    # Empty DB → INGEST_EMPTY_DB_DAYS (cold-start backfill); otherwise the gap
+    # since the last ingested_date is clamped to [INGEST_GAP_MIN_DAYS,
+    # INGEST_GAP_MAX_DAYS]. The cap prevents a long-idle DB from triggering a
+    # one-shot multi-month re-ingest that would blow past API rate limits.
+    ingest_empty_db_days: int = 30
+    ingest_gap_min_days: int = 1
+    ingest_gap_max_days: int = 30
 
     # Quality gate. After scoring, papers whose max(originality, impact) is
     # below this threshold are marked is_processed=2 ("low quality, hidden")

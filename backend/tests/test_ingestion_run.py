@@ -53,7 +53,7 @@ def _seed_paper(ingested_date: datetime.datetime, url: str) -> None:
 def test_compute_days_back_empty_db_returns_cold_start_window(clean_papers):
     from kb.ingestion import run as run_mod
 
-    assert run_mod._compute_days_back() == run_mod.EMPTY_DB_DAYS
+    assert run_mod._compute_days_back() == run_mod.settings.ingest_empty_db_days
 
 
 def test_compute_days_back_returns_gap_when_within_bounds(clean_papers):
@@ -73,7 +73,7 @@ def test_compute_days_back_clamps_high_at_max(clean_papers):
         datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=100),
         "https://example.test/run/gap-100d",
     )
-    assert run_mod._compute_days_back() == run_mod.GAP_MAX_DAYS
+    assert run_mod._compute_days_back() == run_mod.settings.ingest_gap_max_days
 
 
 def test_compute_days_back_clamps_low_at_one(clean_papers):
@@ -85,7 +85,7 @@ def test_compute_days_back_clamps_low_at_one(clean_papers):
         datetime.datetime.now(datetime.UTC),
         "https://example.test/run/gap-now",
     )
-    assert run_mod._compute_days_back() == run_mod.GAP_MIN_DAYS
+    assert run_mod._compute_days_back() == run_mod.settings.ingest_gap_min_days
 
 
 def test_compute_days_back_tolerates_naive_legacy_datetime(clean_papers):
@@ -99,7 +99,7 @@ def test_compute_days_back_tolerates_naive_legacy_datetime(clean_papers):
     _seed_paper(naive_three_days_ago, "https://example.test/run/naive")
     # The exact value depends on tz handling; accept the reasonable range.
     result = run_mod._compute_days_back()
-    assert run_mod.GAP_MIN_DAYS <= result <= run_mod.GAP_MAX_DAYS
+    assert run_mod.settings.ingest_gap_min_days <= result <= run_mod.settings.ingest_gap_max_days
 
 
 # ─── run_ingestion source propagation ─────────────────────────────
@@ -130,9 +130,9 @@ def test_run_ingestion_propagates_cold_start_window_to_all_sources(clean_papers)
     from kb.ingestion import run as run_mod
 
     captured = _spy_run_ingestion(run_mod)
-    assert captured == {"arxiv": run_mod.EMPTY_DB_DAYS,
-                        "rss": run_mod.EMPTY_DB_DAYS,
-                        "github": run_mod.EMPTY_DB_DAYS}
+    assert captured == {"arxiv": run_mod.settings.ingest_empty_db_days,
+                        "rss": run_mod.settings.ingest_empty_db_days,
+                        "github": run_mod.settings.ingest_empty_db_days}
 
 
 def test_run_ingestion_explicit_override_takes_precedence(clean_papers):

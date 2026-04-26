@@ -275,10 +275,17 @@ def test_summarize_and_score_non_json_leaves_pending_for_retry():
         db.close()
 
 
-def test_summarize_and_score_low_quality_marks_skipped():
-    """max(originality, impact) < threshold (default 7.0) → is_processed=2."""
+def test_summarize_and_score_low_quality_marks_skipped(monkeypatch):
+    """max(originality, impact) < threshold → is_processed=2.
+
+    Pin the threshold to 7.0 so the test doesn't break when an operator
+    overrides KB_QUALITY_SCORE_THRESHOLD via .env (4.0/5.5 must fall below).
+    """
+    from kb import config
     from kb.database import SessionLocal
     from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "quality_score_threshold", 7.0)
 
     low_json = json.dumps({
         "originality_score": 4.0,
@@ -308,6 +315,105 @@ def test_summarize_and_score_low_quality_marks_skipped():
         updated = db.query(Paper).filter(Paper.id == paper_id).first()
         assert updated.is_processed == 2  # quarantined as low-quality
         assert updated.impact_score == pytest.approx(5.5)
+    finally:
+        db.close()
+
+
+def test_summarize_and_score_blog_skips_quality_gate():
+    """Blog posts use a paper-centric rubric unfairly, so they bypass scoring
+    and go straight to is_processed=1 with summary-only output. The scoring
+    LLM call must NOT be made (only one call_llm response consumed)."""
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    from kb.processing import llm as llm_mod
+    import datetime
+    import uuid
+
+    summary_only = ["Summary of the blog post."]
+
+    def fake_call_llm(prompt):
+        return summary_only.pop(0)
+
+    db = SessionLocal()
+    try:
+        post = Paper(
+            title="A Deep Dive Into GPU Memory",
+            abstract="An informal blog summary.",
+            authors=["Some Engineer"],
+            organizations=[],
+            source_type=SourceType.BLOG,
+            source_name="Some Blog",
+            url=f"https://example.com/blog/{uuid.uuid4()}",
+            published_date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
+        )
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        post_id = post.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        success = llm_mod.summarize_and_score(post_id)
+
+    assert success is True
+    assert summary_only == []  # only the summary call was made; no scoring
+
+    db = SessionLocal()
+    try:
+        updated = db.query(Paper).filter(Paper.id == post_id).first()
+        assert updated.is_processed == 1
+        assert updated.summary == "Summary of the blog post."
+        assert updated.originality_score == pytest.approx(0.0)
+        assert updated.impact_score == pytest.approx(0.0)
+        assert "blog" in updated.impact_rationale.lower()
+    finally:
+        db.close()
+
+
+def test_summarize_and_score_project_skips_quality_gate():
+    """Same as the blog case but for SourceType.PROJECT (GitHub repos)."""
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    from kb.processing import llm as llm_mod
+    import datetime
+    import uuid
+
+    responses = ["Summary of the repo."]
+
+    def fake_call_llm(prompt):
+        return responses.pop(0)
+
+    db = SessionLocal()
+    try:
+        repo = Paper(
+            title="org/awesome-cuda",
+            abstract="A README description.",
+            authors=["org"],
+            organizations=["org"],
+            source_type=SourceType.PROJECT,
+            source_name="github",
+            url=f"https://github.com/org/{uuid.uuid4()}",
+            published_date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
+        )
+        db.add(repo)
+        db.commit()
+        db.refresh(repo)
+        repo_id = repo.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        success = llm_mod.summarize_and_score(repo_id)
+
+    assert success is True
+    assert responses == []
+
+    db = SessionLocal()
+    try:
+        updated = db.query(Paper).filter(Paper.id == repo_id).first()
+        assert updated.is_processed == 1
+        assert updated.impact_score == pytest.approx(0.0)
     finally:
         db.close()
 
@@ -356,3 +462,176 @@ def test_summarize_and_score_missing_paper_returns_false():
     with patch.object(llm_mod, "call_llm", return_value="irrelevant"):
         result = llm_mod.summarize_and_score(999_999_999)
     assert result is False
+
+
+# ─── _lang_instruction / _impact_lang_instruction ─────────────────
+
+
+def test_lang_instruction_returns_empty_for_en(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "language", "en")
+    assert llm_mod._lang_instruction() == ""
+    assert llm_mod._impact_lang_instruction() == ""
+
+
+def test_lang_instruction_returns_chinese_suffix_for_zh(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "language", "zh")
+    assert "Chinese" in llm_mod._lang_instruction()
+    assert "简体中文" in llm_mod._lang_instruction()
+    assert "Chinese" in llm_mod._impact_lang_instruction()
+    assert "简体中文" in llm_mod._impact_lang_instruction()
+
+
+def test_summarize_prompt_includes_lang_instruction_zh(monkeypatch):
+    from kb import config
+    from kb.database import SessionLocal
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "language", "zh")
+
+    captured_prompts = []
+
+    good_json = json.dumps({
+        "originality_score": 8.0,
+        "impact_score": 7.5,
+        "impact_rationale": "优秀的工作。",
+    })
+
+    def fake_call_llm(prompt):
+        captured_prompts.append(prompt)
+        if len(captured_prompts) == 1:
+            return "摘要内容。"
+        return good_json
+
+    db = SessionLocal()
+    try:
+        paper = _make_paper(db)
+        paper_id = paper.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        llm_mod.summarize_and_score(paper_id)
+
+    assert len(captured_prompts) >= 1
+    summary_prompt = captured_prompts[0]
+    assert "Write your entire response in Chinese" in summary_prompt
+    assert "=== UNTRUSTED START ===" in summary_prompt
+
+
+def test_summarize_prompt_unchanged_for_en(monkeypatch):
+    from kb import config
+    from kb.database import SessionLocal
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "language", "en")
+
+    captured_prompts = []
+
+    good_json = json.dumps({
+        "originality_score": 8.0,
+        "impact_score": 7.5,
+        "impact_rationale": "Strong work.",
+    })
+
+    def fake_call_llm(prompt):
+        captured_prompts.append(prompt)
+        if len(captured_prompts) == 1:
+            return "Summary text."
+        return good_json
+
+    db = SessionLocal()
+    try:
+        paper = _make_paper(db)
+        paper_id = paper.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        llm_mod.summarize_and_score(paper_id)
+
+    assert len(captured_prompts) == 2
+    for prompt in captured_prompts:
+        assert "Chinese" not in prompt
+        assert "简体中文" not in prompt
+
+
+def test_summarize_json_keys_translated_returns_false():
+    """If LLM returns JSON with translated keys (not English), defensive check returns False."""
+    from kb.database import SessionLocal
+    from kb.processing import llm as llm_mod
+
+    translated_json = json.dumps({
+        "原创性": 8.0,
+        "影响力": 7.0,
+        "impact_rationale": "优秀的工作。",
+    })
+    call_responses = ["Summary text.", translated_json]
+
+    def fake_call_llm(prompt):
+        return call_responses.pop(0)
+
+    db = SessionLocal()
+    try:
+        paper = _make_paper(db)
+        paper_id = paper.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        result = llm_mod.summarize_and_score(paper_id)
+
+    assert result is False
+
+    db = SessionLocal()
+    try:
+        from kb.models import Paper
+        updated = db.query(Paper).filter(Paper.id == paper_id).first()
+        assert updated.is_processed == 0
+    finally:
+        db.close()
+
+
+def test_impact_prompt_no_entire_response_chinese(monkeypatch):
+    """impact_prompt must NOT say 'Write your entire response in Chinese';
+    it should only instruct the model to write impact_rationale in Chinese."""
+    from kb import config
+    from kb.database import SessionLocal
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(config.settings, "language", "zh")
+
+    captured_prompts = []
+
+    good_json = json.dumps({
+        "originality_score": 8.0,
+        "impact_score": 7.5,
+        "impact_rationale": "优秀的工作。",
+    })
+
+    def fake_call_llm(prompt):
+        captured_prompts.append(prompt)
+        if len(captured_prompts) == 1:
+            return "摘要内容。"
+        return good_json
+
+    db = SessionLocal()
+    try:
+        paper = _make_paper(db)
+        paper_id = paper.id
+    finally:
+        db.close()
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        llm_mod.summarize_and_score(paper_id)
+
+    assert len(captured_prompts) == 2
+    impact_prompt = captured_prompts[1]
+    assert "Write your entire response in Chinese" not in impact_prompt
+    assert "impact_rationale" in impact_prompt
+    assert "Chinese" in impact_prompt

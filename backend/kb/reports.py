@@ -6,6 +6,7 @@ import logging
 from kb.database import SessionLocal
 from kb.models import Paper, DailyReport
 from kb.processing.llm import call_llm
+from kb.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,9 @@ def generate_daily_report(date: datetime.date | None = None) -> DailyReport:
 
         if not papers:
             content = (
-                f"No new papers were ingested on {date.isoformat()}. "
-                "Check the ingestion pipeline."
+                f"{date.isoformat()} 无新论文入库，请检查采集流水线。"
+                if settings.language == "zh"
+                else f"No new papers were ingested on {date.isoformat()}. Check the ingestion pipeline."
             )
             report = _upsert_report(db, existing, start, date, content, [])
             return report
@@ -74,6 +76,17 @@ PAPERS:
 
 Write a professional, technical report. No fluff. Keep it concise but informative."""
 
+        if settings.language == "zh":
+            prompt += (
+                "\n\nIMPORTANT: Write the entire report in Chinese (简体中文). "
+                "Use the following Chinese section names instead of the English ones above:\n"
+                "1. **概要** (Executive Summary)\n"
+                "2. **重点论文** (Top Papers)\n"
+                "3. **主题趋势** (Key Themes)\n"
+                "4. **潜力之作** (Hidden Gems)\n"
+                "5. **推荐阅读** (Recommended Reading)"
+            )
+
         content = call_llm(prompt) or "(LLM produced no output)"
         report = _upsert_report(
             db, existing, start, date, content, [p.id for p in papers[:15]]
@@ -92,7 +105,11 @@ def _upsert_report(
     content: str,
     paper_ids: list[int],
 ) -> DailyReport:
-    title = f"Daily Research Report — {date.isoformat()}"
+    title = (
+        f"每日研究简报 — {date.isoformat()}"
+        if settings.language == "zh"
+        else f"Daily Research Report — {date.isoformat()}"
+    )
     if existing is not None:
         existing.title = title
         existing.content = content

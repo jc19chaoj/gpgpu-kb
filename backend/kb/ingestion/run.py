@@ -5,6 +5,7 @@ import logging
 
 from sqlalchemy import func
 
+from kb.config import settings
 from kb.database import SessionLocal
 from kb.ingestion.arxiv import fetch_recent_papers, save_papers
 from kb.ingestion.rss import fetch_recent_posts, save_posts
@@ -13,14 +14,14 @@ from kb.models import Paper
 
 logger = logging.getLogger(__name__)
 
-# Lookback window bounds. Empty DB → EMPTY_DB_DAYS (cold start);
-# otherwise gap = today − MAX(ingested_date), clamped to [GAP_MIN, GAP_MAX].
-GAP_MIN_DAYS = 1
-GAP_MAX_DAYS = 30
-EMPTY_DB_DAYS = 30
-
 
 def _compute_days_back() -> int:
+    """Pick a lookback window. Empty DB → cold-start backfill; otherwise the
+    gap since the most recent ingested_date, clamped to [min, max].
+
+    All three bounds come from `kb.config.settings` (KB_INGEST_*) so operators
+    can tune the cold-start window or relax the cap for big backfills.
+    """
     db = SessionLocal()
     try:
         last = db.query(func.max(Paper.ingested_date)).scalar()
@@ -28,12 +29,15 @@ def _compute_days_back() -> int:
         db.close()
 
     if last is None:
-        return EMPTY_DB_DAYS
+        return settings.ingest_empty_db_days
 
     if last.tzinfo is None:
         last = last.replace(tzinfo=datetime.UTC)
     gap_days = (datetime.datetime.now(datetime.UTC) - last).days
-    return min(max(gap_days, GAP_MIN_DAYS), GAP_MAX_DAYS)
+    return min(
+        max(gap_days, settings.ingest_gap_min_days),
+        settings.ingest_gap_max_days,
+    )
 
 
 def run_ingestion(days_back: int | None = None) -> dict[str, int]:

@@ -126,10 +126,17 @@ def test_generate_daily_report_upsert_no_integrity_error():
 # ─── Empty case: no papers → placeholder content ──────────────────
 
 
-def test_generate_daily_report_empty_db_returns_placeholder():
-    """When no papers are processed at all, report contains the 'No new papers' placeholder."""
+def test_generate_daily_report_empty_db_returns_placeholder(monkeypatch):
+    """When no papers are processed at all, report contains the 'No new papers' placeholder.
+
+    Pin language='en' so the assertion text matches regardless of the operator's
+    KB_LANGUAGE setting (the zh placeholder uses '无新论文入库').
+    """
+    from kb import config
     from kb.models import DailyReport
     import kb.reports as reports_mod
+
+    monkeypatch.setattr(config.settings, "language", "en")
 
     future_date = datetime.date(2099, 12, 30)
 
@@ -183,3 +190,115 @@ def test_generate_daily_report_empty_db_returns_placeholder():
     assert report is not None
     assert "No new papers" in report.content
     assert future_date.isoformat() in report.content
+
+
+# ─── Chinese mode tests ───────────────────────────────────────────
+
+
+def test_report_title_chinese_when_lang_zh(monkeypatch):
+    """When settings.language='zh', report title should contain '每日研究简报'."""
+    from kb.database import SessionLocal
+    import kb.reports as reports_mod
+    import kb.config as config
+
+    test_date = _YESTERDAY - datetime.timedelta(days=200)
+
+    db = SessionLocal()
+    try:
+        _seed_papers(db, 2, test_date)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(config.settings, "language", "zh")
+    with patch.object(reports_mod, "call_llm", return_value="## 报告\n内容"):
+        report = reports_mod.generate_daily_report(date=test_date)
+
+    assert "每日研究简报" in report.title
+
+
+def test_report_prompt_includes_chinese_instruction_zh(monkeypatch):
+    """When settings.language='zh', prompt passed to call_llm should contain Chinese section names."""
+    from kb.database import SessionLocal
+    import kb.reports as reports_mod
+    import kb.config as config
+
+    test_date = _YESTERDAY - datetime.timedelta(days=201)
+
+    db = SessionLocal()
+    try:
+        _seed_papers(db, 1, test_date)
+    finally:
+        db.close()
+
+    captured_prompts = []
+
+    def _capture_llm(prompt):
+        captured_prompts.append(prompt)
+        return "## 报告\n内容"
+
+    monkeypatch.setattr(config.settings, "language", "zh")
+    with patch.object(reports_mod, "call_llm", side_effect=_capture_llm):
+        reports_mod.generate_daily_report(date=test_date)
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+    assert "概要" in prompt
+    assert "重点论文" in prompt
+    assert "Chinese" in prompt
+
+
+def test_report_empty_placeholder_chinese_when_lang_zh(monkeypatch):
+    """When settings.language='zh' and no papers exist, placeholder should contain '无新论文入库'."""
+    import kb.reports as reports_mod
+    import kb.config as config
+    from kb.models import DailyReport
+
+    future_date = datetime.date(2099, 12, 31)
+
+    created_reports = []
+
+    class _FakeQuery:
+        def __init__(self, model):
+            self._model = model
+
+        def filter(self, *a, **kw):
+            return self
+
+        def order_by(self, *a, **kw):
+            return self
+
+        def limit(self, *a):
+            return self
+
+        def first(self):
+            return None
+
+        def all(self):
+            return []
+
+    class _FakeSession:
+        def query(self, model):
+            return _FakeQuery(model)
+
+        def add(self, obj):
+            created_reports.append(obj)
+
+        def commit(self):
+            for obj in created_reports:
+                if not getattr(obj, "id", None):
+                    obj.id = 9998
+
+        def refresh(self, obj):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(config.settings, "language", "zh")
+    with patch.object(reports_mod, "call_llm", return_value="should not be called") as mock_llm, \
+         patch.object(reports_mod, "SessionLocal", return_value=_FakeSession()):
+        report = reports_mod.generate_daily_report(date=future_date)
+
+    mock_llm.assert_not_called()
+    assert report is not None
+    assert "无新论文入库" in report.content
