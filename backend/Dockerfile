@@ -62,4 +62,11 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
 
-CMD ["uvicorn", "kb.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --timeout-keep-alive 75: uvicorn's default (5s) races with the Next.js
+# fetch-agent connection pool when /api/* is reverse-proxied through Next
+# (see frontend/next.config.ts rewrites). If the upstream closes a keep-alive
+# socket while the proxy still has it pooled, the next reuse fails with
+# ECONNRESET and the frontend shows "Sorry, I couldn't process that query".
+# Bumping the upstream timeout above any reasonable proxy idle window
+# eliminates the race (same pattern as AWS ELB / nginx upstream guidance).
+CMD ["uvicorn", "kb.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]

@@ -778,3 +778,71 @@ def test_impact_prompt_no_entire_response_chinese(monkeypatch):
     assert "Write your entire response in Chinese" not in score_prompt
     assert "score_rationale" in score_prompt
     assert "Chinese" in score_prompt
+
+
+# ─── stream_llm provider switching ────────────────────────────────
+
+
+def test_stream_llm_yields_provider_chunks(monkeypatch):
+    """stream_llm should pass through chunks from the configured provider."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    def _mock_stream(prompt: str):
+        assert prompt == "test prompt"
+        yield "alpha "
+        yield "beta"
+
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "hermes", _mock_stream)
+    chunks = list(llm_mod.stream_llm("test prompt"))
+    assert chunks == ["alpha ", "beta"]
+
+
+def test_stream_llm_silent_on_exception(monkeypatch):
+    """A provider that raises mid-stream should NOT propagate; the
+    generator should end cleanly (mirrors call_llm's empty-string contract)."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    def _bad_stream(prompt: str):
+        yield "first chunk"
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "hermes", _bad_stream)
+    chunks = list(llm_mod.stream_llm("p"))
+    # The first chunk yields fine; the exception is swallowed and the
+    # generator ends silently.
+    assert chunks == ["first chunk"]
+
+
+def test_stream_llm_routes_to_anthropic(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    def _mock_stream(prompt: str):
+        yield "anthropic-stream"
+
+    monkeypatch.setattr(config.settings, "llm_provider", "anthropic")
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "anthropic", _mock_stream)
+    assert list(llm_mod.stream_llm("p")) == ["anthropic-stream"]
+
+
+def test_stream_hermes_falls_back_to_call_hermes(monkeypatch):
+    """Hermes can't truly stream — it must yield call_hermes's full output
+    as a single chunk so the API contract holds across providers."""
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "_call_hermes", lambda prompt: "full hermes body")
+    chunks = list(llm_mod._stream_hermes("p"))
+    assert chunks == ["full hermes body"]
+
+
+def test_stream_hermes_empty_yields_nothing(monkeypatch):
+    """When hermes returns "" (timeout, missing CLI, error), the stream
+    should produce zero chunks rather than yielding an empty string."""
+    from kb.processing import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "_call_hermes", lambda prompt: "")
+    assert list(llm_mod._stream_hermes("p")) == []

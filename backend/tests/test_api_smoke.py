@@ -484,3 +484,130 @@ def test_chat_history_max_length_capped(client):
     history = [{"role": "user", "content": str(i)} for i in range(100)]
     r = client.post("/api/chat", json={"query": "hi", "history": history})
     assert r.status_code == 422
+
+
+# ─── Chat (streaming) — /api/chat/stream ──────────────────────────
+
+
+def _drain_sse(client, payload: dict) -> tuple[int, str, list[tuple[str, dict]]]:
+    """Send a POST to /api/chat/stream, drain the SSE body, and parse it
+    into a list of (event_name, data_dict) tuples. Returns (status, content_type, frames)."""
+    import json
+
+    with client.stream("POST", "/api/chat/stream", json=payload) as r:
+        status = r.status_code
+        content_type = r.headers.get("content-type", "")
+        if status != 200:
+            # body fully consumed via iter_text so the connection can close.
+            "".join(r.iter_text())
+            return status, content_type, []
+        body = "".join(r.iter_text())
+
+    frames: list[tuple[str, dict]] = []
+    for raw in body.split("\n\n"):
+        if not raw.strip():
+            continue
+        event = ""
+        data = ""
+        for line in raw.split("\n"):
+            if line.startswith("event:"):
+                event = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data += line[len("data:"):].strip()
+        if event:
+            frames.append((event, json.loads(data) if data else {}))
+    return status, content_type, frames
+
+
+def test_chat_stream_emits_sources_token_done(client, monkeypatch):
+    """Happy path: source-anchored stream emits sources, token(s), then done
+    in that order, in valid SSE format."""
+    pid = _seed_paper_for_chat("stream-happy", full_text="STREAMING_BODY_TOKEN")
+
+    captured: dict[str, str] = {}
+
+    def _fake_stream_llm(prompt: str):
+        captured["prompt"] = prompt
+        yield "Hello "
+        yield "world"
+
+    from kb import main as main_mod
+    monkeypatch.setattr(main_mod, "stream_llm", _fake_stream_llm)
+
+    status, ct, frames = _drain_sse(client, {"query": "what is this", "paper_id": pid})
+    assert status == 200
+    assert "text/event-stream" in ct
+    # Source body made it into the prompt (paper_id mode).
+    assert "STREAMING_BODY_TOKEN" in captured["prompt"]
+
+    events = [name for name, _ in frames]
+    assert events[0] == "sources"
+    assert events[-1] == "done"
+    assert "token" in events
+    # Sources frame contains exactly the chosen paper.
+    sources_payload = next(d for n, d in frames if n == "sources")
+    assert len(sources_payload["sources"]) == 1
+    assert sources_payload["sources"][0]["id"] == pid
+    # Token chunks accumulate to the full output.
+    token_text = "".join(d["content"] for n, d in frames if n == "token")
+    assert token_text == "Hello world"
+
+
+def test_chat_stream_history_injects_prior_turns(client, monkeypatch):
+    captured: dict[str, str] = {}
+
+    def _fake_stream_llm(prompt: str):
+        captured["prompt"] = prompt
+        yield "ok"
+
+    from kb import main as main_mod
+    monkeypatch.setattr(main_mod, "stream_llm", _fake_stream_llm)
+
+    payload = {
+        "query": "follow up",
+        "history": [
+            {"role": "user", "content": "STREAM_HIST_TOKEN_A"},
+            {"role": "assistant", "content": "STREAM_HIST_TOKEN_B"},
+        ],
+    }
+    status, _, frames = _drain_sse(client, payload)
+    assert status == 200
+    assert "STREAM_HIST_TOKEN_A" in captured["prompt"]
+    assert "STREAM_HIST_TOKEN_B" in captured["prompt"]
+    assert any(n == "done" for n, _ in frames)
+
+
+def test_chat_stream_paper_id_404(client):
+    """paper_id pointing to a missing row returns HTTP 404 *before* the
+    stream begins — clients see a normal error, not an empty stream."""
+    status, _, _ = _drain_sse(client, {"query": "hi", "paper_id": 999_999})
+    assert status == 404
+
+
+def test_chat_stream_empty_output_yields_placeholder(client, monkeypatch):
+    """If the provider yields nothing (e.g. hermes empty), the endpoint
+    still emits a placeholder token so the client always sees one token
+    event between sources and done — matches /api/chat's
+    '(LLM produced no output)' contract."""
+
+    def _fake_stream_llm(prompt: str):
+        return
+        yield  # makes this a generator function
+
+    from kb import main as main_mod
+    monkeypatch.setattr(main_mod, "stream_llm", _fake_stream_llm)
+
+    status, _, frames = _drain_sse(client, {"query": "hi"})
+    assert status == 200
+    token_payload = next(d for n, d in frames if n == "token")
+    assert token_payload["content"] == "(LLM produced no output)"
+
+
+def test_chat_stream_history_role_validated(client):
+    """Same Pydantic guard as /api/chat — system role is rejected at 422
+    before the stream begins."""
+    status, _, _ = _drain_sse(
+        client,
+        {"query": "hi", "history": [{"role": "system", "content": "rogue"}]},
+    )
+    assert status == 422

@@ -10,6 +10,7 @@ Providers (selected via KB_LLM_PROVIDER):
 import json
 import logging
 import subprocess
+from collections.abc import Iterator
 from typing import Any
 
 from kb.config import settings
@@ -118,6 +119,113 @@ def call_llm(prompt: str) -> str:
     except Exception:
         logger.exception("LLM provider %s raised", settings.llm_provider)
         return ""
+
+
+# ─── Streaming provider implementations ───────────────────────────
+#
+# Mirror `_call_*` but yield incremental text chunks. Used by /api/chat/stream.
+# Hermes is a subprocess and cannot truly stream — it yields its full output
+# as a single chunk so the API contract holds across providers.
+
+def _stream_hermes(prompt: str) -> Iterator[str]:
+    text = _call_hermes(prompt)
+    if text:
+        yield text
+
+
+def _stream_anthropic(prompt: str) -> Iterator[str]:
+    if not settings.anthropic_api_key:
+        logger.error("KB_LLM_PROVIDER=anthropic but no ANTHROPIC_API_KEY is set")
+        return
+    try:
+        import anthropic  # type: ignore
+    except ImportError:
+        logger.error("anthropic SDK not installed; pip install -e '.[llm-cloud]'")
+        return
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    with client.messages.stream(
+        model=settings.anthropic_model,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        for text in stream.text_stream:
+            if text:
+                yield text
+
+
+def _stream_openai_compatible(
+    prompt: str, *, api_key: str, model: str, base_url: str | None = None
+) -> Iterator[str]:
+    """Shared body for openai-protocol providers (openai + deepseek)."""
+    try:
+        import openai  # type: ignore
+    except ImportError:
+        logger.error("openai SDK not installed; pip install -e '.[llm-cloud]'")
+        return
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = openai.OpenAI(**client_kwargs)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        stream=True,
+        timeout=settings.llm_timeout_seconds,
+    )
+    for chunk in resp:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        text = getattr(delta, "content", None)
+        if text:
+            yield text
+
+
+def _stream_openai(prompt: str) -> Iterator[str]:
+    if not settings.openai_api_key:
+        logger.error("KB_LLM_PROVIDER=openai but no OPENAI_API_KEY is set")
+        return
+    yield from _stream_openai_compatible(
+        prompt, api_key=settings.openai_api_key, model=settings.openai_model
+    )
+
+
+def _stream_deepseek(prompt: str) -> Iterator[str]:
+    if not settings.deepseek_api_key:
+        logger.error("KB_LLM_PROVIDER=deepseek but no DEEPSEEK_API_KEY is set")
+        return
+    yield from _stream_openai_compatible(
+        prompt,
+        api_key=settings.deepseek_api_key,
+        model=settings.deepseek_model,
+        base_url=settings.deepseek_base_url,
+    )
+
+
+_STREAM_PROVIDERS = {
+    "hermes": _stream_hermes,
+    "anthropic": _stream_anthropic,
+    "openai": _stream_openai,
+    "deepseek": _stream_deepseek,
+}
+
+
+def stream_llm(prompt: str) -> Iterator[str]:
+    """Public streaming LLM call. Mirrors `call_llm`'s contract:
+    on any failure the generator ends silently — never raises."""
+    provider = _STREAM_PROVIDERS.get(settings.llm_provider)
+    if provider is None:
+        logger.error(
+            "Unknown KB_LLM_PROVIDER=%r; falling back to hermes (stream)",
+            settings.llm_provider,
+        )
+        provider = _stream_hermes
+    try:
+        yield from provider(prompt)
+    except Exception:
+        logger.exception("LLM stream provider %s raised", settings.llm_provider)
+        # silent end: matches call_llm's empty-string contract
 
 
 # ─── Helpers ──────────────────────────────────────────────────────

@@ -1,17 +1,18 @@
 {
-  "schema_version": "1.1",
-  "generated_at": "2026-05-02T08:57:04Z",
+  "schema_version": "1.2",
+  "generated_at": "2026-05-02T21:18:53Z",
   "generator": "init-architect (adaptive)",
   "project": {
     "name": "gpgpu-kb",
-    "summary": "Self-updating GPGPU chip-architecture research knowledge base. Daily ingest of ArXiv / curated RSS / GitHub trending; per-source-type LLM scoring on universal axes (quality, relevance); ChromaDB-backed semantic search and RAG chat over the corpus; bilingual (en/zh) Markdown daily reports; Dockerized deployment with optional cron pipeline.",
+    "summary": "Self-updating GPGPU chip-architecture research knowledge base. Daily ingest of ArXiv / curated RSS / GitHub trending; per-source-type LLM scoring on universal axes (quality, relevance); ChromaDB-backed semantic search and multi-turn / source-anchored RAG chat with on-demand arxiv PDF full-text loading and SSE streaming token output over the corpus; bilingual (en/zh) Markdown daily reports; Dockerized deployment with optional cron pipeline.",
     "type": "monorepo (backend + frontend)",
     "primary_languages": ["Python 3.12", "TypeScript 5"],
     "stack": [
       "FastAPI", "SQLAlchemy 2", "Pydantic 2",
-      "ChromaDB", "sentence-transformers",
+      "ChromaDB", "sentence-transformers", "pypdf",
+      "Server-Sent Events (text/event-stream)",
       "Next.js 16 (App Router, standalone)", "React 19",
-      "Tailwind v4", "shadcn/ui",
+      "Tailwind v4", "shadcn/ui (Tabs / Dialog)",
       "Playwright (e2e)",
       "Docker Compose"
     ]
@@ -26,6 +27,8 @@
         "backend/kb/main.py",
         "backend/kb/daily.py",
         "backend/kb/ingestion/run.py",
+        "backend/kb/processing/llm.py",
+        "backend/kb/processing/pdf.py",
         "backend/kb/scripts/rescore_non_papers.py",
         "backend/run_api.sh",
         "backend/Dockerfile"
@@ -34,22 +37,31 @@
         "GET /api/papers (sort_by adds quality_score|relevance_score|total_score; default total_score; include_low_quality flag)",
         "GET /api/papers/search (semantic with keyword fallback; LIKE wildcards escaped)",
         "GET /api/papers/{paper_id}",
-        "POST /api/chat (optional Bearer token via KB_CHAT_TOKEN, hmac.compare_digest)",
+        "POST /api/chat (optional Bearer token via KB_CHAT_TOKEN, hmac.compare_digest; supports paper_id (source-anchored) + history[] (multi-turn); shares _build_chat_context with /api/chat/stream)",
+        "POST /api/chat/stream (NEW: SSE text/event-stream; same Bearer guard + paper_id + history; events: sources -> token... -> done [+ optional error]; HTTPException raised before stream begins)",
         "GET /api/reports",
         "GET /api/reports/{report_id}",
         "GET /api/stats (adds top_overall: cross-source-type top-5 by max(quality, relevance))",
         "GET /api/health"
       ],
       "data_models": [
-        "Paper (papers): now includes universal score axes quality_score / relevance_score / score_rationale alongside legacy originality_score / impact_score / impact_rationale",
+        "Paper (papers): includes universal score axes quality_score / relevance_score / score_rationale alongside legacy originality_score / impact_score / impact_rationale; full_text TEXT column lazily populated by source-anchored chat (PDF extraction)",
         "DailyReport (daily_reports)"
       ],
-      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env). New fields: language, ingest_empty_db_days, ingest_gap_min_days, ingest_gap_max_days, deepseek_*, chat_token, quality_score_threshold, data_dir.",
-      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev). Docker controls extras via ARG INSTALL_EXTRAS=ml,llm-cloud (default).",
-      "tests": "backend/tests/ (~95 tests, coverage ~74%). New coverage: per-source-type rubrics (paper/blog/talk/project), Chinese mode prompt injection, JSON-key translation rejection, non-paper bypass of quality gate, paper legacy field mirroring, top_overall, LIKE escape, RSS dict-categories backfill.",
-      "llm_providers": ["hermes (local CLI; not available in Docker)", "anthropic", "openai", "deepseek (reuses openai SDK with base_url)"],
+      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env). Fields: language, ingest_empty_db_days, ingest_gap_min_days, ingest_gap_max_days, deepseek_*, chat_token, quality_score_threshold, data_dir, llm_timeout_seconds (also passed to streaming providers), etc.",
+      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev). Default deps include pypdf>=5.0 (for source-anchored chat PDF extraction). Docker controls extras via ARG INSTALL_EXTRAS=ml,llm-cloud (default).",
+      "tests": "backend/tests/ (~115 tests, coverage ~74%). Coverage spans per-source-type rubrics (paper/blog/talk/project), Chinese mode prompt injection, JSON-key translation rejection, non-paper bypass of quality gate, paper legacy field mirroring, top_overall, LIKE escape, RSS dict-categories backfill, chat paper_id source-anchored mode prompt injection + 404 + sources scoping, chat history[] injection + role pattern + max_length=40, test_processing_pdf.py (cache hit / download+extract+persist / abstract fallback / missing paper / download failure non-poisoning), NEW: 5 SSE cases in test_api_smoke.py (_drain_sse helper; happy path event sequence sources->token->done with full_text token in prompt + sources scoped to chosen paper + tokens concatenate to full output; history injection into stream prompt; paper_id 404 raised BEFORE stream begins; empty stream_llm output -> placeholder '(LLM produced no output)' token; system role rejected at 422 before stream begins), NEW: 5 stream_llm cases in test_processing_llm.py (route to _STREAM_PROVIDERS[provider]; mid-stream exception swallowed silently while preserving already-yielded chunks; anthropic route; _stream_hermes single-chunk fallback via _call_hermes; _call_hermes empty -> _stream_hermes yields nothing).",
+      "llm_providers": ["hermes (local CLI; not available in Docker; cannot truly stream — _stream_hermes yields _call_hermes output as a single chunk)", "anthropic (messages.stream / text_stream for SSE)", "openai (stream=True via _stream_openai_compatible)", "deepseek (reuses openai SDK + base_url via _stream_openai_compatible)"],
+      "llm_streaming": {
+        "public_api": "stream_llm(prompt) -> Iterator[str], parallel to call_llm(prompt) -> str. Both swallow provider exceptions (call_llm returns ''; stream_llm ends generator silently — never raises).",
+        "registry": "_STREAM_PROVIDERS dict {hermes, anthropic, openai, deepseek} captured at import time, parallel to _PROVIDERS. Adding a new provider requires updating BOTH dicts.",
+        "openai_compatible_helper": "_stream_openai_compatible(prompt, *, api_key, model, base_url=None) shared body used by _stream_openai and _stream_deepseek (stream=True; chunk.choices[0].delta.content). New OpenAI-compatible providers (Together / Groq / internal gateway) should reuse this helper rather than reconstructing the client.",
+        "anthropic_streaming": "_stream_anthropic uses client.messages.stream(...).text_stream context manager.",
+        "hermes_fallback": "_stream_hermes calls _call_hermes (subprocess), yields the full result as a single chunk; if _call_hermes returns '' (timeout, missing CLI, error), yields nothing — the SSE endpoint then emits a placeholder '(LLM produced no output)' token so clients always see one token between sources and done."
+      },
       "auth": {
-        "chat_endpoint": "Optional Bearer token via KB_CHAT_TOKEN; compared via hmac.compare_digest in verify_chat_token (Depends in /api/chat)."
+        "chat_endpoint": "Optional Bearer token via KB_CHAT_TOKEN; compared via hmac.compare_digest in verify_chat_token (Depends in /api/chat AND /api/chat/stream — same guard).",
+        "stream_endpoint_same_guard": "/api/chat/stream uses dependencies=[Depends(verify_chat_token)]; identical to /api/chat. Any new chat-family endpoint must reuse this dependency."
       },
       "scoring": {
         "axes": ["quality_score", "relevance_score"],
@@ -60,22 +72,38 @@
           "project": ["Innovation", "Maturity"]
         },
         "quality_gate": "max(quality, relevance) >= KB_QUALITY_SCORE_THRESHOLD (default 7.0). Applied ONLY to source_type=paper. Non-papers always go to is_processed=1 on JSON parse success. JSON parse failure / translated keys / missing keys leave is_processed=0 for retry.",
-        "paper_legacy_mirror": "For papers, summarize_and_score copies quality→originality_score, relevance→impact_score, score_rationale→impact_rationale to keep legacy API consumers and stored reports stable."
+        "paper_legacy_mirror": "For papers, summarize_and_score copies quality->originality_score, relevance->impact_score, score_rationale->impact_rationale to keep legacy API consumers and stored reports stable."
       },
       "ingestion": {
         "rss_feeds_count": 11,
         "removed_feeds": ["AnandTech (site shut down 2024)", "Meta AI Blog (no public RSS)"],
         "active_feeds_examples": ["semiengineering.com", "chipsandcheese.com", "semianalysis.substack.com", "openai.com/news", "blog.google", "huggingface.co/blog", "developer.nvidia.com/blog", "research.nvidia.com", "lilianweng.github.io", "karpathy.github.io", "interconnects.ai"],
-        "adaptive_lookback": "kb/ingestion/run.py::_compute_days_back(): empty DB → KB_INGEST_EMPTY_DB_DAYS; otherwise now - max(ingested_date) clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS]."
+        "adaptive_lookback": "kb/ingestion/run.py::_compute_days_back(): empty DB -> KB_INGEST_EMPTY_DB_DAYS; otherwise now - max(ingested_date) clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS]."
       },
       "cold_start_handling": "kb.daily detects whether any paper has is_processed != 0 (processing) and whether any is_processed=1 row has chroma_id != '' (embedding). If neither, run_processing / index_unindexed_papers run with batch_size=None to drain the entire backlog. Steady-state runs cap at 100/run.",
       "chinese_mode": {
         "env_var": "KB_LANGUAGE",
         "values": ["en (default)", "zh"],
-        "scope": "summarize prompt suffix, score_rationale value (JSON keys stay English), daily report content + title + section names. CLI override: python -m kb.daily --lang zh."
+        "scope": "summarize prompt suffix, score_rationale value (JSON keys stay English), daily report content + title + section names. CLI override: python -m kb.daily --lang zh.",
+        "chat_prompt_now_hardcoded_chinese": "AS OF 2026-05-02 21:18:53: /api/chat and /api/chat/stream system prompts are HARDCODED to Chinese ('你是一名资深的 GPGPU 芯片架构助理 ...') in _build_chat_context — KB_LANGUAGE no longer affects them. Reverting to English requires editing the template directly. Both endpoints use the SAME prompt source (one place to change)."
+      },
+      "chat_extensions_2026_05_02": {
+        "schema": "ChatMessage(role: user|assistant, content min_length=1 max_length=chat_query_max_len*4); ChatRequest now has paper_id: int | None and history: list[ChatMessage] (max_length=40)",
+        "source_anchored_mode": "When paper_id is set, /api/chat AND /api/chat/stream skip RAG retrieval, call fetch_full_text(paper_id) (downloads PDF + extracts via pypdf, caches to Paper.full_text on success; abstract+summary fallback on failure without poisoning cache), feed entire body into prompt, return sources=[that paper] only. paper_id missing -> 404 (raised BEFORE the SSE stream starts in /api/chat/stream).",
+        "history_injection": "_format_history renders the most recent _HISTORY_TURN_CAP=12 turns (each truncated to 4000 chars) inside the UNTRUSTED block. Both RAG and source-anchored modes use the same path. Pydantic max_length=40 is the API-level DoS bound; the 12-turn cap is the prompt-budget bound — independent knobs.",
+        "pdf_module": "kb/processing/pdf.py: _download_pdf via httpx.Client.stream (20MB max, 30s timeout); _extract_text via pypdf with per-page error tolerance; _MAX_EXTRACTED_CHARS=120000 truncation before persisting; non-PDF URLs -> summary+abstract fallback (NOT cached).",
+        "uvicorn_keepalive_fix": "Both backend/Dockerfile CMD and backend/run_api.sh now pass --timeout-keep-alive 75 to avoid ECONNRESET races between uvicorn's 5s default keep-alive and the Next.js reverse-proxy connection pool (symptom: random 'Sorry, I couldn't process that query' on the chat page). Especially critical for /api/chat/stream which holds the connection open for the entire LLM generation."
+      },
+      "chat_streaming_2026_05_02_21_18": {
+        "endpoint": "POST /api/chat/stream returns text/event-stream with headers Cache-Control: no-cache + X-Accel-Buffering: no (defeats nginx/cpolar buffering).",
+        "shared_context_builder": "NEW _build_chat_context(req, db) -> tuple[str, list[PaperOut]] extracts the prompt + sources construction so /api/chat and /api/chat/stream share one source of truth. Any rubric / sanitization / history-format change propagates to both endpoints automatically.",
+        "sse_helper": "NEW _sse_event(event, data) renders 'event: <name>\\ndata: <json>\\n\\n' with json.dumps(..., ensure_ascii=False) so Chinese stays compact in transit.",
+        "event_sequence": "sources (exactly 1; payload {sources:[PaperOut...]}) -> token (>=1; payload {content:'<chunk>'}; if stream_llm yields nothing, a placeholder '(LLM produced no output)' token is emitted so clients always see one token between sources and done) -> done (exactly 1; payload {}). Optional 'error' frame (payload {message:'...'}) — currently stream_llm failures are swallowed silently and no error frame is emitted; clients distinguish via 'no token before done'.",
+        "http_error_invariant": "ORDER INVARIANT: _build_chat_context MUST run synchronously in the request handler BEFORE StreamingResponse is constructed. Otherwise HTTPException (e.g. paper_id 404) would be swallowed inside an already-200 streaming response. The current implementation enforces this by calling _build_chat_context outside event_stream().",
+        "constants": ["_SOURCE_TEXT_PROMPT_CAP=60000 (chars of full_text injected into source-anchored prompt)", "_HISTORY_TURN_CAP=12 (most recent turns rendered into prompt)"]
       },
       "docker": {
-        "dockerfile": "backend/Dockerfile (python:3.12-slim, build-essential + curl, ARG INSTALL_EXTRAS=ml,llm-cloud, VOLUME /app/data, HEALTHCHECK /api/health, CMD uvicorn)",
+        "dockerfile": "backend/Dockerfile (python:3.12-slim, build-essential + curl, ARG INSTALL_EXTRAS=ml,llm-cloud, VOLUME /app/data, HEALTHCHECK /api/health, CMD uvicorn ... --timeout-keep-alive 75; comments now spell out the ECONNRESET race vs Next.js fetch-agent connection pool)",
         "dockerignore": "backend/.dockerignore (excludes data/, tests/, *.md, .venv, .pytest_cache, etc.)",
         "compose_overrides": ["KB_DATABASE_URL=sqlite:////app/data/kb.sqlite", "KB_CHROMA_DIR=/app/data/chroma", "KB_DATA_DIR=/app/data", "KB_CORS_ORIGINS=[\"http://localhost:3000\",\"http://127.0.0.1:3000\"]"],
         "daily_profile": "docker compose --profile cron run --rm daily (one-shot pipeline reusing backend image)"
@@ -94,26 +122,32 @@
         "backend/kb/ingestion/run.py",
         "backend/kb/processing/llm.py",
         "backend/kb/processing/embeddings.py",
+        "backend/kb/processing/pdf.py",
         "backend/kb/scripts/rescore_non_papers.py",
         "backend/Dockerfile",
+        "backend/run_api.sh",
         "backend/.dockerignore",
+        "backend/pyproject.toml",
         "backend/tests/README.md",
         "backend/tests/conftest.py",
         "backend/tests/test_api_smoke.py",
         "backend/tests/test_processing_llm.py",
+        "backend/tests/test_processing_pdf.py",
         "backend/tests/test_reports.py",
         "backend/tests/test_ingestion_rss.py"
       ],
       "claude_md": "backend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 28,
+        "scanned_files": 9,
         "high_confidence": true,
         "gaps": [
-          "未读取 backend/kb/ingestion/arxiv.py 与 github_trending.py 源代码（按 README 描述总结，关键字段如 cs.* 类目数与 polite-sleep 路径未直接证实）",
+          "未读取 backend/kb/ingestion/arxiv.py 与 github_trending.py 源代码本轮（沿用前一刷新结论）",
+          "未读取 backend/kb/processing/embeddings.py 源代码本轮（沿用前一刷新结论）",
+          "未读取 backend/kb/processing/pdf.py 源代码本轮（沿用上一刷新结论）",
           "未读取 backend/tests/conftest.py 内部细节（仅依赖 README 说明 _init_db / client 夹具）",
-          "未读取 backend/pyproject.toml 完整内容；extras 列表来自代码注释与 docker-compose 默认值",
-          "backend/kb/scripts/__init__.py 是否存在未确认（鉴于 README 用 -m kb.scripts.rescore_non_papers，应该是 package）",
-          "未读取 frontend/tests/e2e/ 下具体测试用例文件，无法列出场景矩阵"
+          "未读取 backend/kb/scripts/rescore_non_papers.py 源代码本轮（沿用前一刷新结论）",
+          "未读取 backend/kb/config.py 全文以核对所有字段（沿用前一刷新结论 + 现 schemas/main 推断）",
+          "未读取 backend/kb/schemas.py / models.py / database.py 本轮（沿用上一刷新结论；本轮 git status 中也未修改）"
         ]
       }
     },
@@ -125,27 +159,33 @@
       "entry_points": [
         "frontend/src/app/layout.tsx",
         "frontend/src/app/page.tsx",
+        "frontend/src/app/chat/page.tsx",
+        "frontend/src/hooks/use-conversation-history.ts",
+        "frontend/src/components/chat/chat-right-sidebar.tsx",
+        "frontend/src/components/chat/source-picker.tsx",
+        "frontend/src/lib/api.ts",
+        "frontend/src/lib/types.ts",
         "frontend/next.config.ts",
         "frontend/Dockerfile"
       ],
       "pages": [
         "/ (Browse + Search; default sort_by=total_score)",
-        "/chat (RAG)",
-        "/paper/[id] (Universal Score axes: ScoreCircle x2 with per-source-type labels)",
+        "/chat (Multi-turn streaming RAG via SSE + Source-anchored mode + Stop button + /chat?paperId= deep link)",
+        "/paper/[id] (Universal Score axes; can deep-link to /chat?paperId=)",
         "/reports",
         "/reports/[id]",
         "/stats"
       ],
       "next_config": {
         "output": "standalone",
-        "redirects": ["/search → / (302, permanent: false)"],
-        "rewrites": ["/api/:path* → ${KB_BACKEND_URL}/api/:path*"],
+        "redirects": ["/search -> / (302, permanent: false)"],
+        "rewrites": ["/api/:path* -> ${KB_BACKEND_URL}/api/:path* (proxies SSE for /api/chat/stream too)"],
         "kb_backend_url_default": "http://127.0.0.1:8000",
         "kb_backend_url_docker": "http://backend:8000",
         "build_time_env": ["NEXT_PUBLIC_API_URL (baked into client bundle)", "KB_BACKEND_URL (baked into routes-manifest.json)", "NPM_REGISTRY"]
       },
-      "api_client": "frontend/src/lib/api.ts (API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '' — defaults to same-origin via Next /api proxy)",
-      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py; adds quality_score / relevance_score / score_rationale and Stats.top_overall?)",
+      "api_client": "frontend/src/lib/api.ts (API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '' — defaults to same-origin via Next /api proxy). chat() forwards optional paper_id and history (built incrementally to avoid sending null/undefined). NEW: chatStream(request, {signal?}) async generator — fetch /api/chat/stream with Accept: text/event-stream, response.body.getReader() + TextDecoder, splits on '\\n\\n', _parseSSEFrame decodes into ChatStreamEvent union. _chatPayload(request) is now shared by chat() and chatStream(). _parseSSEFrame joins consecutive 'data:' lines with '\\n' per SSE spec to defend against LLM tokens containing raw newlines that would otherwise glue two JSON objects together and silently drop the frame.",
+      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py + kb/main.py::_sse_event; adds quality_score / relevance_score / score_rationale, Stats.top_overall?, ChatMessage{role:user|assistant,content}, ChatRequest.paper_id? / history?, NEW ChatStreamEvent discriminated union {sources|token|error|done}).",
       "score_labels": {
         "paper": ["Originality", "Impact"],
         "blog": ["Depth", "Actionability"],
@@ -153,8 +193,26 @@
         "project": ["Innovation", "Maturity"]
       },
       "score_resolution": "_resolveScores(paper): paper rows fall back to originality_score/impact_score when universal axes are 0 (legacy data); non-paper rows always use universal axes directly. Mirrored in src/components/paper-card.tsx and src/app/paper/[id]/page.tsx.",
+      "chat_module_2026_05_02": {
+        "page_file": "src/app/chat/page.tsx (Suspense + ChatContent; DisplayMessage extends ChatMessage with renderer-only sources?/error?; _stripDisplay strips WELCOME and error before persistence + before sending to backend)",
+        "history_persistence": "src/hooks/use-conversation-history.ts: localStorage key 'gpgpu-kb.chat.conversations.v1', cap 50 conversations, sorted by updatedAt desc, SSR-safe (returns [] before mount), hydrated flag exposed for sidebars to gate rendering. Conversation = {id,title,paperId?,paperTitle?,messages,updatedAt}. _isConversation guard on read so old/incompatible rows are silently dropped — bump key version when extending schema.",
+        "right_sidebar": "src/components/chat/chat-right-sidebar.tsx: Tabs(History|Source). History = New chat button + scrollable list (active row highlight, hover Trash2 to delete, time-relative timestamps). Source = pinned-paper card with X to clear + Pick source button -> SourcePicker.",
+        "source_picker": "src/components/chat/source-picker.tsx: Dialog + debounced (300ms) searchPapers(q, semantic:false) keyword path; requestSeq.current guards against late-arriving stale-query responses; rows render title + source_type badge + source_name + first 3 authors.",
+        "deep_link": "/chat?paperId=NN auto-pin: useEffect reads searchParams, fetches getPaper(id), startNew({paperId,paperTitle}), setSelectedPaper(paper), router.replace('/chat'). pinnedPaperIdRef avoids React 19 strict-mode double effect AND back/forward re-pinning.",
+        "mobile_responsive": "Right sidebar hidden below lg; input padding uses pb-[max(0.75rem,env(safe-area-inset-bottom))] for iOS home indicator; input height/text size split (h-10 text-base on mobile to defeat iOS auto-zoom, sm:h-9 sm:text-sm on desktop); IME guard via isComposing/keyCode 229 on Enter."
+      },
+      "chat_streaming_2026_05_02_21_18": {
+        "page_file": "src/app/chat/page.tsx — completely rewritten for streaming. DisplayMessage now also has streaming?: boolean (transient, stripped by _stripDisplay alongside WELCOME and error rows).",
+        "send_flow": "handleSend: snapshot priorTurns = _stripDisplay(messages) BEFORE pushing new turn -> push userMsg + empty streaming placeholder -> AbortController stored in abortRef -> for await (const ev of chatStream({query, top_k:5, paper_id:selectedPaper?.id, history:priorTurns.length>0?priorTurns:undefined}, {signal:controller.signal})) handles 'sources'|'token'|'error'|'done' (token uses local snapshot variable to avoid closure staleness when growing accumulated string).",
+        "abort_controller": "abortRef: useRef<AbortController|null>. Aborted by: Stop button, conversation switch (useEffect [history.activeId]), New chat (handleNewChat), /chat?paperId= deep-link change (useEffect [searchParams]), component unmount (cleanup). finally block clears abortRef ONLY if it still points at the controller this handler created — prevents a newer send from being clobbered by an older finally.",
+        "finalize_states": "finally branches three ways: showError = errored && !accumulated (red bubble; NOT persisted); aborted with partial content (preserved + persisted, ChatGPT-style); done (persisted normally). Persistence uses send-start priorTurns snapshot (NOT closure messages) so cross-conversation switches mid-stream don't leak turns into the wrong conversation.",
+        "stop_button": "Loading state swaps the Send button (emerald, lucide Send) for a Stop button (red-600, lucide Square) at the same h-10 w-10 sm:h-9 sm:w-9 footprint. onClick triggers abortRef.current?.abort().",
+        "input_polish": "<Input enterKeyHint='send' ...> hints mobile keyboards to label Enter as 'Send'. Placeholder switches based on selectedPaper. Spinner ('Searching knowledge base...' / 'Reading the source...') only shows while streaming AND placeholder content is still empty — once tokens flow, the markdown bubble takes over.",
+        "stream_decoder": "src/lib/api.ts::chatStream — fetch with Accept: text/event-stream + signal -> response.body.getReader() + TextDecoder accumulator -> split on '\\n\\n' -> _parseSSEFrame decodes into ChatStreamEvent union (sources|token|error|done). finally calls reader.releaseLock() inside try/catch (releaseLock throws after abort/error, safe to swallow). _chatPayload shared with chat() to keep payload shape consistent.",
+        "welcome_copy": "WELCOME message updated to mention right-sidebar source pinning ('Pin a source on the right to chat with a single paper or blog (arXiv PDFs are loaded in full).')."
+      },
       "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*, playwright.config.ts, next.config.ts, Dockerfile, .dockerignore",
-      "tests": "frontend/tests/e2e/ (Playwright, chromium-only, mocked backend)",
+      "tests": "frontend/tests/e2e/ (Playwright, chromium-only, mocked backend). Suggested next additions for 2026-05-02 21:18:53 delta: ① mock text/event-stream response and verify placeholder grows incrementally; ② Stop button triggers AbortController.abort and partial content is persisted (matches ChatGPT); ③ switching conversations mid-stream — old conversation unaffected by lingering tokens; ④ /chat?paperId= deep-link cleanup (URL replaced + selectedPaper set); ⑤ history sidebar render + restore flow.",
       "scripts": {
         "dev": "next dev",
         "build": "next build (produces .next/standalone)",
@@ -181,34 +239,40 @@
         "frontend/src/app/paper/[id]/page.tsx",
         "frontend/src/components/paper-card.tsx",
         "frontend/src/components/search-bar.tsx",
+        "frontend/src/components/chat/chat-right-sidebar.tsx",
+        "frontend/src/components/chat/source-picker.tsx",
+        "frontend/src/hooks/use-conversation-history.ts",
         "frontend/src/lib/api.ts",
         "frontend/src/lib/types.ts",
         "frontend/src/app/globals.css"
       ],
       "claude_md": "frontend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 12,
+        "scanned_files": 3,
         "high_confidence": true,
         "gaps": [
-          "未深入 src/components/ui/* 各 shadcn 原语 (button/card/badge/skeleton/dialog/input/scroll-area)",
-          "未读取 src/app/chat/page.tsx / reports/[id]/page.tsx / stats/page.tsx 内部细节",
+          "未深入 src/components/ui/* shadcn 原语集合 (button/card/dialog/badge/skeleton/input/scroll-area/tabs)",
+          "未读取 src/app/reports/[id]/page.tsx / stats/page.tsx 内部细节",
           "未读取 next.config.ts 之外的 eslint.config.* / tsconfig.json / postcss.config.*",
           "未枚举 tests/e2e/ 下具体测试用例文件",
-          "src/lib/api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON",
-          "src/components/layout/sidebar.tsx 与 header.tsx 未读取（导航结构未直接验证）"
+          "src/lib/api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON / chatStream",
+          "未直接读取 src/components/layout/sidebar.tsx 与 header.tsx（沿用前一刷新结论）",
+          "未读取 src/app/paper/[id]/page.tsx 本轮（推断 'Open in Chat' 跳到 /chat?paperId= 仍存在，未在本轮 git status 中修改）",
+          "未读取 src/hooks/use-conversation-history.ts 本轮（沿用上轮结论；本轮 git status 未修改它）",
+          "未读取 src/components/chat/chat-right-sidebar.tsx 与 source-picker.tsx 本轮（沿用上轮结论；本轮 git status 未修改它们）"
         ]
       }
     }
   ],
   "root_artifacts": {
     "claude_md": "CLAUDE.md",
-    "readme": "README.md (now includes Docker Deployment + cpolar sections)",
+    "readme": "README.md (includes Docker Deployment + cpolar sections)",
     "start_script": "start.sh",
     "ci_workflow": ".github/workflows/ci.yml (3 jobs: backend pytest+cov / frontend tsc+eslint / frontend playwright)",
-    "docker_compose": "docker-compose.yml (backend + frontend + opt-in daily profile; bind-mount ./backend/data → /app/data)",
+    "docker_compose": "docker-compose.yml (backend + frontend + opt-in daily profile; bind-mount ./backend/data -> /app/data)",
     "env_docker_example": ".env.docker.example (canonical operator config: provider keys, BACKEND_INSTALL_EXTRAS, KB_LANGUAGE, KB_CHAT_TOKEN, ingest gap knobs)",
     "docs_dir": "docs/ (present but empty/minimal — no module-level CLAUDE.md created)",
-    "omc_state": ".omc/ (includes .omc/plans/autopilot-impl-scoring.md — implementation plan for the 2026-05-01 universal-axis migration)",
+    "omc_state": ".omc/ (includes .omc/plans/autopilot-chat-enhance.md — implementation plan for the 2026-05-02 multi-turn chat + source-anchored + PDF full-text feature; the SSE-streaming delta of 2026-05-02 21:18:53 was implemented inline without a separate plan file)",
     "gitignore": ".gitignore (covers .venv, backend/data/, node_modules/, .next/, .omc state files)"
   },
   "ignore_strategy": {
@@ -228,24 +292,27 @@
   "coverage_summary": {
     "modules_total": 2,
     "modules_with_claude_md": 2,
-    "files_read_this_run": 38,
-    "files_read_cumulative": 60,
-    "estimated_repo_files": "~150 (excluding node_modules/.venv/.next/data; rough estimate)",
-    "coverage_percent_estimate": 88,
+    "files_read_this_run": 14,
+    "files_read_cumulative": 100,
+    "estimated_repo_files": "~165 (excluding node_modules/.venv/.next/data; rough estimate; +5 from last run reflecting the SSE plumbing growth)",
+    "coverage_percent_estimate": 90,
     "truncated": false,
-    "notes": "Major delta between 2026-04-25 16:50 and this run: universal score axes (paper/blog/talk/project rubrics), Chinese-language LLM mode (KB_LANGUAGE), Docker Compose deployment stack with separate Dockerfiles + .dockerignores + .env.docker.example, Next.js standalone build with /api/* reverse proxy (eliminates CORS), adaptive ingestion lookback window (KB_INGEST_*), cold-start uncapped processing/embedding, one-shot rescore_non_papers.py operations script, RSS feed pruning (AnandTech / Meta AI Blog removed), PaperOut.categories field_validator for legacy dict tags. All deltas verified against the actual modified files listed in the run's git status."
+    "notes": "Major delta vs 2026-05-02 20:12:04: (a) NEW POST /api/chat/stream SSE endpoint (kb/main.py) returning text/event-stream with X-Accel-Buffering:no + Cache-Control:no-cache; events sources -> token... -> done [+ optional error]; placeholder '(LLM produced no output)' token when stream_llm yields nothing; HTTPException raised BEFORE the stream begins so paper_id 404 surfaces as a normal HTTP error rather than an empty SSE. (b) NEW shared _build_chat_context(req, db) -> tuple[str, list[PaperOut]] extracts the prompt + sources construction so /api/chat and /api/chat/stream live on one source of truth — paper_id branch (load Paper, lazy-import fetch_full_text, source-anchored prompt with full body up to _SOURCE_TEXT_PROMPT_CAP=60000 chars) and RAG branch (semantic search top_k, summary-based context). Both branches inject _format_history(req.history) inside the same UNTRUSTED block. (c) Chat system prompts switched from English to Chinese hardcoded ('你是一名资深的 GPGPU 芯片架构助理 ...', closing with '请用简体中文作答') — KB_LANGUAGE no longer affects /api/chat or /api/chat/stream (still affects summarization/scoring/reports). (d) NEW _sse_event(event, data) helper with json.dumps(..., ensure_ascii=False) keeps Chinese compact in transit. (e) NEW stream_llm(prompt) -> Iterator[str] in kb/processing/llm.py, parallel to call_llm; routed via NEW _STREAM_PROVIDERS dict {hermes, anthropic, openai, deepseek}. Failures end the generator silently (never raise). _stream_anthropic uses client.messages.stream(...).text_stream; _stream_openai_compatible(prompt, *, api_key, model, base_url=None) is the shared body for openai-protocol providers (openai + deepseek); _stream_hermes calls _call_hermes and yields the full result as a single chunk (empty -> yields nothing). (f) backend/Dockerfile + backend/run_api.sh keep --timeout-keep-alive 75 (no new delta) but the SSE long-poll dependency on it is now critical; Dockerfile comments now spell out the ECONNRESET race vs Next.js fetch-agent connection pool. (g) NEW chatStream(request, {signal?}) async generator in frontend/src/lib/api.ts: fetch /api/chat/stream with Accept: text/event-stream, response.body.getReader() + TextDecoder, splits on '\\n\\n', _parseSSEFrame decodes into ChatStreamEvent union; reader.releaseLock() guarded by try/catch (throws after abort, safe to swallow); _chatPayload(request) shared by chat() and chatStream() to keep payload shape consistent; _parseSSEFrame joins consecutive 'data:' lines with '\\n' per SSE spec. (h) NEW ChatStreamEvent discriminated union in frontend/src/lib/types.ts ({sources|token|error|done}) mirrored from backend _sse_event. (i) frontend/src/app/chat/page.tsx COMPLETELY rewritten for streaming: DisplayMessage adds transient streaming?: boolean field; handleSend pushes user + empty streaming placeholder, then for await (const ev of chatStream(...)) increments accumulated string into the placeholder using a local snapshot variable; AbortController held in abortRef; aborted on Stop button, conversation switch, new chat, /chat?paperId= deep-link change, and component unmount; finally three-state finalize (showError persists nothing + red bubble; aborted preserves partial + persists; done persists normally); persistence uses send-start priorTurns SNAPSHOT (not closure messages) to prevent cross-conversation leakage. NEW Stop button (red-600 lucide Square) replaces Send during loading; <Input enterKeyHint='send'> for mobile keyboards; spinner shows only while streaming AND placeholder is empty; abortRef cleared in finally only when still pointing at this handler's controller. WELCOME copy mentions arXiv PDF full loading. _stripDisplay also filters out streaming/error rows. (j) Backend tests: NEW 5 SSE cases in test_api_smoke.py (_drain_sse helper; happy path event sequence + sources scoping + tokens concatenate; history injection; paper_id 404 raised before stream; empty output -> placeholder; system role 422 before stream); NEW 5 stream_llm cases in test_processing_llm.py (route to _STREAM_PROVIDERS; mid-stream exception swallowed but already-yielded chunks preserved; anthropic route; _stream_hermes single-chunk fallback; _call_hermes empty -> _stream_hermes yields nothing). Total suite ~105 -> ~115."
   },
   "next_steps": [
-    "扫描 frontend/tests/e2e/ 实际用例并在 frontend/CLAUDE.md 中列出场景矩阵（chat / browse / search 等）",
-    "扫描 frontend/src/components/ui/* 以列出已落地的 shadcn 原语清单",
+    "实施 KB_CHAT_TOKEN 时同步扩 frontend/src/lib/api.ts 的 fetchJSON 与 chatStream：通过 server-side route handler 在 Next 里转发 Bearer，避免暴露 NEXT_PUBLIC_*",
+    "为 SSE 流式 chat 扩展 e2e：mock text/event-stream 响应 -> placeholder 增量 / Stop 按钮 abort -> partial 持久化 / 切换会话期间正在流 -> 旧会话不受影响 / /chat?paperId= deep-link 起新会话且 URL 被清空",
+    "为 useConversationHistory 添加 vitest 单测覆盖 _isConversation / _safeWrite 配额满 / hydration",
+    "为 _parseSSEFrame 添加 vitest 单测覆盖多行 data: 拼接、event 缺失、JSON 解析失败 silent drop",
+    "扫描 frontend/src/components/ui/* 以列出已落地的 shadcn 原语清单（已加 Tabs / Dialog）",
     "读取 frontend/eslint.config.* / tsconfig.json / postcss.config.* 以记录构建/类型/lint 约定",
-    "若后端开启 KB_CHAT_TOKEN，在 frontend/src/lib/api.ts 增加 Bearer 注入并补 e2e 用例（同时考虑通过 server-side route handler 转发，避免 NEXT_PUBLIC_*）",
     "深扫 backend/tests/conftest.py 验证 _init_db / client 夹具如何隔离 SQLite 与 ChromaDB",
     "扫 backend/kb/ingestion/arxiv.py 与 github_trending.py 源码以核实 cs.* 类目列表与 polite-sleep 触发条件",
     "为 docs/ 目录补充实际内容或在根 CLAUDE.md 中标注其用途",
-    "如果引入 hermes cron 或 docker-compose --profile cron 调度作业到生产，在 backend/CLAUDE.md 增加 ops/runbook 链接",
-    "为 backend/kb/scripts/ 新增 README 或 __init__.py 注释，明确这是运维脚本目录而非业务代码",
-    "若未来引入 NEXT_PUBLIC_CHAT_TOKEN 或 server-side route handler 转发 Bearer，更新 frontend/CLAUDE.md 第三章并删除 'currently not implemented' 提示"
+    "若 source-anchored chat 的 PDF 解析在生产报错率高，考虑加白名单 substring 或 Content-Type 嗅探（避免 HTML 误判）",
+    "把 _MAX_PDF_BYTES / _DOWNLOAD_TIMEOUT_S / _MAX_EXTRACTED_CHARS / _SOURCE_TEXT_PROMPT_CAP / _HISTORY_TURN_CAP 全部提到 settings 里，便于无重启调参",
+    "评估把 chat 系统 prompt 也接到 KB_LANGUAGE（当前硬编码中文），或加新变量 KB_CHAT_LANGUAGE 独立控制 chat / summary / report 的语言",
+    "考虑在 SSE 端点真正发 'error' 事件而非静默吞掉 stream_llm 异常，让前端能区分 '后端炸了' 与 'LLM 真没输出'"
   ],
   "changelog": [
     {
@@ -266,7 +333,17 @@
     {
       "timestamp": "2026-05-02T08:57:04Z",
       "action": "incremental_refresh",
-      "summary": "Major refresh covering deltas across all changed files in git status: (1) Universal Score Axes — Paper.quality_score / relevance_score / score_rationale columns with idempotent SQLite migration; per-source-type rubrics (paper=originality/impact mirrored to legacy fields, blog=depth/actionability, talk=depth/actionability, project=innovation/maturity); /api/papers sort_by adds quality_score|relevance_score|total_score (default total_score = sum of all four scoring fields); /api/stats adds top_overall (cross-type top-5 by max(quality, relevance)); reports.py orders by max(quality, relevance) so non-papers can show up; non-papers bypass quality gate, JSON parse failure / translated-keys / missing required keys all preserve is_processed=0 for retry. (2) Chinese-language LLM output — KB_LANGUAGE=zh injects _lang_instruction (full summary in Chinese) and _impact_lang_instruction (only score_rationale value in Chinese; JSON keys stay English); kb.daily --lang zh CLI override; daily report title 每日研究简报 — and Chinese section names. (3) Docker Compose deployment — root docker-compose.yml + .env.docker.example; backend/Dockerfile (python:3.12-slim, ARG INSTALL_EXTRAS=ml,llm-cloud, HEALTHCHECK /api/health, VOLUME /app/data); frontend/Dockerfile (3-stage standalone build, alpine non-root, HEALTHCHECK GET /); per-side .dockerignore; daily service via --profile cron. (4) Next.js standalone + reverse proxy — next.config.ts adds output:'standalone', /api/:path* → KB_BACKEND_URL rewrite, /search → / redirect; src/lib/api.ts API_BASE defaults to '' (same-origin), eliminating CORS in normal deployments. (5) Adaptive ingestion lookback — kb/ingestion/run.py::_compute_days_back uses KB_INGEST_EMPTY_DB_DAYS for cold-start, MAX(ingested_date) gap clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS] otherwise. (6) Cold-start uncapped processing/embedding — kb.daily detects whether any paper has been processed/embedded and drains the entire backlog if not, then caps at 100/run for steady state. (7) New ops script — backend/kb/scripts/rescore_non_papers.py (--dry-run / --limit / --source-type) backfills universal scores on legacy non-paper rows. (8) RSS feed pruning — removed AnandTech (defunct) and Meta AI Blog (no public RSS); 11 verified feeds remain; tag normalization (_tag_to_str + PaperOut.categories field_validator) handles legacy feedparser dict rows without 500. (9) Frontend universal-axes UI — paper-card.tsx and paper/[id]/page.tsx mirror SCORE_LABELS; _resolveScores does universal-first with paper-legacy fallback. (10) Tests — added per-rubric assertions (FAANG / TECHNICAL DEPTH / INNOVATION / MATURITY / ACTIONABILITY), Chinese-mode prompt assertions, JSON-key translation rejection test, top_overall test, LIKE-escape test, dict-categories backfill tests; suite grew from ~75 to ~95 cases. All deltas verified by reading the actual modified source files (kb/main.py, daily.py, database.py, models.py, schemas.py, config.py, reports.py, processing/llm.py, processing/embeddings.py, ingestion/rss.py, ingestion/run.py, scripts/rescore_non_papers.py; frontend next.config.ts, layout.tsx, page.tsx, paper/[id]/page.tsx, components/paper-card.tsx, lib/api.ts, lib/types.ts, app/globals.css; root README.md, docker-compose.yml, .env.docker.example, backend/Dockerfile, frontend/Dockerfile, both .dockerignore files; tests/test_api_smoke.py, test_processing_llm.py, test_reports.py, test_ingestion_rss.py)."
+      "summary": "Universal Score Axes (paper/blog/talk/project rubrics + paper legacy mirroring), Chinese-language LLM mode (KB_LANGUAGE), Docker Compose deployment stack (backend/frontend Dockerfiles + .dockerignore + docker-compose.yml + .env.docker.example), Next.js standalone build with /api/* reverse proxy (eliminates CORS), adaptive ingestion lookback window (KB_INGEST_*), cold-start uncapped processing/embedding, one-shot rescore_non_papers.py operations script, RSS feed pruning (AnandTech / Meta AI Blog removed), PaperOut.categories field_validator for legacy dict tags."
+    },
+    {
+      "timestamp": "2026-05-02T20:12:04Z",
+      "action": "incremental_refresh",
+      "summary": "Multi-turn + source-anchored chat refresh: (1) /api/chat schema — schemas.py adds ChatMessage{role:^(user|assistant)$, content max=chat_query_max_len*4} and ChatRequest{paper_id: int|None, history: list[ChatMessage] max_length=40}. (2) /api/chat behavior — _format_history (most-recent _HISTORY_TURN_CAP=12 turns, 4000 char per turn) and a paper_id branch that bypasses RAG, calls fetch_full_text(paper_id), feeds full body (<=_SOURCE_TEXT_PROMPT_CAP=60000 chars) into a SOURCE-anchored prompt, returns sources=[that paper] only; missing paper_id -> 404. (3) NEW backend module kb/processing/pdf.py — fetch_full_text(paper_id) downloads via httpx.Client.stream (20MB max, 30s timeout), extracts via pypdf (per-page error tolerance), truncates to 120000 chars, persists to Paper.full_text on success; non-PDF URLs and any download/parse failure return summary+abstract fallback WITHOUT poisoning the cache. (4) Paper.full_text TEXT column added; database.py::_BACKCOMPAT_COLUMNS adds ('full_text','TEXT DEFAULT \\'\\''). (5) pyproject.toml promotes pypdf>=5.0 to default dependencies. (6) backend/Dockerfile CMD and backend/run_api.sh both pass --timeout-keep-alive 75 (fixes random ECONNRESET / 'Sorry, I couldn\\'t process that query' caused by Next.js reverse-proxy connection-pool keep-alive races against uvicorn's 5s default). (7) Frontend chat refactor — src/app/chat/page.tsx switches to a two-pane layout, useConversationHistory hook (localStorage cap 50, hydrated flag, _isConversation guard), ChatRightSidebar (Tabs History|Source), SourcePicker (Dialog + 300ms-debounced searchPapers), /chat?paperId= deep-link auto-pin with pinnedPaperIdRef double-effect guard, mobile-responsive input bar with safe-area-inset-bottom + iOS no-zoom font size + IME guard. (8) src/lib/types.ts adds ChatMessage and extends ChatRequest. (9) src/lib/api.ts::chat strips undefined/null fields from payload. (10) Tests — NEW backend/tests/test_processing_pdf.py (5 cases). backend/tests/test_api_smoke.py adds 5 chat-mode cases. Total suite ~95 -> ~105. (11) .omc/plans/autopilot-chat-enhance.md committed as the implementation plan for this delta."
+    },
+    {
+      "timestamp": "2026-05-02T21:18:53Z",
+      "action": "incremental_refresh",
+      "summary": "SSE streaming chat refresh covering deltas across modified files in git status: (1) NEW POST /api/chat/stream SSE endpoint in backend/kb/main.py (text/event-stream; events sources -> token... -> done [+ optional error]; placeholder '(LLM produced no output)' token when stream_llm yields nothing; X-Accel-Buffering: no + Cache-Control: no-cache headers; reuses verify_chat_token Bearer guard). (2) NEW shared _build_chat_context(req, db) -> tuple[str, list[PaperOut]] extracted so /api/chat and /api/chat/stream share one source of truth for prompt + sources construction; HTTPException (paper_id 404) MUST be raised synchronously in the request handler BEFORE StreamingResponse is constructed so it surfaces as a normal HTTP error rather than an empty SSE — the current implementation enforces this. (3) Chat system prompts switched from English to Chinese hardcoded ('你是一名资深的 GPGPU 芯片架构助理 ...', closing with '请用简体中文作答') — KB_LANGUAGE no longer affects /api/chat[/stream] (still affects summarization/scoring/reports). Reverting to English requires editing the template inside _build_chat_context (one place, two endpoints). (4) NEW _sse_event(event, data) helper in backend/kb/main.py with json.dumps(..., ensure_ascii=False) keeps Chinese compact in transit. (5) NEW stream_llm(prompt) -> Iterator[str] in backend/kb/processing/llm.py, parallel public API to call_llm; routed via NEW _STREAM_PROVIDERS dict {hermes, anthropic, openai, deepseek}. Failures end the generator silently (never raise) — matches call_llm's empty-string contract. _stream_anthropic uses client.messages.stream(...).text_stream context manager. NEW _stream_openai_compatible(prompt, *, api_key, model, base_url=None) shared body for openai-protocol providers reused by _stream_openai and _stream_deepseek (stream=True; chunk.choices[0].delta.content). _stream_hermes calls _call_hermes and yields the full result as a single chunk; if _call_hermes returns '' it yields nothing (the SSE endpoint then emits the placeholder token). _STREAM_PROVIDERS dict captured at import time — tests must monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, 'name', mock). (6) backend/Dockerfile + backend/run_api.sh keep --timeout-keep-alive 75 (no new delta) but the SSE long-poll dependency on it is now critical; Dockerfile comments now spell out the ECONNRESET race vs Next.js fetch-agent connection pool. (7) NEW chatStream(request, {signal?}) async generator in frontend/src/lib/api.ts (fetch /api/chat/stream with Accept: text/event-stream + signal -> response.body.getReader() + TextDecoder accumulator -> split on '\\n\\n' -> _parseSSEFrame decodes into ChatStreamEvent union; reader.releaseLock() in finally guarded by try/catch — releaseLock throws after abort/error). (8) _chatPayload(request) shared body extracted in frontend/src/lib/api.ts so chat() and chatStream() build identical payloads (paper_id null/undefined dropped, history empty array dropped). _parseSSEFrame joins consecutive 'data:' lines with '\\n' per SSE spec to defend against LLM tokens with raw newlines that would otherwise glue two JSON objects together and silently drop the frame. (9) NEW ChatStreamEvent discriminated union in frontend/src/lib/types.ts ({type:'sources',sources}|{type:'token',content}|{type:'error',message}|{type:'done'}) mirrored from backend _sse_event. ChatRequest already had paper_id?/history? from previous refresh. (10) frontend/src/app/chat/page.tsx COMPLETELY REWRITTEN for streaming: DisplayMessage adds transient streaming?: boolean field (stripped by _stripDisplay alongside WELCOME and error rows). handleSend snapshots priorTurns = _stripDisplay(messages) BEFORE pushing the new user/placeholder turn; then pushes userMsg + empty streaming placeholder; then for await (const ev of chatStream({query, top_k:5, paper_id:selectedPaper?.id, history:priorTurns.length>0?priorTurns:undefined}, {signal:controller.signal})) — token branch grows accumulated string and uses a local snapshot variable inside setMessages so functional updaters read the current value rather than the closure snapshot; sources branch attaches sources to the placeholder; done -> break; AbortError -> aborted=true; other exceptions -> errored=true. AbortController held in abortRef.current; aborted on Stop button (red Square icon replacing Send), conversation switch (useEffect [history.activeId]), new chat (handleNewChat), /chat?paperId= deep-link change (useEffect [searchParams]), and component unmount (cleanup effect). finally three-state finalize: showError = errored && !accumulated (NOT persisted, red bubble 'Sorry, I couldn\\'t process that query. Is the backend running?'); aborted with partial content (preserved + persisted, ChatGPT-style); done (persisted normally with finalContent + sources). Persistence uses send-start priorTurns SNAPSHOT (not closure messages) so cross-conversation switches mid-stream don't leak turns. abortRef cleared in finally ONLY when it still points at this handler's controller — prevents a newer send from being clobbered. Stop button uses red-600 + lucide Square; Send button uses emerald-600 + lucide Send; both at h-10 w-10 sm:h-9 sm:w-9 footprint. <Input enterKeyHint='send'> hints mobile keyboards; placeholder switches based on selectedPaper. Spinner ('Searching knowledge base...' / 'Reading the source...') shows only while streaming AND placeholder content is empty — once tokens flow, the markdown bubble takes over. WELCOME copy updated to mention right-sidebar source pinning + 'arXiv PDFs are loaded in full'. (11) Tests — NEW 5 SSE cases in backend/tests/test_api_smoke.py (_drain_sse helper drains stream into list[(event_name, data_dict)]; happy path verifies event sequence sources -> token... -> done with sources scoped to chosen paper + tokens concatenate to full output + full_text token in prompt; history injection into stream prompt; paper_id 404 raised BEFORE stream begins so client sees normal HTTP 404 not empty stream; empty output -> placeholder '(LLM produced no output)' token between sources and done; system role rejected at 422 before stream begins). NEW 5 stream_llm cases in backend/tests/test_processing_llm.py (route to _STREAM_PROVIDERS[provider]; mid-stream exception swallowed silently while preserving already-yielded chunks; anthropic route; _stream_hermes single-chunk fallback via _call_hermes; _call_hermes empty -> _stream_hermes yields nothing). Total suite ~105 -> ~115. All deltas verified by reading the actual modified source files in this run (backend/Dockerfile, backend/run_api.sh, backend/kb/main.py, backend/kb/processing/llm.py, backend/tests/test_api_smoke.py, backend/tests/test_processing_llm.py, frontend/src/app/chat/page.tsx, frontend/src/lib/api.ts, frontend/src/lib/types.ts)."
     }
   ]
 }

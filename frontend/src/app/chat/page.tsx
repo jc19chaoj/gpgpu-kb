@@ -5,8 +5,8 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Cpu, User, FileText, Loader2, PinIcon } from "lucide-react";
-import { chat, getPaper } from "@/lib/api";
+import { Send, Cpu, User, FileText, Loader2, PinIcon, Square } from "lucide-react";
+import { chatStream, getPaper } from "@/lib/api";
 import type { ChatMessage, Paper } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -19,6 +19,8 @@ interface DisplayMessage extends ChatMessage {
   sources?: Paper[];
   /** transient: error state, not persisted to history */
   error?: boolean;
+  /** transient: actively streaming tokens; placeholder shown if content empty */
+  streaming?: boolean;
 }
 
 const WELCOME: DisplayMessage = {
@@ -29,11 +31,11 @@ const WELCOME: DisplayMessage = {
 
 function _stripDisplay(messages: DisplayMessage[]): ChatMessage[] {
   // Persist & send only the role/content fields. `sources` is renderer-only;
-  // `error` is transient feedback. Drop the welcome card too — it's the
-  // assistant's intro, not part of the actual chat history.
+  // `error` and `streaming` are transient. Drop the welcome card too — it's
+  // the assistant's intro, not part of the actual chat history.
   return messages
     .filter((m, i) => !(i === 0 && m === WELCOME))
-    .filter((m) => !m.error)
+    .filter((m) => !m.error && !m.streaming)
     .map(({ role, content }) => ({ role, content }));
 }
 
@@ -50,12 +52,27 @@ function ChatContent() {
   // double-effect (and any back/forward navigation) doesn't open a fresh
   // conversation twice for the same `?paperId=` deep link.
   const pinnedPaperIdRef = useRef<number | null>(null);
+  // In-flight stream so we can abort on Stop, conversation switch, new
+  // chat, deep-link change, or component unmount.
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Cancel any in-flight stream when the page unmounts (route change, tab
+  // close). Without this the fetch would keep tokens flowing into a
+  // setMessages on a stale component.
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
 
   // When the user picks a saved conversation from the sidebar, hydrate the
   // local message stream from its persisted turns. We avoid re-deriving on
   // every render by gating on activeId.
   useEffect(() => {
     if (!history.active) return;
+    // Switching conversations mid-stream would have the in-flight tokens
+    // clobber the newly hydrated messages. Cancel first.
+    abortRef.current?.abort();
     setMessages([WELCOME, ...history.active.messages.map((m) => ({ ...m }))]);
     // Restore the pinned source by id alone — we only stored the title,
     // so leaving the rest of Paper fields blank is fine for display, but
@@ -140,6 +157,7 @@ function ChatContent() {
   }, [searchParams]);
 
   const handleNewChat = () => {
+    abortRef.current?.abort();
     setMessages([WELCOME]);
     setSelectedPaper(null);
     history.startNew();
@@ -149,50 +167,126 @@ function ChatContent() {
     setSelectedPaper(paper);
   };
 
+  const handleStop = () => {
+    abortRef.current?.abort();
+  };
+
   const handleSend = async () => {
     if (!input.trim() || loading) return;
     const query = input.trim();
     setInput("");
 
     const userMsg: DisplayMessage = { role: "user", content: query };
-    const next = [...messages, userMsg];
-    setMessages(next);
+    const placeholder: DisplayMessage = { role: "assistant", content: "", streaming: true };
+    // Snapshot of prior turns BEFORE the new user/placeholder are appended;
+    // this is what the backend should see as `history`.
+    const priorTurns = _stripDisplay(messages);
+    setMessages([...messages, userMsg, placeholder]);
     setLoading(true);
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    let accumulated = "";
+    let streamSources: Paper[] | undefined;
+    let errored = false;
+    let aborted = false;
+
     try {
-      const priorTurns = _stripDisplay(messages); // history excludes the new user turn
-      const res = await chat({
-        query,
-        top_k: 5,
-        paper_id: selectedPaper?.id,
-        history: priorTurns.length > 0 ? priorTurns : undefined,
-      });
-      const assistantMsg: DisplayMessage = {
-        role: "assistant",
-        content: res.answer,
-        sources: res.sources,
-      };
-      const final = [...next, assistantMsg];
-      setMessages(final);
-      history.saveActive(_stripDisplay(final), {
-        paperId: selectedPaper?.id,
-        paperTitle: selectedPaper?.title,
-      });
-    } catch {
-      setMessages((prev) => [
-        ...prev,
+      for await (const ev of chatStream(
         {
-          role: "assistant",
-          content: "Sorry, I couldn't process that query. Is the backend running?",
-          error: true,
+          query,
+          top_k: 5,
+          paper_id: selectedPaper?.id,
+          history: priorTurns.length > 0 ? priorTurns : undefined,
         },
-      ]);
+        { signal: controller.signal },
+      )) {
+        if (ev.type === "sources") {
+          streamSources = ev.sources;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last?.streaming) return prev;
+            return [...prev.slice(0, -1), { ...last, sources: streamSources }];
+          });
+        } else if (ev.type === "token") {
+          accumulated += ev.content;
+          // Capture the running total in a local so the functional updater
+          // reads the up-to-date value rather than the closure snapshot.
+          const snapshot = accumulated;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last?.streaming) return prev;
+            return [...prev.slice(0, -1), { ...last, content: snapshot }];
+          });
+        } else if (ev.type === "error") {
+          errored = true;
+        } else if (ev.type === "done") {
+          break;
+        }
+      }
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError") {
+        aborted = true;
+      } else {
+        errored = true;
+      }
     } finally {
+      // Clear ref only if it still points at our controller — a newer send
+      // may have replaced it after we started.
+      if (abortRef.current === controller) abortRef.current = null;
       setLoading(false);
+
+      // Finalize the placeholder. Three outcomes share this path:
+      //   - clean done: replace with accumulated content (or placeholder)
+      //   - aborted:    keep partial content (matches ChatGPT behavior)
+      //   - errored:    show error bubble; don't persist
+      const showError = errored && !accumulated;
+      const finalContent = showError
+        ? "Sorry, I couldn't process that query. Is the backend running?"
+        : accumulated || "(LLM produced no output)";
+
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last?.streaming) return prev;
+        return [
+          ...prev.slice(0, -1),
+          {
+            role: "assistant",
+            content: finalContent,
+            sources: showError ? undefined : streamSources,
+            streaming: false,
+            error: showError,
+          },
+        ];
+      });
+
+      // Persist on success or partial-but-non-empty abort. Skip on pure
+      // error or fully-empty abort so we don't pollute history with junk.
+      //
+      // Use `priorTurns` (the snapshot taken at send-start) rather than
+      // _stripDisplay(messages): the closure's `messages` is stale, and if
+      // the user switched conversations mid-stream it would now reference
+      // the *new* conversation's history — leaking turns across sessions.
+      if (!showError && (accumulated || !aborted)) {
+        const persisted: ChatMessage[] = [
+          ...priorTurns,
+          { role: "user", content: query },
+          { role: "assistant", content: finalContent },
+        ];
+        history.saveActive(persisted, {
+          paperId: selectedPaper?.id,
+          paperTitle: selectedPaper?.title,
+        });
+      }
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // Skip while an IME (Chinese/Japanese/Korean) is composing — pressing Enter
+    // to pick a candidate would otherwise submit a half-typed message.
+    // keyCode 229 covers older Safari where isComposing isn't reliably set.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -256,7 +350,12 @@ function ChatContent() {
                   </div>
                 </div>
               ))}
-              {loading && (
+              {/* Pre-token spinner: only while we're waiting on the first
+                  streamed chunk. Once tokens start flowing the streaming
+                  placeholder bubble already gives live feedback. */}
+              {loading
+                && messages[messages.length - 1]?.streaming
+                && !messages[messages.length - 1]?.content && (
                 <div className="flex gap-3">
                   <Loader2 className="h-5 w-5 text-emerald-400 animate-spin shrink-0 mt-1" />
                   <div className="text-sm text-zinc-500">
@@ -283,15 +382,28 @@ function ChatContent() {
                 className="flex-1 bg-zinc-900 border-zinc-800 text-base sm:text-sm h-10 sm:h-9"
                 disabled={loading}
               />
-              <Button
-                type="submit"
-                size="icon"
-                disabled={loading || !input.trim()}
-                className="bg-emerald-600 hover:bg-emerald-700 h-10 w-10 sm:h-9 sm:w-9 shrink-0"
-                onClick={handleSend}
-              >
-                <Send className="h-4 w-4" />
-              </Button>
+              {loading ? (
+                <Button
+                  type="button"
+                  size="icon"
+                  aria-label="Stop generating"
+                  className="bg-red-600 hover:bg-red-700 h-10 w-10 sm:h-9 sm:w-9 shrink-0"
+                  onClick={handleStop}
+                >
+                  <Square className="h-4 w-4" />
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  size="icon"
+                  aria-label="Send"
+                  disabled={!input.trim()}
+                  className="bg-emerald-600 hover:bg-emerald-700 h-10 w-10 sm:h-9 sm:w-9 shrink-0"
+                  onClick={handleSend}
+                >
+                  <Send className="h-4 w-4" />
+                </Button>
+              )}
             </div>
             <p className="text-[10px] text-zinc-600 mt-2 hidden sm:block">
               {selectedPaper

@@ -64,6 +64,14 @@ export interface ChatResponse {
   sources: Paper[];
 }
 
+// SSE events emitted by /api/chat/stream. Decoded by `chatStream()` in
+// lib/api.ts; keep in sync with backend `_sse_event(...)` in kb/main.py.
+export type ChatStreamEvent =
+  | { type: "sources"; sources: Paper[] }
+  | { type: "token"; content: string }
+  | { type: "error"; message: string }
+  | { type: "done" };
+
 export interface Stats {
   total_papers: number;
   processed: number;
