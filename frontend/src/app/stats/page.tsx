@@ -19,7 +19,7 @@ export default function StatsPage() {
 
   if (loading) {
     return (
-      <div className="max-w-3xl mx-auto p-6 space-y-4">
+      <div className="max-w-3xl mx-auto p-4 sm:p-6 space-y-4">
         <Skeleton className="h-32 w-full bg-zinc-900" />
         <Skeleton className="h-48 w-full bg-zinc-900" />
       </div>
@@ -29,8 +29,8 @@ export default function StatsPage() {
   if (!stats) return null;
 
   return (
-    <div className="max-w-3xl mx-auto p-6">
-      <h1 className="text-lg font-semibold mb-4">Knowledge Base Stats</h1>
+    <div className="max-w-3xl mx-auto p-4 sm:p-6">
+      <h1 className="text-base sm:text-lg font-semibold mb-4">Knowledge Base Stats</h1>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <Card className="bg-zinc-900 border-zinc-800">

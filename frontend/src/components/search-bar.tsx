@@ -34,7 +34,8 @@ export function SearchBar() {
         value={q}
         onChange={(e) => setQ(e.target.value)}
         placeholder="Search papers, blogs, projects..."
-        className="pl-9 bg-zinc-900 border-zinc-800 text-sm h-9"
+        enterKeyHint="search"
+        className="pl-9 bg-zinc-900 border-zinc-800 text-base sm:text-sm h-10 sm:h-9"
       />
     </form>
   );

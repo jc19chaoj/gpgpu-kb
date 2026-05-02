@@ -63,14 +63,14 @@ function BrowseContent() {
   useEffect(() => { fetchPapers(); }, [fetchPapers]);
 
   return (
-    <div className="max-w-4xl mx-auto p-6">
+    <div className="max-w-4xl mx-auto p-4 sm:p-6">
       <div className="space-y-4 mb-6">
-        <div className="flex items-center gap-4">
-          <h1 className="text-lg font-semibold">
+        <div className="flex items-baseline gap-3 flex-wrap">
+          <h1 className="text-base sm:text-lg font-semibold truncate">
             {query ? `Search: "${query}"` : "Browse"}
           </h1>
           {data && (
-            <span className="text-sm text-zinc-500">{data.total} items</span>
+            <span className="text-xs sm:text-sm text-zinc-500">{data.total} items</span>
           )}
         </div>
 
@@ -164,7 +164,7 @@ function BrowseContent() {
 
 export default function BrowsePage() {
   return (
-    <Suspense fallback={<div className="max-w-4xl mx-auto p-6 space-y-3">{Array.from({length:5}).map((_,i)=><Skeleton key={i} className="h-32 w-full bg-zinc-900"/>)}</div>}>
+    <Suspense fallback={<div className="max-w-4xl mx-auto p-4 sm:p-6 space-y-3">{Array.from({length:5}).map((_,i)=><Skeleton key={i} className="h-32 w-full bg-zinc-900"/>)}</div>}>
       <BrowseContent />
     </Suspense>
   );

@@ -45,6 +45,9 @@ class Paper(Base):
     quality_score = Column(Float, default=0.0, index=True)
     relevance_score = Column(Float, default=0.0)
     score_rationale = Column(Text, default="")
+    # Full extracted body text used by source-anchored chat (e.g. arxiv PDF
+    # text). Lazily populated on first chat that selects this paper as source.
+    full_text = Column(Text, default="")
     is_processed = Column(Integer, default=0, index=True)  # 0=pending, 1=done, 2=skipped
 
     # Vector embedding ref (stored in ChromaDB separately)

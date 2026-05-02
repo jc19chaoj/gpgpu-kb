@@ -45,9 +45,16 @@ export async function searchPapers(q: string, params?: {
 }
 
 export async function chat(request: ChatRequest): Promise<ChatResponse> {
+  // Strip undefined / null fields so the backend's optional-with-default
+  // pydantic schema sees a clean payload.
+  const payload: Record<string, unknown> = { query: request.query };
+  if (request.top_k !== undefined) payload.top_k = request.top_k;
+  if (request.paper_id !== undefined && request.paper_id !== null) payload.paper_id = request.paper_id;
+  if (request.history && request.history.length > 0) payload.history = request.history;
+
   return fetchJSON<ChatResponse>("/api/chat", {
     method: "POST",
-    body: JSON.stringify(request),
+    body: JSON.stringify(payload),
   });
 }
 

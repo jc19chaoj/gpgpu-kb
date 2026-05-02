@@ -26,8 +26,12 @@ WORKDIR /app
 #    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 
 # Install Python deps first so the layer caches across code edits.
+# Only pyproject.toml + a stub `kb/__init__.py` are copied here, so changing
+# any real source under kb/ does NOT invalidate this (slow) install layer.
+# We use an editable install (`pip install -e`) so that when the real source
+# is copied in below, it overrides the stub without needing to reinstall.
 COPY pyproject.toml ./
-COPY kb ./kb
+RUN mkdir -p kb && : > kb/__init__.py
 
 # INSTALL_EXTRAS controls how heavy the image is.
 #   "ml,llm-cloud" (default) — ChromaDB + sentence-transformers + Anthropic/OpenAI/DeepSeek SDK
@@ -35,10 +39,13 @@ COPY kb ./kb
 #   ""                        — minimal: ingestion + LLM-via-CLI only
 ARG INSTALL_EXTRAS=ml,llm-cloud
 RUN if [ -z "$INSTALL_EXTRAS" ]; then \
-        pip install . ; \
+        pip install -e . ; \
     else \
-        pip install ".[${INSTALL_EXTRAS}]" ; \
+        pip install -e ".[${INSTALL_EXTRAS}]" ; \
     fi
+
+# Real source goes in last — code edits only invalidate this thin layer.
+COPY kb ./kb
 
 # Persisted data lives under /app/data (mount a volume here in production).
 RUN mkdir -p /app/data

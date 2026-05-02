@@ -42,6 +42,7 @@ _BACKCOMPAT_COLUMNS = [
     ("quality_score", "FLOAT DEFAULT 0.0"),
     ("relevance_score", "FLOAT DEFAULT 0.0"),
     ("score_rationale", "TEXT DEFAULT ''"),
+    ("full_text", "TEXT DEFAULT ''"),
 ]
 
 

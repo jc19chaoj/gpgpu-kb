@@ -1,55 +1,191 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { chat } from "@/lib/api";
-import { Paper } from "@/lib/types";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Send, Cpu, User, FileText, Loader2, PinIcon } from "lucide-react";
+import { chat, getPaper } from "@/lib/api";
+import type { ChatMessage, Paper } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Send, Cpu, User, FileText, Loader2 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import Link from "next/link";
+import { ChatRightSidebar } from "@/components/chat/chat-right-sidebar";
+import { useConversationHistory } from "@/hooks/use-conversation-history";
 
-interface Message {
-  role: "user" | "assistant";
-  content: string;
+interface DisplayMessage extends ChatMessage {
   sources?: Paper[];
+  /** transient: error state, not persisted to history */
+  error?: boolean;
 }
 
-export default function ChatPage() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: "assistant",
-      content: "I'm your GPGPU research assistant. Ask me anything about papers, architectures, optimizations, or trends in the knowledge base. I'll search the most relevant papers and answer based on the latest research.",
-    },
-  ]);
+const WELCOME: DisplayMessage = {
+  role: "assistant",
+  content:
+    "I'm your GPGPU research assistant. Ask me anything about papers, architectures, optimizations, or trends in the knowledge base. Pin a source on the right to chat with a single paper or blog (arXiv PDFs are loaded in full).",
+};
+
+function _stripDisplay(messages: DisplayMessage[]): ChatMessage[] {
+  // Persist & send only the role/content fields. `sources` is renderer-only;
+  // `error` is transient feedback. Drop the welcome card too — it's the
+  // assistant's intro, not part of the actual chat history.
+  return messages
+    .filter((m, i) => !(i === 0 && m === WELCOME))
+    .filter((m) => !m.error)
+    .map(({ role, content }) => ({ role, content }));
+}
+
+function ChatContent() {
+  const history = useConversationHistory();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [messages, setMessages] = useState<DisplayMessage[]>([WELCOME]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Tracks the paperId we've already auto-pinned so React 19's strict-mode
+  // double-effect (and any back/forward navigation) doesn't open a fresh
+  // conversation twice for the same `?paperId=` deep link.
+  const pinnedPaperIdRef = useRef<number | null>(null);
+
+  // When the user picks a saved conversation from the sidebar, hydrate the
+  // local message stream from its persisted turns. We avoid re-deriving on
+  // every render by gating on activeId.
+  useEffect(() => {
+    if (!history.active) return;
+    setMessages([WELCOME, ...history.active.messages.map((m) => ({ ...m }))]);
+    // Restore the pinned source by id alone — we only stored the title,
+    // so leaving the rest of Paper fields blank is fine for display, but
+    // we need a `Paper`-shaped object. Use a minimal shape with the fields
+    // the sidebar reads.
+    if (history.active.paperId !== undefined && history.active.paperTitle) {
+      setSelectedPaper((prev) =>
+        prev?.id === history.active!.paperId
+          ? prev
+          : ({
+              id: history.active!.paperId!,
+              title: history.active!.paperTitle ?? "",
+              authors: [],
+              organizations: [],
+              abstract: "",
+              url: "",
+              pdf_url: "",
+              source_type: "paper",
+              source_name: "",
+              published_date: null,
+              ingested_date: "",
+              categories: [],
+              venue: "",
+              citation_count: 0,
+              summary: "",
+              originality_score: 0,
+              impact_score: 0,
+              impact_rationale: "",
+              quality_score: 0,
+              relevance_score: 0,
+              score_rationale: "",
+            } as Paper),
+      );
+    } else {
+      setSelectedPaper(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [history.activeId]);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Deep-link from the paper detail page: `/chat?paperId=123` opens a fresh
+  // source-anchored conversation. We strip the query string immediately so
+  // back/forward and refreshes don't keep re-pinning, and dedupe via
+  // pinnedPaperIdRef in case React 19 fires the effect twice on mount.
+  useEffect(() => {
+    const raw = searchParams.get("paperId");
+    if (!raw) return;
+    const id = Number(raw);
+    if (!Number.isInteger(id) || id <= 0) {
+      router.replace("/chat");
+      return;
+    }
+    if (pinnedPaperIdRef.current === id) return;
+    pinnedPaperIdRef.current = id;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const paper = await getPaper(id);
+        if (cancelled) return;
+        // Strip the query only after the fetch succeeds — on 404 the URL
+        // stays so the user can see the broken deep link instead of landing
+        // on a clean /chat with no feedback.
+        router.replace("/chat");
+        history.startNew({ paperId: paper.id, paperTitle: paper.title });
+        setSelectedPaper(paper);
+        setMessages([WELCOME]);
+      } catch {
+        // Silent fallback to a normal RAG chat — matches the page's existing
+        // pattern of swallowing backend errors rather than surfacing them.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // history & router identity changes shouldn't re-trigger this; only the
+    // URL param matters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  const handleNewChat = () => {
+    setMessages([WELCOME]);
+    setSelectedPaper(null);
+    history.startNew();
+  };
+
+  const handlePickSource = (paper: Paper | null) => {
+    setSelectedPaper(paper);
+  };
+
   const handleSend = async () => {
     if (!input.trim() || loading) return;
     const query = input.trim();
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: query }]);
+
+    const userMsg: DisplayMessage = { role: "user", content: query };
+    const next = [...messages, userMsg];
+    setMessages(next);
     setLoading(true);
 
     try {
-      const res = await chat({ query, top_k: 5 });
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: res.answer, sources: res.sources },
-      ]);
+      const priorTurns = _stripDisplay(messages); // history excludes the new user turn
+      const res = await chat({
+        query,
+        top_k: 5,
+        paper_id: selectedPaper?.id,
+        history: priorTurns.length > 0 ? priorTurns : undefined,
+      });
+      const assistantMsg: DisplayMessage = {
+        role: "assistant",
+        content: res.answer,
+        sources: res.sources,
+      };
+      const final = [...next, assistantMsg];
+      setMessages(final);
+      history.saveActive(_stripDisplay(final), {
+        paperId: selectedPaper?.id,
+        paperTitle: selectedPaper?.title,
+      });
     } catch {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Sorry, I couldn't process that query. Is the backend running?" },
+        {
+          role: "assistant",
+          content: "Sorry, I couldn't process that query. Is the backend running?",
+          error: true,
+        },
       ]);
     } finally {
       setLoading(false);
@@ -63,75 +199,129 @@ export default function ChatPage() {
     }
   };
 
-  return (
-    <div className="flex flex-col h-full max-w-3xl mx-auto">
-      <ScrollArea className="flex-1 px-6">
-        <div className="space-y-4 py-4">
-          {messages.map((msg, i) => (
-            <div key={i} className="flex gap-3">
-              <div className="shrink-0 mt-1">
-                {msg.role === "assistant" ? (
-                  <Cpu className="h-5 w-5 text-emerald-400" />
-                ) : (
-                  <User className="h-5 w-5 text-blue-400" />
-                )}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium text-zinc-400 mb-1">
-                  {msg.role === "assistant" ? "Assistant" : "You"}
-                </div>
-                <div className="prose prose-invert prose-sm max-w-none text-zinc-300">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {msg.content}
-                  </ReactMarkdown>
-                </div>
-                {msg.sources && msg.sources.length > 0 && (
-                  <div className="mt-3 pt-3 border-t border-zinc-800">
-                    <p className="text-xs text-zinc-500 mb-2">Sources:</p>
-                    <div className="flex flex-wrap gap-2">
-                      {msg.sources.map((s) => (
-                        <Link key={s.id} href={`/paper/${s.id}`}>
-                          <Badge variant="outline" className="cursor-pointer hover:bg-zinc-800 text-xs border-zinc-700 text-zinc-400">
-                            <FileText className="h-3 w-3 mr-1" />
-                            {s.title.slice(0, 60)}{s.title.length > 60 ? "..." : ""}
-                          </Badge>
-                        </Link>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-          {loading && (
-            <div className="flex gap-3">
-              <Loader2 className="h-5 w-5 text-emerald-400 animate-spin shrink-0 mt-1" />
-              <div className="text-sm text-zinc-500">Searching knowledge base...</div>
-            </div>
-          )}
-          <div ref={scrollRef} />
-        </div>
-      </ScrollArea>
-
-      <div className="border-t border-zinc-800 p-4">
-        <div className="flex items-center gap-2">
-          <Input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask about GPU architectures, attention mechanisms, LLM training..."
-            className="flex-1 bg-zinc-900 border-zinc-800 text-sm"
-            disabled={loading}
-          />
-          <Button type="submit" size="icon" disabled={loading || !input.trim()}
-                  className="bg-emerald-600 hover:bg-emerald-700" onClick={handleSend}>
-            <Send className="h-4 w-4" />
-          </Button>
-        </div>
-        <p className="text-[10px] text-zinc-600 mt-2">
-          Answers are based on papers in the knowledge base. Results may vary by processing state.
-        </p>
+  const sourceBanner = useMemo(() => {
+    if (!selectedPaper) return null;
+    return (
+      <div className="mx-4 sm:mx-6 mt-3 mb-1 rounded-md border border-emerald-800/40 bg-emerald-950/20 px-3 py-2 flex items-center gap-2 text-xs text-emerald-200">
+        <PinIcon className="h-3.5 w-3.5 shrink-0" />
+        <span className="truncate">
+          Anchored to: <span className="font-medium">{selectedPaper.title}</span>
+        </span>
       </div>
+    );
+  }, [selectedPaper]);
+
+  return (
+    <div className="flex h-full">
+      <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 flex flex-col max-w-3xl w-full mx-auto">
+          {sourceBanner}
+          <ScrollArea className="flex-1 px-4 sm:px-6">
+            <div className="space-y-4 py-4">
+              {messages.map((msg, i) => (
+                <div key={i} className="flex gap-3">
+                  <div className="shrink-0 mt-1">
+                    {msg.role === "assistant" ? (
+                      <Cpu className={msg.error ? "h-5 w-5 text-red-400" : "h-5 w-5 text-emerald-400"} />
+                    ) : (
+                      <User className="h-5 w-5 text-blue-400" />
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-zinc-400 mb-1">
+                      {msg.role === "assistant" ? "Assistant" : "You"}
+                    </div>
+                    <div className="prose prose-invert prose-sm max-w-none text-zinc-300">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                    </div>
+                    {msg.sources && msg.sources.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-zinc-800">
+                        <p className="text-xs text-zinc-500 mb-2">Sources:</p>
+                        <div className="flex flex-wrap gap-2">
+                          {msg.sources.map((s) => (
+                            <Link key={s.id} href={`/paper/${s.id}`}>
+                              <Badge
+                                variant="outline"
+                                className="cursor-pointer hover:bg-zinc-800 text-xs border-zinc-700 text-zinc-400"
+                              >
+                                <FileText className="h-3 w-3 mr-1" />
+                                {s.title.slice(0, 60)}
+                                {s.title.length > 60 ? "..." : ""}
+                              </Badge>
+                            </Link>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {loading && (
+                <div className="flex gap-3">
+                  <Loader2 className="h-5 w-5 text-emerald-400 animate-spin shrink-0 mt-1" />
+                  <div className="text-sm text-zinc-500">
+                    {selectedPaper ? "Reading the source..." : "Searching knowledge base..."}
+                  </div>
+                </div>
+              )}
+              <div ref={scrollRef} />
+            </div>
+          </ScrollArea>
+
+          <div className="border-t border-zinc-800 p-3 sm:p-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-zinc-950/80 backdrop-blur-sm">
+            <div className="flex items-center gap-2">
+              <Input
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  selectedPaper
+                    ? `Ask about "${selectedPaper.title.slice(0, 40)}..."`
+                    : "Ask about GPU architectures, attention, LLMs..."
+                }
+                enterKeyHint="send"
+                className="flex-1 bg-zinc-900 border-zinc-800 text-base sm:text-sm h-10 sm:h-9"
+                disabled={loading}
+              />
+              <Button
+                type="submit"
+                size="icon"
+                disabled={loading || !input.trim()}
+                className="bg-emerald-600 hover:bg-emerald-700 h-10 w-10 sm:h-9 sm:w-9 shrink-0"
+                onClick={handleSend}
+              >
+                <Send className="h-4 w-4" />
+              </Button>
+            </div>
+            <p className="text-[10px] text-zinc-600 mt-2 hidden sm:block">
+              {selectedPaper
+                ? "Anchored to a single source — the LLM sees its full content."
+                : "Answers are based on papers in the knowledge base. Results may vary by processing state."}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <ChatRightSidebar
+        conversations={history.conversations}
+        activeId={history.activeId}
+        hydrated={history.hydrated}
+        selectedPaper={selectedPaper}
+        onSelectConversation={history.selectConversation}
+        onDeleteConversation={history.deleteConversation}
+        onNewChat={handleNewChat}
+        onSelectPaper={handlePickSource}
+      />
     </div>
+  );
+}
+
+export default function ChatPage() {
+  // Suspense is required by Next 16 around any client tree that calls
+  // useSearchParams (we read `?paperId=` for source-anchored deep links).
+  return (
+    <Suspense fallback={null}>
+      <ChatContent />
+    </Suspense>
   );
 }

@@ -380,3 +380,107 @@ def test_stats_includes_top_overall(client):
     # Each entry has the universal-axis shape (when present).
     for entry in body["top_overall"]:
         assert {"id", "title", "source_type", "quality_score", "relevance_score"}.issubset(entry)
+
+
+# ─── Chat: source-anchored mode + history ─────────────────────────
+
+def _seed_paper_for_chat(prefix: str, *, pdf_url: str = "", full_text: str = "") -> int:
+    """Insert one paper for chat-mode tests. Caller controls full_text so
+    we can avoid network calls in tests."""
+    import datetime
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+
+    db = SessionLocal()
+    try:
+        p = Paper(
+            title=f"chat-src-{prefix}",
+            abstract="abstract body",
+            summary="curated summary body",
+            authors=["Author A"],
+            organizations=["LabX"],
+            source_type=SourceType.PAPER,
+            source_name="arxiv",
+            url=f"https://example.test/chat/{prefix}",
+            pdf_url=pdf_url,
+            full_text=full_text,
+            published_date=datetime.datetime(2026, 4, 25, tzinfo=datetime.UTC),
+            impact_score=8.0,
+            originality_score=8.0,
+            is_processed=1,
+        )
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return p.id
+    finally:
+        db.close()
+
+
+def test_chat_with_paper_id_uses_full_source(client, monkeypatch):
+    """source-anchored mode: prompt contains the source body and `sources`
+    contains exactly the chosen paper."""
+    pid = _seed_paper_for_chat("anchor", full_text="UNIQUE_FULL_BODY_TOKEN")
+
+    captured: dict[str, str] = {}
+
+    def _fake_call_llm(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return "anchored answer"
+
+    from kb import main as main_mod
+    monkeypatch.setattr(main_mod, "call_llm", _fake_call_llm)
+
+    r = client.post("/api/chat", json={"query": "what does this paper say", "paper_id": pid})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["answer"] == "anchored answer"
+    assert len(body["sources"]) == 1 and body["sources"][0]["id"] == pid
+    assert "UNIQUE_FULL_BODY_TOKEN" in captured["prompt"]
+    assert "FULL SOURCE CONTENT" in captured["prompt"]
+
+
+def test_chat_with_paper_id_404(client):
+    r = client.post("/api/chat", json={"query": "hi", "paper_id": 999_999})
+    assert r.status_code == 404
+
+
+def test_chat_with_history_injects_prior_turns(client, monkeypatch):
+    captured: dict[str, str] = {}
+
+    def _fake_call_llm(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return "history-aware answer"
+
+    from kb import main as main_mod
+    monkeypatch.setattr(main_mod, "call_llm", _fake_call_llm)
+
+    payload = {
+        "query": "follow up",
+        "history": [
+            {"role": "user", "content": "FIRST_USER_TURN_TOKEN"},
+            {"role": "assistant", "content": "FIRST_ASSISTANT_TURN_TOKEN"},
+        ],
+    }
+    r = client.post("/api/chat", json=payload)
+    assert r.status_code == 200, r.text
+    assert "FIRST_USER_TURN_TOKEN" in captured["prompt"]
+    assert "FIRST_ASSISTANT_TURN_TOKEN" in captured["prompt"]
+
+
+def test_chat_history_role_validated(client):
+    r = client.post(
+        "/api/chat",
+        json={
+            "query": "hi",
+            "history": [{"role": "system", "content": "rogue prompt"}],
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_chat_history_max_length_capped(client):
+    """history length is bounded — over-long arrays are rejected."""
+    history = [{"role": "user", "content": str(i)} for i in range(100)]
+    r = client.post("/api/chat", json={"query": "hi", "history": history})
+    assert r.status_code == 422

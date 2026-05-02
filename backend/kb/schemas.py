@@ -71,9 +71,28 @@ class DailyReportOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ChatMessage(BaseModel):
+    """One turn of chat history.
+
+    The frontend sends prior user/assistant turns so the backend can build a
+    multi-turn prompt. System messages are not accepted from the client; the
+    backend prepends its own instructions.
+    """
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., min_length=1, max_length=settings.chat_query_max_len * 4)
+
+
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=settings.chat_query_max_len)
     top_k: int = Field(5, ge=1, le=settings.chat_top_k_max)
+    # Optional: when set, anchor the conversation to a single source. The
+    # backend skips RAG retrieval, loads the entire source content (downloads
+    # the PDF for arxiv papers), and feeds it as the sole context.
+    paper_id: int | None = None
+    # Optional: prior conversation turns from this client-side session. Bounded
+    # in length on the API side (drop earliest if too long); the per-message
+    # max_length above also caps individual turns.
+    history: list[ChatMessage] = Field(default_factory=list, max_length=40)
 
 
 class ChatResponse(BaseModel):

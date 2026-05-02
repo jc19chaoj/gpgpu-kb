@@ -40,12 +40,12 @@ function ScoreBar({ label, score }: { label: string; score: number }) {
   const width = Math.round(score * 10);
   const color = score >= 7 ? "bg-emerald-500" : score >= 4 ? "bg-amber-500" : "bg-red-500";
   return (
-    <div className="flex items-center gap-2 text-xs">
-      <span className="text-zinc-500 w-20">{label}</span>
+    <div className="flex items-center gap-2 text-[11px] sm:text-xs">
+      <span className="text-zinc-500 w-16 sm:w-20 shrink-0 truncate">{label}</span>
       <div className="flex-1 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
         <div className={`h-full rounded-full ${color}`} style={{ width: `${width}%` }} />
       </div>
-      <span className="text-zinc-400 w-8 text-right">{score.toFixed(1)}</span>
+      <span className="text-zinc-400 w-8 text-right tabular-nums">{score.toFixed(1)}</span>
     </div>
   );
 }
@@ -55,22 +55,22 @@ export function PaperCard({ paper }: { paper: Paper }) {
   const { quality, relevance } = _resolveScores(paper);
   return (
     <Card className="bg-zinc-900 border-zinc-800 hover:border-zinc-700 transition-colors">
-      <CardContent className="p-4">
-        <div className="flex items-start justify-between gap-3">
+      <CardContent className="p-3 sm:p-4">
+        <div className="flex items-start justify-between gap-2 sm:gap-3">
           <div className="flex-1 min-w-0">
             <Link href={`/paper/${paper.id}`} className="hover:text-emerald-400 transition-colors">
-              <h3 className="font-medium text-sm leading-snug line-clamp-2">{paper.title}</h3>
+              <h3 className="font-medium text-sm leading-snug line-clamp-2 break-words">{paper.title}</h3>
             </Link>
-            <p className="text-xs text-zinc-400 mt-1">
+            <p className="text-[11px] sm:text-xs text-zinc-400 mt-1 line-clamp-1">
               {paper.authors.slice(0, 3).join(", ")}
               {paper.authors.length > 3 ? ` +${paper.authors.length - 3} more` : ""}
               {paper.venue ? ` \u00b7 ${paper.venue}` : ""}
             </p>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
-            <Badge variant="outline" className="text-[10px] h-5 px-1.5 gap-1 border-zinc-700 text-zinc-400">
+            <Badge variant="outline" className="text-[10px] h-5 px-1.5 gap-1 border-zinc-700 text-zinc-400 max-w-[90px] sm:max-w-none truncate">
               {sourceIcons[paper.source_type]}
-              {paper.source_name}
+              <span className="truncate">{paper.source_name}</span>
             </Badge>
           </div>
         </div>

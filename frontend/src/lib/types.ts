@@ -41,9 +41,22 @@ export interface DailyReport {
   paper_ids: number[];
 }
 
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface ChatRequest {
   query: string;
   top_k?: number;
+  // When set, anchor the conversation to a single source. The backend skips
+  // semantic retrieval and feeds the full source content as the only context
+  // (downloads the arxiv PDF on demand).
+  paper_id?: number;
+  // Prior conversation turns from this client-side session, in chronological
+  // order. The backend keeps the most recent ~12 turns when building the
+  // prompt.
+  history?: ChatMessage[];
 }
 
 export interface ChatResponse {

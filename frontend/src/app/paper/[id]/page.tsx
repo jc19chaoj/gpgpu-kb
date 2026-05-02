@@ -7,7 +7,7 @@ import { Paper } from "@/lib/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ExternalLink, FileText, Calendar, Users, Building2, Tag, Trophy } from "lucide-react";
+import { ExternalLink, FileText, Calendar, Users, Building2, Tag, Trophy, MessageSquare } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Link from "next/link";
@@ -65,7 +65,7 @@ export default function PaperDetailPage() {
 
   if (loading) {
     return (
-      <div className="max-w-3xl mx-auto p-6 space-y-4">
+      <div className="max-w-3xl mx-auto p-4 sm:p-6 space-y-4">
         <Skeleton className="h-8 w-3/4 bg-zinc-900" />
         <Skeleton className="h-4 w-1/2 bg-zinc-900" />
         <Skeleton className="h-64 w-full bg-zinc-900" />
@@ -75,7 +75,7 @@ export default function PaperDetailPage() {
 
   if (!paper) {
     return (
-      <div className="max-w-3xl mx-auto p-6 text-center py-16">
+      <div className="max-w-3xl mx-auto p-4 sm:p-6 text-center py-16">
         <p className="text-zinc-500">Paper not found.</p>
         <Link href="/" className="text-sm text-emerald-400 hover:underline mt-2 inline-block">
           Back to browse
@@ -85,14 +85,14 @@ export default function PaperDetailPage() {
   }
 
   return (
-    <div className="max-w-3xl mx-auto p-6">
+    <div className="max-w-3xl mx-auto p-4 sm:p-6">
       <Link href="/" className="text-xs text-zinc-500 hover:text-zinc-300 mb-4 inline-block">
         ← Back to browse
       </Link>
 
       <div className="mb-6">
-        <div className="flex items-start justify-between gap-4">
-          <h1 className="text-xl font-semibold leading-snug">{paper.title}</h1>
+        <div className="flex items-start justify-between gap-3">
+          <h1 className="text-lg sm:text-xl font-semibold leading-snug break-words min-w-0">{paper.title}</h1>
           <Badge variant="outline" className="shrink-0 border-zinc-700 text-zinc-400 text-xs">
             {paper.source_type}
           </Badge>
@@ -139,6 +139,12 @@ export default function PaperDetailPage() {
               <FileText className="h-3.5 w-3.5" /> PDF
             </a>
           )}
+          <Link
+            href={`/chat?paperId=${paper.id}`}
+            className="text-sm text-emerald-400 hover:underline flex items-center gap-1"
+          >
+            <MessageSquare className="h-3.5 w-3.5" /> Chat about this
+          </Link>
         </div>
 
         {paper.categories.length > 0 && (
@@ -159,7 +165,7 @@ export default function PaperDetailPage() {
         return (
           <Card className="bg-zinc-900 border-zinc-800 mb-6">
             <CardContent className="p-4">
-              <div className="flex items-center justify-center gap-12">
+              <div className="flex items-center justify-center gap-8 sm:gap-12">
                 <ScoreCircle value={quality} label={qLabel} color="#10b981" />
                 <ScoreCircle value={relevance} label={rLabel} color="#3b82f6" />
               </div>
