@@ -39,6 +39,23 @@ def _is_cold_start() -> bool:
         db.close()
 
 
+def _is_embedding_cold_start() -> bool:
+    """True if no processed paper has been embedded yet.
+
+    Mirrors `_is_cold_start` but for the embedding stage: on the first run
+    that produces a large batch of `is_processed=1` papers, we want to
+    drain the whole backlog instead of capping at 100.
+    """
+    db = SessionLocal()
+    try:
+        return db.query(Paper).filter(
+            Paper.is_processed == 1,
+            Paper.chroma_id != "",
+        ).first() is None
+    finally:
+        db.close()
+
+
 def run_daily_pipeline() -> None:
     print("=" * 60)
     print(_t("  GPGPU Knowledge Base - Daily Pipeline",
@@ -63,7 +80,11 @@ def run_daily_pipeline() -> None:
     processed = run_processing(batch_size=batch_size)
 
     print(_t("\n[3/4] EMBEDDING", "\n[3/4] 向量化"))
-    indexed = index_unindexed_papers(batch_size=100)
+    embed_cold_start = _is_embedding_cold_start()
+    embed_batch = None if embed_cold_start else 100
+    if embed_cold_start:
+        logger.info("[embedding] cold start detected — indexing entire backlog")
+    indexed = index_unindexed_papers(batch_size=embed_batch)
 
     print(_t("\n[4/4] DAILY REPORT", "\n[4/4] 每日简报"))
     generate_daily_report()

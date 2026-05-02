@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, Header, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from kb.config import settings
@@ -99,8 +100,8 @@ def list_papers(
     page_size: int = Query(20, ge=1, le=100),
     source_type: str | None = None,
     sort_by: str = Query(
-        "impact_score",
-        pattern="^(published_date|impact_score|originality_score|ingested_date)$",
+        "total_score",
+        pattern="^(published_date|impact_score|originality_score|quality_score|relevance_score|total_score|ingested_date)$",
     ),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     include_low_quality: bool = Query(False),
@@ -114,7 +115,19 @@ def list_papers(
     if source_type:
         q = q.filter(Paper.source_type == source_type)
 
-    order_col = getattr(Paper, sort_by)
+    if sort_by == "total_score":
+        # Papers store scores in originality/impact; blog/project/talk store
+        # them in quality/relevance (see processing/llm.py). The two pairs are
+        # mutually exclusive per row, so summing all four yields the row's
+        # total regardless of source_type.
+        order_col = (
+            Paper.originality_score
+            + Paper.impact_score
+            + Paper.quality_score
+            + Paper.relevance_score
+        )
+    else:
+        order_col = getattr(Paper, sort_by)
     q = q.order_by(order_col.desc() if sort_dir == "desc" else order_col.asc())
 
     total = q.count()
@@ -262,10 +275,22 @@ def get_stats(db: Session = Depends(get_db)):
     for st in SourceType:
         count = db.query(Paper).filter(Paper.source_type == st).count()
         by_type[st.value] = count
+    # Legacy paper-centric Top-5 (still impact_score so existing dashboards
+    # don't move). top_overall is the new universal-axis ranking that lets
+    # blog/project rows compete with papers.
     top_impact = (
         db.query(Paper)
         .filter(Paper.is_processed == 1)
         .order_by(Paper.impact_score.desc())
+        .limit(5)
+        .all()
+    )
+    # Same ranking expression as the daily report so the two surfaces agree
+    # on "top overall". SQLite scalar max(a,b) per row.
+    top_overall = (
+        db.query(Paper)
+        .filter(Paper.is_processed == 1)
+        .order_by(func.max(Paper.quality_score, Paper.relevance_score).desc())
         .limit(5)
         .all()
     )
@@ -278,6 +303,16 @@ def get_stats(db: Session = Depends(get_db)):
         "top_impact": [
             {"id": p.id, "title": p.title, "impact_score": p.impact_score}
             for p in top_impact
+        ],
+        "top_overall": [
+            {
+                "id": p.id,
+                "title": p.title,
+                "source_type": p.source_type.value if hasattr(p.source_type, "value") else str(p.source_type),
+                "quality_score": p.quality_score,
+                "relevance_score": p.relevance_score,
+            }
+            for p in top_overall
         ],
     }
 

@@ -9,6 +9,21 @@ from kb.models import Paper, SourceType
 
 logger = logging.getLogger(__name__)
 
+
+def _tag_to_str(tag) -> str:
+    """Normalize a feedparser tag to a string.
+
+    feedparser yields tags as FeedParserDicts with keys `term` / `scheme` /
+    `label`. The `term` is the human-readable category. Plain strings are
+    passed through; anything unrecognised becomes "" so callers can drop it.
+    """
+    if isinstance(tag, str):
+        return tag
+    if hasattr(tag, "get"):
+        return tag.get("term") or tag.get("label") or ""
+    return ""
+
+
 # Feeds verified active as of 2026-04. Update this list when feeds rot.
 # Removed: AnandTech (site shut down in 2024, /rss redirects to forums HTML);
 #          Meta AI Blog (ai.meta.com/blog/feed/ returns 404, no public RSS).
@@ -16,7 +31,6 @@ FEEDS = [
     # Chip / Architecture
     ("https://semiengineering.com/feed/", "Semiconductor Engineering"),
     ("https://chipsandcheese.com/feed/", "Chips and Cheese"),
-    ("https://fuse.wikichip.org/feed/", "WikiChip Fuse"),
     # SemiAnalysis migrated to Substack in late 2025; the wp.com feed stopped at 2025-09.
     ("https://semianalysis.substack.com/feed", "SemiAnalysis"),
     # AI / ML labs
@@ -71,7 +85,7 @@ def fetch_recent_posts(days_back: int = 1) -> list[dict]:
                 "source_type": SourceType.BLOG,
                 "source_name": source_name,
                 "published_date": published,
-                "categories": list(entry.get("tags", [])),
+                "categories": [s for s in (_tag_to_str(t) for t in entry.get("tags", [])) if s],
                 "venue": "",
             })
             kept += 1

@@ -203,9 +203,9 @@ def test_summarize_and_score_happy_path():
     from kb.processing import llm as llm_mod
 
     good_json = json.dumps({
-        "originality_score": 8.0,
-        "impact_score": 7.5,
-        "impact_rationale": "Strong work from a top lab."
+        "quality_score": 8.0,
+        "relevance_score": 7.5,
+        "score_rationale": "Strong work from a top lab."
     })
 
     call_responses = ["This is a detailed summary.", good_json]
@@ -288,9 +288,9 @@ def test_summarize_and_score_low_quality_marks_skipped(monkeypatch):
     monkeypatch.setattr(config.settings, "quality_score_threshold", 7.0)
 
     low_json = json.dumps({
-        "originality_score": 4.0,
-        "impact_score": 5.5,
-        "impact_rationale": "Niche follow-up work."
+        "quality_score": 4.0,
+        "relevance_score": 5.5,
+        "score_rationale": "Niche follow-up work."
     })
     call_responses = ["Summary text.", low_json]
 
@@ -319,101 +319,244 @@ def test_summarize_and_score_low_quality_marks_skipped(monkeypatch):
         db.close()
 
 
-def test_summarize_and_score_blog_skips_quality_gate():
-    """Blog posts use a paper-centric rubric unfairly, so they bypass scoring
-    and go straight to is_processed=1 with summary-only output. The scoring
-    LLM call must NOT be made (only one call_llm response consumed)."""
+def _seed_typed(source_type, url_prefix: str) -> int:
+    """Create a non-paper row and return its id."""
     from kb.database import SessionLocal
-    from kb.models import Paper, SourceType
-    from kb.processing import llm as llm_mod
+    from kb.models import Paper
     import datetime
     import uuid
 
-    summary_only = ["Summary of the blog post."]
-
-    def fake_call_llm(prompt):
-        return summary_only.pop(0)
-
     db = SessionLocal()
     try:
-        post = Paper(
-            title="A Deep Dive Into GPU Memory",
-            abstract="An informal blog summary.",
-            authors=["Some Engineer"],
+        row = Paper(
+            title=f"{source_type.value} title",
+            abstract="Some text.",
+            authors=["someone"],
             organizations=[],
-            source_type=SourceType.BLOG,
-            source_name="Some Blog",
-            url=f"https://example.com/blog/{uuid.uuid4()}",
+            source_type=source_type,
+            source_name=source_type.value,
+            url=f"{url_prefix}/{uuid.uuid4()}",
             published_date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
         )
-        db.add(post)
+        db.add(row)
         db.commit()
-        db.refresh(post)
-        post_id = post.id
+        db.refresh(row)
+        return row.id
     finally:
         db.close()
+
+
+def test_blog_score_uses_depth_actionability_rubric():
+    """Blog posts now go through the universal scoring path with a blog-specific
+    rubric. Two LLM calls (summary + score), is_processed=1 regardless of score."""
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    from kb.processing import llm as llm_mod
+
+    captured_prompts: list[str] = []
+
+    score_json = json.dumps({
+        "quality_score": 6.5,
+        "relevance_score": 8.0,
+        "score_rationale": "Solid technical depth and immediately actionable.",
+    })
+    responses = ["Blog summary.", score_json]
+
+    def fake_call_llm(prompt):
+        captured_prompts.append(prompt)
+        return responses.pop(0)
+
+    post_id = _seed_typed(SourceType.BLOG, "https://example.com/blog")
 
     with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
         success = llm_mod.summarize_and_score(post_id)
 
     assert success is True
-    assert summary_only == []  # only the summary call was made; no scoring
+    # Both summary and score prompts were issued.
+    assert len(captured_prompts) == 2
+    score_prompt = captured_prompts[1]
+    assert "TECHNICAL DEPTH" in score_prompt
+    assert "ACTIONABILITY" in score_prompt
+    # Paper-only language must NOT appear in a blog rubric.
+    assert "FAANG" not in score_prompt
 
     db = SessionLocal()
     try:
         updated = db.query(Paper).filter(Paper.id == post_id).first()
         assert updated.is_processed == 1
-        assert updated.summary == "Summary of the blog post."
+        assert updated.summary == "Blog summary."
+        assert updated.quality_score == pytest.approx(6.5)
+        assert updated.relevance_score == pytest.approx(8.0)
+        assert "actionable" in updated.score_rationale.lower()
+        # Legacy paper fields are NOT mirrored for non-papers.
         assert updated.originality_score == pytest.approx(0.0)
         assert updated.impact_score == pytest.approx(0.0)
-        assert "blog" in updated.impact_rationale.lower()
     finally:
         db.close()
 
 
-def test_summarize_and_score_project_skips_quality_gate():
-    """Same as the blog case but for SourceType.PROJECT (GitHub repos)."""
+def test_project_score_uses_innovation_maturity_rubric():
     from kb.database import SessionLocal
     from kb.models import Paper, SourceType
     from kb.processing import llm as llm_mod
-    import datetime
-    import uuid
 
-    responses = ["Summary of the repo."]
+    captured: list[str] = []
+    score_json = json.dumps({
+        "quality_score": 7.0,
+        "relevance_score": 4.5,
+        "score_rationale": "Novel kernel approach but early-stage repo.",
+    })
+    responses = ["Repo summary.", score_json]
+
+    def fake_call_llm(prompt):
+        captured.append(prompt)
+        return responses.pop(0)
+
+    repo_id = _seed_typed(SourceType.PROJECT, "https://github.com/x")
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        assert llm_mod.summarize_and_score(repo_id) is True
+
+    assert "INNOVATION" in captured[1]
+    assert "MATURITY" in captured[1]
+
+    db = SessionLocal()
+    try:
+        updated = db.query(Paper).filter(Paper.id == repo_id).first()
+        assert updated.is_processed == 1
+        assert updated.quality_score == pytest.approx(7.0)
+        assert updated.relevance_score == pytest.approx(4.5)
+    finally:
+        db.close()
+
+
+def test_talk_score_uses_depth_actionability_rubric():
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    from kb.processing import llm as llm_mod
+
+    captured: list[str] = []
+    score_json = json.dumps({
+        "quality_score": 5.0,
+        "relevance_score": 6.0,
+        "score_rationale": "Useful overview.",
+    })
+    responses = ["Talk summary.", score_json]
+
+    def fake_call_llm(prompt):
+        captured.append(prompt)
+        return responses.pop(0)
+
+    talk_id = _seed_typed(SourceType.TALK, "https://example.com/talk")
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        assert llm_mod.summarize_and_score(talk_id) is True
+
+    assert "DEPTH" in captured[1]
+    assert "ACTIONABILITY" in captured[1]
+
+    db = SessionLocal()
+    try:
+        updated = db.query(Paper).filter(Paper.id == talk_id).first()
+        assert updated.is_processed == 1
+        assert updated.quality_score == pytest.approx(5.0)
+        assert updated.relevance_score == pytest.approx(6.0)
+    finally:
+        db.close()
+
+
+def test_blog_low_score_still_processed():
+    """2(a): non-papers always go to is_processed=1 on parse success, even
+    when scores are at the floor. Curated RSS list is the gate, not the LLM."""
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    from kb.processing import llm as llm_mod
+
+    score_json = json.dumps({
+        "quality_score": 1.0,
+        "relevance_score": 1.0,
+        "score_rationale": "Marketing fluff.",
+    })
+    responses = ["Summary.", score_json]
+
+    def fake_call_llm(prompt):
+        return responses.pop(0)
+
+    post_id = _seed_typed(SourceType.BLOG, "https://example.com/blog-low")
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        assert llm_mod.summarize_and_score(post_id) is True
+
+    db = SessionLocal()
+    try:
+        updated = db.query(Paper).filter(Paper.id == post_id).first()
+        # Crucially is_processed=1 (NOT 2): non-papers bypass the quality gate.
+        assert updated.is_processed == 1
+    finally:
+        db.close()
+
+
+def test_paper_mirrors_universal_to_legacy_fields():
+    """For papers, quality/relevance must mirror to originality/impact so
+    older API consumers and stored daily reports keep working."""
+    from kb.database import SessionLocal
+    from kb.models import Paper
+    from kb.processing import llm as llm_mod
+
+    score_json = json.dumps({
+        "quality_score": 8.5,
+        "relevance_score": 7.0,
+        "score_rationale": "Mirror test.",
+    })
+    responses = ["Summary.", score_json]
 
     def fake_call_llm(prompt):
         return responses.pop(0)
 
     db = SessionLocal()
     try:
-        repo = Paper(
-            title="org/awesome-cuda",
-            abstract="A README description.",
-            authors=["org"],
-            organizations=["org"],
-            source_type=SourceType.PROJECT,
-            source_name="github",
-            url=f"https://github.com/org/{uuid.uuid4()}",
-            published_date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
-        )
-        db.add(repo)
-        db.commit()
-        db.refresh(repo)
-        repo_id = repo.id
+        paper = _make_paper(db)
+        paper_id = paper.id
     finally:
         db.close()
 
     with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
-        success = llm_mod.summarize_and_score(repo_id)
-
-    assert success is True
-    assert responses == []
+        assert llm_mod.summarize_and_score(paper_id) is True
 
     db = SessionLocal()
     try:
-        updated = db.query(Paper).filter(Paper.id == repo_id).first()
-        assert updated.is_processed == 1
-        assert updated.impact_score == pytest.approx(0.0)
+        updated = db.query(Paper).filter(Paper.id == paper_id).first()
+        assert updated.quality_score == pytest.approx(8.5)
+        assert updated.relevance_score == pytest.approx(7.0)
+        assert updated.originality_score == pytest.approx(8.5)
+        assert updated.impact_score == pytest.approx(7.0)
+        assert updated.score_rationale == updated.impact_rationale
+    finally:
+        db.close()
+
+
+def test_non_paper_json_failure_leaves_pending():
+    """JSON parse failure on a non-paper must leave is_processed=0 (retry),
+    matching the existing paper retry semantics."""
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    from kb.processing import llm as llm_mod
+
+    responses = ["Summary.", "NOT JSON"]
+
+    def fake_call_llm(prompt):
+        return responses.pop(0)
+
+    post_id = _seed_typed(SourceType.BLOG, "https://example.com/blog-fail")
+
+    with patch.object(llm_mod, "call_llm", side_effect=fake_call_llm):
+        assert llm_mod.summarize_and_score(post_id) is False
+
+    db = SessionLocal()
+    try:
+        updated = db.query(Paper).filter(Paper.id == post_id).first()
+        assert updated.is_processed == 0
+        assert updated.quality_score == pytest.approx(0.0)
     finally:
         db.close()
 
@@ -428,9 +571,9 @@ def test_summarize_and_score_threshold_uses_max_of_two_dimensions(monkeypatch):
     monkeypatch.setattr(config.settings, "quality_score_threshold", 7.0)
 
     high_orig_low_impact = json.dumps({
-        "originality_score": 8.5,
-        "impact_score": 4.0,
-        "impact_rationale": "Novel idea but unknown lab."
+        "quality_score": 8.5,
+        "relevance_score": 4.0,
+        "score_rationale": "Novel idea but unknown lab."
     })
     call_responses = ["Summary.", high_orig_low_impact]
 
@@ -497,9 +640,9 @@ def test_summarize_prompt_includes_lang_instruction_zh(monkeypatch):
     captured_prompts = []
 
     good_json = json.dumps({
-        "originality_score": 8.0,
-        "impact_score": 7.5,
-        "impact_rationale": "优秀的工作。",
+        "quality_score": 8.0,
+        "relevance_score": 7.5,
+        "score_rationale": "优秀的工作。",
     })
 
     def fake_call_llm(prompt):
@@ -534,9 +677,9 @@ def test_summarize_prompt_unchanged_for_en(monkeypatch):
     captured_prompts = []
 
     good_json = json.dumps({
-        "originality_score": 8.0,
-        "impact_score": 7.5,
-        "impact_rationale": "Strong work.",
+        "quality_score": 8.0,
+        "relevance_score": 7.5,
+        "score_rationale": "Strong work.",
     })
 
     def fake_call_llm(prompt):
@@ -567,9 +710,9 @@ def test_summarize_json_keys_translated_returns_false():
     from kb.processing import llm as llm_mod
 
     translated_json = json.dumps({
-        "原创性": 8.0,
-        "影响力": 7.0,
-        "impact_rationale": "优秀的工作。",
+        "质量": 8.0,
+        "相关性": 7.0,
+        "score_rationale": "优秀的工作。",
     })
     call_responses = ["Summary text.", translated_json]
 
@@ -609,9 +752,9 @@ def test_impact_prompt_no_entire_response_chinese(monkeypatch):
     captured_prompts = []
 
     good_json = json.dumps({
-        "originality_score": 8.0,
-        "impact_score": 7.5,
-        "impact_rationale": "优秀的工作。",
+        "quality_score": 8.0,
+        "relevance_score": 7.5,
+        "score_rationale": "优秀的工作。",
     })
 
     def fake_call_llm(prompt):
@@ -631,7 +774,7 @@ def test_impact_prompt_no_entire_response_chinese(monkeypatch):
         llm_mod.summarize_and_score(paper_id)
 
     assert len(captured_prompts) == 2
-    impact_prompt = captured_prompts[1]
-    assert "Write your entire response in Chinese" not in impact_prompt
-    assert "impact_rationale" in impact_prompt
-    assert "Chinese" in impact_prompt
+    score_prompt = captured_prompts[1]
+    assert "Write your entire response in Chinese" not in score_prompt
+    assert "score_rationale" in score_prompt
+    assert "Chinese" in score_prompt

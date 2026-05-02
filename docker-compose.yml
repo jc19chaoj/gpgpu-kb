@@ -1,0 +1,94 @@
+# GPGPU Knowledge Base — local / single-host Docker deployment.
+#
+# Quick start:
+#   cp .env.docker.example .env
+#   docker compose up -d --build
+#   open http://localhost:3000   (frontend)
+#   open http://localhost:8000/docs   (backend)
+#
+# One-shot daily pipeline (ingest → process → embed → report):
+#   docker compose --profile cron run --rm daily
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        # Set INSTALL_EXTRAS="" to skip the heavy ML stack (ChromaDB +
+        # sentence-transformers ≈ 2 GB). Search will fall back to keyword.
+        INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-ml,llm-cloud}
+    image: gpgpu-kb-backend:latest
+    container_name: gpgpu-kb-backend
+    restart: unless-stopped
+    env_file:
+      # Reuse the existing backend/.env if present; fall back to repo-root .env.
+      - path: backend/.env
+        required: false
+      - path: .env
+        required: false
+    environment:
+      KB_DATABASE_URL: sqlite:////app/data/kb.sqlite
+      KB_CHROMA_DIR: /app/data/chroma
+      KB_DATA_DIR: /app/data
+      # Allow the browser-served frontend to call the API.
+      KB_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Bind-mount the existing host directory so we reuse the live SQLite +
+      # ChromaDB data and any new ingestion is visible from the host.
+      - ./backend/data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Empty by default → browser uses relative /api/* URLs and the Next
+        # server proxies them to the backend service via KB_BACKEND_URL below.
+        # This makes the frontend reachable from any host (LAN, public domain)
+        # without a build-time rebake. Override only if you want browsers to
+        # bypass the proxy and hit the backend directly.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+        # Server-side proxy target for the /api/* rewrite. Next bakes this
+        # into routes-manifest.json at build time, so it MUST be a build arg
+        # (runtime env is ignored). `backend` is the compose service DNS.
+        KB_BACKEND_URL: ${KB_BACKEND_URL:-http://backend:8000}
+    image: gpgpu-kb-frontend:latest
+    container_name: gpgpu-kb-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+
+  # Run-once daily pipeline. Excluded from `docker compose up` via profile.
+  # Invoke with:  docker compose --profile cron run --rm daily
+  daily:
+    image: gpgpu-kb-backend:latest
+    profiles: ["cron"]
+    depends_on:
+      - backend
+    env_file:
+      # Reuse the existing backend/.env if present; fall back to repo-root .env.
+      - path: backend/.env
+        required: false
+      - path: .env
+        required: false
+    environment:
+      KB_DATABASE_URL: sqlite:////app/data/kb.sqlite
+      KB_CHROMA_DIR: /app/data/chroma
+      KB_DATA_DIR: /app/data
+    volumes:
+      # Bind-mount the existing host directory so we reuse the live SQLite +
+      # ChromaDB data and any new ingestion is visible from the host.
+      - ./backend/data:/app/data
+    command: ["python", "-m", "kb.daily"]

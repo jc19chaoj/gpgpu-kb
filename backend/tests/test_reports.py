@@ -247,6 +247,80 @@ def test_report_prompt_includes_chinese_instruction_zh(monkeypatch):
     assert "Chinese" in prompt
 
 
+def test_report_includes_non_paper_rows():
+    """Daily report ranks by max(quality_score, relevance_score), so a blog
+    with high relevance_score must appear in the report's paper_ids alongside
+    paper rows."""
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+    import kb.reports as reports_mod
+
+    test_date = _YESTERDAY - datetime.timedelta(days=300)
+
+    db = SessionLocal()
+    try:
+        # One paper (modest impact) and one blog (high relevance) ingested
+        # the same day. Both is_processed=1 so both should be eligible.
+        paper = Paper(
+            title="Mid-tier paper",
+            abstract="abs",
+            authors=["A"],
+            organizations=[],
+            source_type=SourceType.PAPER,
+            source_name="arxiv",
+            url=f"https://example.com/report-mixed-{test_date.isoformat()}-paper",
+            ingested_date=_utc_dt(test_date),
+            is_processed=1,
+            summary="paper summary",
+            quality_score=5.0,
+            relevance_score=5.0,
+            originality_score=5.0,
+            impact_score=5.0,
+        )
+        blog = Paper(
+            title="Banger blog post",
+            abstract="abs",
+            authors=["B"],
+            organizations=[],
+            source_type=SourceType.BLOG,
+            source_name="rss",
+            url=f"https://example.com/report-mixed-{test_date.isoformat()}-blog",
+            ingested_date=_utc_dt(test_date),
+            is_processed=1,
+            summary="blog summary",
+            quality_score=8.5,
+            relevance_score=9.0,
+        )
+        db.add_all([paper, blog])
+        db.commit()
+        db.refresh(paper)
+        db.refresh(blog)
+        paper_id, blog_id = paper.id, blog.id
+    finally:
+        db.close()
+
+    captured: list[str] = []
+
+    def _capture(prompt):
+        captured.append(prompt)
+        return "## Report\nContent."
+
+    with patch.object(reports_mod, "call_llm", side_effect=_capture):
+        report = reports_mod.generate_daily_report(date=test_date)
+
+    assert {paper_id, blog_id}.issubset(set(report.paper_ids))
+    # The blog scored higher on max(quality, relevance) so it should appear
+    # before the paper in the prompt context.
+    assert len(captured) == 1
+    blog_pos = captured[0].find("Banger blog post")
+    paper_pos = captured[0].find("Mid-tier paper")
+    assert blog_pos != -1 and paper_pos != -1
+    assert blog_pos < paper_pos
+    # And the blog row is rendered with the blog-specific score labels.
+    assert "Depth:" in captured[0]
+    assert "Actionability:" in captured[0]
+
+
 def test_report_empty_placeholder_chinese_when_lang_zh(monkeypatch):
     """When settings.language='zh' and no papers exist, placeholder should contain '无新论文入库'."""
     import kb.reports as reports_mod

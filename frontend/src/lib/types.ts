@@ -18,6 +18,12 @@ export interface Paper {
   originality_score: number;
   impact_score: number;
   impact_rationale: string;
+  // Universal score axes used by all source_types. Per-type display labels
+  // live in components/paper-card.tsx; for papers these mirror originality
+  // and impact respectively.
+  quality_score: number;
+  relevance_score: number;
+  score_rationale: string;
 }
 
 export interface PaperListResponse {
@@ -50,4 +56,11 @@ export interface Stats {
   processed: number;
   by_type: Record<string, number>;
   top_impact: { id: number; title: string; impact_score: number }[];
+  top_overall?: {
+    id: number;
+    title: string;
+    source_type: string;
+    quality_score: number;
+    relevance_score: number;
+  }[];
 }

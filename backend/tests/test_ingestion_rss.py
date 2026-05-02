@@ -141,6 +141,55 @@ class TestFetchRecentPosts:
         assert len(posts) == 1
         assert posts[0]["published_date"] is None
 
+    def test_tags_normalized_to_strings(self):
+        """feedparser yields tags as dicts with `term`/`scheme`/`label`. Persist
+        the human-readable `term` (or `label` fallback) as plain strings, not
+        the raw dict — otherwise PaperOut.categories: list[str] explodes when
+        the API later serializes the row."""
+        entry = _entry(
+            title="With Tags",
+            link="https://example.com/with-tags",
+            published_parsed=_fresh_parsed(),
+        )
+        entry.tags = [
+            {"term": "AI", "scheme": "http://x", "label": None},
+            {"term": "Hardware"},
+            {"label": "Fallback Label"},   # no `term` → fall back to label
+            {"scheme": "http://x"},        # neither → must be dropped
+            "plain-string-tag",            # already a string → pass through
+        ]
+        feed = _make_feed([entry])
+
+        with patch("kb.ingestion.rss.FEEDS", [("https://example.com/feed", "Blog")]):
+            with patch("kb.ingestion.rss.feedparser.parse", return_value=feed):
+                posts = fetch_recent_posts(days_back=1)
+
+        assert len(posts) == 1
+        assert posts[0]["categories"] == [
+            "AI",
+            "Hardware",
+            "Fallback Label",
+            "plain-string-tag",
+        ]
+        # Sanity: no dicts leaked through
+        assert all(isinstance(c, str) for c in posts[0]["categories"])
+
+    def test_no_tags_yields_empty_categories(self):
+        entry = _entry(
+            title="No Tags",
+            link="https://example.com/no-tags",
+            published_parsed=_fresh_parsed(),
+        )
+        # _entry already sets tags=[]
+        feed = _make_feed([entry])
+
+        with patch("kb.ingestion.rss.FEEDS", [("https://example.com/feed", "Blog")]):
+            with patch("kb.ingestion.rss.feedparser.parse", return_value=feed):
+                posts = fetch_recent_posts(days_back=1)
+
+        assert len(posts) == 1
+        assert posts[0]["categories"] == []
+
     def test_multiple_feeds_aggregated(self):
         entry1 = _entry("Post A", "https://a.com/1", published_parsed=_fresh_parsed())
         entry2 = _entry("Post B", "https://b.com/1", published_parsed=_fresh_parsed())

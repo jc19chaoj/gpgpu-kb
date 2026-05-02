@@ -12,8 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowDown, ArrowUp } from "lucide-react";
 
 const SORT_OPTIONS = [
-  { value: "impact_score", label: "Impact" },
-  { value: "originality_score", label: "Originality" },
+  { value: "total_score", label: "Score" },
   { value: "published_date", label: "Date" },
 ];
 
@@ -32,7 +31,7 @@ function BrowseContent() {
   const [data, setData] = useState<PaperListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
-  const [sortBy, setSortBy] = useState("impact_score");
+  const [sortBy, setSortBy] = useState("total_score");
   const [sortDir, setSortDir] = useState("desc");
   const [typeFilter, setTypeFilter] = useState("");
 

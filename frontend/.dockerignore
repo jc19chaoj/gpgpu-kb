@@ -1,0 +1,20 @@
+node_modules/
+.next/
+out/
+.turbo/
+test-results/
+playwright-report/
+
+.env
+.env.*
+!.env.example
+
+# Exclude e2e + tooling that aren't needed in the runtime image.
+tests/
+playwright.config.ts
+
+*.md
+Dockerfile
+.dockerignore
+.git
+.gitignore

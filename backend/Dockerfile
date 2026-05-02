@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1.7
+# Backend image: FastAPI + SQLAlchemy + (optional) ChromaDB / sentence-transformers
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Build deps for any packages that ship sdists (sentence-transformers/torch ship wheels,
+# but a few transitive deps occasionally need a compiler). curl is used by the healthcheck.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Allow swapping the pip index at build time. Useful when pypi.org is
+# unreachable / rate-limited (e.g. in some regions). Examples:
+#   --build-arg PIP_INDEX_URL=https://pypi.org/simple
+#ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+#ENV PIP_INDEX_URL=$PIP_INDEX_URL \
+#    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
+# Install Python deps first so the layer caches across code edits.
+COPY pyproject.toml ./
+COPY kb ./kb
+
+# INSTALL_EXTRAS controls how heavy the image is.
+#   "ml,llm-cloud" (default) — ChromaDB + sentence-transformers + Anthropic/OpenAI/DeepSeek SDK
+#   "llm-cloud"              — cloud LLM only, semantic search/RAG falls back to keyword
+#   ""                        — minimal: ingestion + LLM-via-CLI only
+ARG INSTALL_EXTRAS=ml,llm-cloud
+RUN if [ -z "$INSTALL_EXTRAS" ]; then \
+        pip install . ; \
+    else \
+        pip install ".[${INSTALL_EXTRAS}]" ; \
+    fi
+
+# Persisted data lives under /app/data (mount a volume here in production).
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
+# Sensible runtime defaults; override via docker-compose env_file or `-e`.
+ENV KB_DATABASE_URL="sqlite:////app/data/kb.sqlite" \
+    KB_CHROMA_DIR="/app/data/chroma" \
+    KB_DATA_DIR="/app/data" \
+    KB_CORS_ORIGINS='["http://localhost:3000"]'
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
+
+CMD ["uvicorn", "kb.main:app", "--host", "0.0.0.0", "--port", "8000"]

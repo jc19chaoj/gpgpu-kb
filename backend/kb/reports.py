@@ -3,12 +3,36 @@
 import datetime
 import logging
 
+from sqlalchemy import func
+
 from kb.database import SessionLocal
 from kb.models import Paper, DailyReport
 from kb.processing.llm import call_llm
 from kb.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# Per-source-type display labels for the (quality_score, relevance_score)
+# pair. Mirrors frontend/src/components/paper-card.tsx — keep in sync.
+_SCORE_LABELS: dict[str, tuple[str, str]] = {
+    "paper": ("Originality", "Impact"),
+    "blog": ("Depth", "Actionability"),
+    "talk": ("Depth", "Actionability"),
+    "project": ("Innovation", "Maturity"),
+}
+
+
+def _score_line(p: Paper) -> str:
+    st = p.source_type.value if hasattr(p.source_type, "value") else str(p.source_type)
+    q_label, r_label = _SCORE_LABELS.get(st, ("Quality", "Relevance"))
+    # Prefer the universal fields; fall back to legacy paper fields for
+    # rows scored before the universal-axis migration (originality/impact
+    # only). This keeps already-rescored papers stable AND avoids 0.0/0.0
+    # bars on legacy non-paper rows that haven't been backfilled yet.
+    quality = p.quality_score or (p.originality_score if st == "paper" else 0.0)
+    relevance = p.relevance_score or (p.impact_score if st == "paper" else 0.0)
+    return f"*{q_label}:* {quality:.1f}/10 | *{r_label}:* {relevance:.1f}/10"
 
 
 def generate_daily_report(date: datetime.date | None = None) -> DailyReport:
@@ -25,11 +49,15 @@ def generate_daily_report(date: datetime.date | None = None) -> DailyReport:
 
     db = SessionLocal()
     try:
+        # Order by the unified axis so blog/project rows compete with papers.
+        # SQLite supports the SQL-standard scalar `MAX(a, b)` via func.max
+        # at the column level (distinct from the GROUP BY aggregate).
+        unified_score = func.max(Paper.quality_score, Paper.relevance_score)
         papers = db.query(Paper).filter(
             Paper.ingested_date >= start,
             Paper.ingested_date <= end,
             Paper.is_processed == 1,
-        ).order_by(Paper.impact_score.desc()).all()
+        ).order_by(unified_score.desc()).all()
 
         if not papers:
             papers = db.query(Paper).filter(
@@ -53,7 +81,7 @@ def generate_daily_report(date: datetime.date | None = None) -> DailyReport:
                 f"### {p.title}\n"
                 f"*Authors:* {', '.join((p.authors or [])[:5])}\n"
                 f"*Type:* {p.source_type} | *Source:* {p.source_name}\n"
-                f"*Originality:* {p.originality_score:.1f}/10 | *Impact:* {p.impact_score:.1f}/10\n"
+                f"{_score_line(p)}\n"
                 f"*Summary:* {(p.summary or '')[:500]}\n"
             )
 

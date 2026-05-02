@@ -101,8 +101,12 @@ class EmbeddingStore:
         return out
 
 
-def index_unindexed_papers(batch_size: int = 50) -> int:
-    """Find papers without embeddings and index them. Returns count."""
+def index_unindexed_papers(batch_size: int | None = 50) -> int:
+    """Find papers without embeddings and index them. Returns count.
+
+    Pass ``batch_size=None`` to drain the entire backlog (used on cold-start
+    runs where every freshly-processed paper still needs an embedding).
+    """
     store = get_embedding_store()
     if not store.available:
         logger.info("ML deps not installed — skipping indexing")
@@ -110,10 +114,13 @@ def index_unindexed_papers(batch_size: int = 50) -> int:
 
     db = SessionLocal()
     try:
-        unindexed = db.query(Paper).filter(
+        query = db.query(Paper).filter(
             Paper.is_processed == 1,
             Paper.chroma_id == "",
-        ).limit(batch_size).all()
+        )
+        if batch_size is not None:
+            query = query.limit(batch_size)
+        unindexed = query.all()
 
         count = 0
         for paper in unindexed:

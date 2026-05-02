@@ -181,3 +181,73 @@ cpolar http 3000
 ```
 
 This exposes the Next.js frontend on a public URL.
+
+## Docker Deployment
+
+A two-service Compose stack is provided (`docker-compose.yml` at the repo root):
+
+```bash
+# 1. Configure
+cp .env.docker.example .env
+# edit .env — at minimum set OPENAI_API_KEY (or ANTHROPIC_API_KEY / DEEPSEEK_API_KEY)
+# and KB_LLM_PROVIDER. Optionally set GITHUB_TOKEN and KB_CHAT_TOKEN.
+
+# 2. Build + run
+docker compose up -d --build
+
+# 3. Open
+#   Frontend:  http://localhost:3000
+#   Backend:   http://localhost:8000/docs
+```
+
+### Services
+
+| Service | Image | Port | Notes |
+| --- | --- | --- | --- |
+| `backend` | `gpgpu-kb-backend` (`python:3.12-slim`) | `8000` | FastAPI; SQLite + ChromaDB persisted in the `kb_data` volume |
+| `frontend` | `gpgpu-kb-frontend` (`node:20-alpine`) | `3000` | Next.js 16 standalone build |
+| `daily` | reuses backend image | – | One-shot pipeline; opt-in via `--profile cron` |
+
+### Daily pipeline (ingest → process → embed → report)
+
+```bash
+# Run the full pipeline once against the same volume:
+docker compose --profile cron run --rm daily
+
+# Schedule it from the host (example: 07:00 daily):
+( crontab -l 2>/dev/null ; \
+  echo '0 7 * * * cd /path/to/gpgpu-kb && docker compose --profile cron run --rm daily >> data/daily.log 2>&1' \
+) | crontab -
+```
+
+### Persistence
+
+All mutable state (`kb.sqlite` + `chroma/`) lives in the named volume `kb_data`,
+mounted at `/app/data` inside the backend and daily containers. Back it up with:
+
+```bash
+docker run --rm -v gpgpu-kb_kb_data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/kb-data-$(date +%F).tgz -C /data .
+```
+
+### Production tips
+
+1. **Build args are baked**: `NEXT_PUBLIC_API_URL` is a Next.js public env, so it
+   is compiled into the client bundle. If you put the backend behind a domain,
+   rebuild the frontend image:
+   ```bash
+   docker compose build --build-arg NEXT_PUBLIC_API_URL=https://kb.example.com frontend
+   ```
+2. **Slim the backend** by skipping the ML stack (~2 GB) when you don't need
+   semantic search/RAG:
+   ```bash
+   BACKEND_INSTALL_EXTRAS=llm-cloud docker compose build backend
+   ```
+   Search will fall back to keyword `LIKE` matching automatically.
+3. **Always set `KB_CHAT_TOKEN`** when exposing the API publicly, otherwise
+   `/api/chat` is an open LLM proxy. Front the frontend with HTTPS (Caddy /
+   Traefik / Cloudflare Tunnel) — the bundled images do not terminate TLS.
+4. **CORS**: `KB_CORS_ORIGINS` defaults to `localhost:3000`. Add the production
+   origin (e.g. `https://kb.example.com`) before deploying.
+5. **`hermes` provider does not work in containers** — pick `openai`,
+   `anthropic`, or `deepseek` and provide the matching API key.

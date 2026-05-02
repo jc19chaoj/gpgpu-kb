@@ -206,3 +206,177 @@ def test_stats_counts_split_by_processing_state(client):
     assert body["processed"] >= 1
     assert body["skipped_low_quality"] >= 1
     assert body["pending"] >= 1
+
+
+# ─── Search regressions ──────────────────────────────────────────
+
+def _seed_paper(
+    *,
+    title: str,
+    url: str,
+    categories,
+    is_processed: int = 1,
+    impact: float = 8.0,
+    originality: float = 8.0,
+) -> int:
+    import datetime
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+
+    db = SessionLocal()
+    try:
+        p = Paper(
+            title=title,
+            abstract="abs",
+            summary="sum",
+            authors=["A"],
+            organizations=[],
+            source_type=SourceType.BLOG,
+            source_name="rss",
+            url=url,
+            published_date=datetime.datetime(2026, 4, 25, tzinfo=datetime.UTC),
+            categories=categories,
+            impact_score=impact,
+            originality_score=originality,
+            is_processed=is_processed,
+        )
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return p.id
+    finally:
+        db.close()
+
+
+def test_search_keyword_returns_paper_with_string_categories(client):
+    """Happy path: searched paper round-trips its string categories intact."""
+    pid = _seed_paper(
+        title="qg-search-strcats hbm reuse",
+        url="https://example.test/qg/search-strcats/0",
+        categories=["arch", "memory"],
+    )
+    r = client.get(
+        "/api/papers/search",
+        params={"q": "qg-search-strcats", "semantic": "false"},
+    )
+    assert r.status_code == 200, r.text
+    by_id = {p["id"]: p for p in r.json()["papers"]}
+    assert pid in by_id
+    assert by_id[pid]["categories"] == ["arch", "memory"]
+
+
+def test_search_handles_legacy_dict_categories(client):
+    """Regression: legacy RSS rows stored categories as feedparser tag dicts
+    (e.g. ``{'term': 'AI', 'scheme': '...', 'label': None}``). The search
+    endpoint must coerce them to strings instead of 500-ing on PaperOut
+    validation."""
+    pid = _seed_paper(
+        title="qg-search-dictcats marker",
+        url="https://example.test/qg/search-dictcats/0",
+        categories=[
+            {"term": "Agentic AI", "scheme": "http://x", "label": None},
+            {"term": "Top Stories", "scheme": "http://x", "label": None},
+            {"label": "Fallback Label"},     # term missing; label fills in
+            {"scheme": "http://x"},           # neither — must be dropped
+            "plain-string-tag",
+        ],
+    )
+
+    r = client.get(
+        "/api/papers/search",
+        params={"q": "qg-search-dictcats marker", "semantic": "false"},
+    )
+    assert r.status_code == 200, r.text
+    by_id = {p["id"]: p for p in r.json()["papers"]}
+    assert pid in by_id
+    assert by_id[pid]["categories"] == [
+        "Agentic AI",
+        "Top Stories",
+        "Fallback Label",
+        "plain-string-tag",
+    ]
+
+
+def test_paper_detail_handles_legacy_dict_categories(client):
+    """Same coercion must protect /api/papers/{id} so direct links don't 500
+    on legacy RSS rows."""
+    pid = _seed_paper(
+        title="qg-detail-dictcats",
+        url="https://example.test/qg/detail-dictcats/0",
+        categories=[{"term": "Hardware", "scheme": "http://x", "label": None}],
+    )
+
+    r = client.get(f"/api/papers/{pid}")
+    assert r.status_code == 200, r.text
+    assert r.json()["categories"] == ["Hardware"]
+
+
+def test_search_q_required(client):
+    r = client.get("/api/papers/search")
+    assert r.status_code == 422
+
+
+def test_search_rejects_empty_q(client):
+    r = client.get("/api/papers/search", params={"q": ""})
+    assert r.status_code == 422
+
+
+def test_search_keyword_escapes_like_wildcards(client):
+    """A `%`/`_` in q must match literally, not as SQL LIKE wildcards.
+    Seed a row whose title contains a literal `%`; a query containing the
+    `%` must hit it, but a bare wildcard substring must NOT spuriously
+    match unrelated rows."""
+    pid = _seed_paper(
+        title="qg-escape 50% throughput",
+        url="https://example.test/qg/escape/0",
+        categories=["perf"],
+    )
+    other = _seed_paper(
+        title="qg-escape baseline",
+        url="https://example.test/qg/escape/1",
+        categories=["perf"],
+    )
+
+    # Literal `%` query: must match only the row containing `%`
+    r = client.get(
+        "/api/papers/search",
+        params={"q": "50%", "semantic": "false", "page_size": 100},
+    )
+    assert r.status_code == 200, r.text
+    ids = {p["id"] for p in r.json()["papers"]}
+    assert pid in ids
+    assert other not in ids
+
+
+def test_search_pagination_caps_page_size(client):
+    """page_size > 100 must be rejected by Query(le=100)."""
+    r = client.get("/api/papers/search", params={"q": "gpu", "page_size": 999})
+    assert r.status_code == 422
+
+
+# ─── Universal score axes (sort + stats) ─────────────────────────
+
+def test_papers_sort_by_quality_score(client):
+    r = client.get("/api/papers", params={"sort_by": "quality_score"})
+    assert r.status_code == 200, r.text
+
+
+def test_papers_sort_by_relevance_score(client):
+    r = client.get("/api/papers", params={"sort_by": "relevance_score"})
+    assert r.status_code == 200, r.text
+
+
+def test_papers_invalid_sort_by_rejected(client):
+    r = client.get("/api/papers", params={"sort_by": "made_up_field"})
+    assert r.status_code == 422
+
+
+def test_stats_includes_top_overall(client):
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    body = r.json()
+    assert "top_overall" in body
+    assert isinstance(body["top_overall"], list)
+    # Each entry has the universal-axis shape (when present).
+    for entry in body["top_overall"]:
+        assert {"id", "title", "source_type", "quality_score", "relevance_score"}.issubset(entry)

@@ -12,6 +12,25 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Link from "next/link";
 
+// Per-source-type score labels. Mirrors components/paper-card.tsx and
+// backend kb/reports.py::SCORE_LABELS.
+const SCORE_LABELS: Record<string, [string, string]> = {
+  paper: ["Originality", "Impact"],
+  blog: ["Depth", "Actionability"],
+  talk: ["Depth", "Actionability"],
+  project: ["Innovation", "Maturity"],
+};
+
+function resolveScores(paper: Paper): { quality: number; relevance: number } {
+  if (paper.source_type === "paper") {
+    return {
+      quality: paper.quality_score || paper.originality_score,
+      relevance: paper.relevance_score || paper.impact_score,
+    };
+  }
+  return { quality: paper.quality_score, relevance: paper.relevance_score };
+}
+
 function ScoreCircle({ value, label, color }: { value: number; label: string; color: string }) {
   const radius = 28;
   const circumference = 2 * Math.PI * radius;
@@ -133,17 +152,24 @@ export default function PaperDetailPage() {
         )}
       </div>
 
-      <Card className="bg-zinc-900 border-zinc-800 mb-6">
-        <CardContent className="p-4">
-          <div className="flex items-center justify-center gap-12">
-            <ScoreCircle value={paper.originality_score} label="Originality" color="#10b981" />
-            <ScoreCircle value={paper.impact_score} label="Impact" color="#3b82f6" />
-          </div>
-          {paper.impact_rationale && (
-            <p className="text-sm text-zinc-400 mt-4 text-center italic">{paper.impact_rationale}</p>
-          )}
-        </CardContent>
-      </Card>
+      {(() => {
+        const [qLabel, rLabel] = SCORE_LABELS[paper.source_type] ?? ["Quality", "Relevance"];
+        const { quality, relevance } = resolveScores(paper);
+        const rationale = paper.score_rationale || paper.impact_rationale;
+        return (
+          <Card className="bg-zinc-900 border-zinc-800 mb-6">
+            <CardContent className="p-4">
+              <div className="flex items-center justify-center gap-12">
+                <ScoreCircle value={quality} label={qLabel} color="#10b981" />
+                <ScoreCircle value={relevance} label={rLabel} color="#3b82f6" />
+              </div>
+              {rationale && (
+                <p className="text-sm text-zinc-400 mt-4 text-center italic">{rationale}</p>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })()}
 
       {paper.summary ? (
         <Card className="bg-zinc-900 border-zinc-800 mb-6">
@@ -161,7 +187,7 @@ export default function PaperDetailPage() {
       ) : (
         <Card className="bg-zinc-900 border-zinc-800 mb-6">
           <CardContent className="p-6 text-center text-zinc-500">
-            <p>This paper is still being processed. Summary coming soon.</p>
+            <p>This item is still being processed. Summary coming soon.</p>
           </CardContent>
         </Card>
       )}
@@ -169,7 +195,9 @@ export default function PaperDetailPage() {
       {paper.abstract && (
         <Card className="bg-zinc-900 border-zinc-800">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Original Abstract</CardTitle>
+            <CardTitle className="text-sm font-medium">
+              {paper.source_type === "paper" ? "Original Abstract" : "Original Excerpt"}
+            </CardTitle>
           </CardHeader>
           <CardContent>
             <p className="text-sm text-zinc-400 leading-relaxed">{paper.abstract}</p>

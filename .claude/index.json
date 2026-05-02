@@ -1,18 +1,19 @@
 {
-  "schema_version": "1.0",
-  "generated_at": "2026-04-25T15:26:48Z",
+  "schema_version": "1.1",
+  "generated_at": "2026-05-02T08:57:04Z",
   "generator": "init-architect (adaptive)",
   "project": {
     "name": "gpgpu-kb",
-    "summary": "Self-updating GPGPU chip-architecture research knowledge base with semantic search and RAG chat over ArXiv papers, curated RSS blogs, and trending GitHub projects.",
+    "summary": "Self-updating GPGPU chip-architecture research knowledge base. Daily ingest of ArXiv / curated RSS / GitHub trending; per-source-type LLM scoring on universal axes (quality, relevance); ChromaDB-backed semantic search and RAG chat over the corpus; bilingual (en/zh) Markdown daily reports; Dockerized deployment with optional cron pipeline.",
     "type": "monorepo (backend + frontend)",
     "primary_languages": ["Python 3.12", "TypeScript 5"],
     "stack": [
       "FastAPI", "SQLAlchemy 2", "Pydantic 2",
       "ChromaDB", "sentence-transformers",
-      "Next.js 16 (App Router)", "React 19",
+      "Next.js 16 (App Router, standalone)", "React 19",
       "Tailwind v4", "shadcn/ui",
-      "Playwright (e2e)"
+      "Playwright (e2e)",
+      "Docker Compose"
     ]
   },
   "modules": [
@@ -24,49 +25,95 @@
       "entry_points": [
         "backend/kb/main.py",
         "backend/kb/daily.py",
-        "backend/run_api.sh"
+        "backend/kb/ingestion/run.py",
+        "backend/kb/scripts/rescore_non_papers.py",
+        "backend/run_api.sh",
+        "backend/Dockerfile"
       ],
       "api_routes": [
-        "GET /api/papers",
-        "GET /api/papers/search",
+        "GET /api/papers (sort_by adds quality_score|relevance_score|total_score; default total_score; include_low_quality flag)",
+        "GET /api/papers/search (semantic with keyword fallback; LIKE wildcards escaped)",
         "GET /api/papers/{paper_id}",
-        "POST /api/chat (optional Bearer token via KB_CHAT_TOKEN)",
+        "POST /api/chat (optional Bearer token via KB_CHAT_TOKEN, hmac.compare_digest)",
         "GET /api/reports",
         "GET /api/reports/{report_id}",
-        "GET /api/stats",
+        "GET /api/stats (adds top_overall: cross-source-type top-5 by max(quality, relevance))",
         "GET /api/health"
       ],
-      "data_models": ["Paper (papers)", "DailyReport (daily_reports)"],
-      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env)",
-      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev)",
-      "tests": "backend/tests/ (~75 tests, coverage ~74%, see tests/README.md)",
-      "llm_providers": ["hermes", "anthropic", "openai", "deepseek"],
+      "data_models": [
+        "Paper (papers): now includes universal score axes quality_score / relevance_score / score_rationale alongside legacy originality_score / impact_score / impact_rationale",
+        "DailyReport (daily_reports)"
+      ],
+      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env). New fields: language, ingest_empty_db_days, ingest_gap_min_days, ingest_gap_max_days, deepseek_*, chat_token, quality_score_threshold, data_dir.",
+      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev). Docker controls extras via ARG INSTALL_EXTRAS=ml,llm-cloud (default).",
+      "tests": "backend/tests/ (~95 tests, coverage ~74%). New coverage: per-source-type rubrics (paper/blog/talk/project), Chinese mode prompt injection, JSON-key translation rejection, non-paper bypass of quality gate, paper legacy field mirroring, top_overall, LIKE escape, RSS dict-categories backfill.",
+      "llm_providers": ["hermes (local CLI; not available in Docker)", "anthropic", "openai", "deepseek (reuses openai SDK with base_url)"],
       "auth": {
-        "chat_endpoint": "Optional Bearer token via KB_CHAT_TOKEN; compared via hmac.compare_digest in verify_chat_token"
+        "chat_endpoint": "Optional Bearer token via KB_CHAT_TOKEN; compared via hmac.compare_digest in verify_chat_token (Depends in /api/chat)."
+      },
+      "scoring": {
+        "axes": ["quality_score", "relevance_score"],
+        "rubric_by_source_type": {
+          "paper": ["Originality", "Impact"],
+          "blog": ["Technical Depth", "Actionability"],
+          "talk": ["Depth", "Actionability"],
+          "project": ["Innovation", "Maturity"]
+        },
+        "quality_gate": "max(quality, relevance) >= KB_QUALITY_SCORE_THRESHOLD (default 7.0). Applied ONLY to source_type=paper. Non-papers always go to is_processed=1 on JSON parse success. JSON parse failure / translated keys / missing keys leave is_processed=0 for retry.",
+        "paper_legacy_mirror": "For papers, summarize_and_score copies quality→originality_score, relevance→impact_score, score_rationale→impact_rationale to keep legacy API consumers and stored reports stable."
+      },
+      "ingestion": {
+        "rss_feeds_count": 11,
+        "removed_feeds": ["AnandTech (site shut down 2024)", "Meta AI Blog (no public RSS)"],
+        "active_feeds_examples": ["semiengineering.com", "chipsandcheese.com", "semianalysis.substack.com", "openai.com/news", "blog.google", "huggingface.co/blog", "developer.nvidia.com/blog", "research.nvidia.com", "lilianweng.github.io", "karpathy.github.io", "interconnects.ai"],
+        "adaptive_lookback": "kb/ingestion/run.py::_compute_days_back(): empty DB → KB_INGEST_EMPTY_DB_DAYS; otherwise now - max(ingested_date) clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS]."
+      },
+      "cold_start_handling": "kb.daily detects whether any paper has is_processed != 0 (processing) and whether any is_processed=1 row has chroma_id != '' (embedding). If neither, run_processing / index_unindexed_papers run with batch_size=None to drain the entire backlog. Steady-state runs cap at 100/run.",
+      "chinese_mode": {
+        "env_var": "KB_LANGUAGE",
+        "values": ["en (default)", "zh"],
+        "scope": "summarize prompt suffix, score_rationale value (JSON keys stay English), daily report content + title + section names. CLI override: python -m kb.daily --lang zh."
+      },
+      "docker": {
+        "dockerfile": "backend/Dockerfile (python:3.12-slim, build-essential + curl, ARG INSTALL_EXTRAS=ml,llm-cloud, VOLUME /app/data, HEALTHCHECK /api/health, CMD uvicorn)",
+        "dockerignore": "backend/.dockerignore (excludes data/, tests/, *.md, .venv, .pytest_cache, etc.)",
+        "compose_overrides": ["KB_DATABASE_URL=sqlite:////app/data/kb.sqlite", "KB_CHROMA_DIR=/app/data/chroma", "KB_DATA_DIR=/app/data", "KB_CORS_ORIGINS=[\"http://localhost:3000\",\"http://127.0.0.1:3000\"]"],
+        "daily_profile": "docker compose --profile cron run --rm daily (one-shot pipeline reusing backend image)"
       },
       "important_paths": [
+        "backend/kb/main.py",
+        "backend/kb/daily.py",
+        "backend/kb/database.py",
+        "backend/kb/models.py",
+        "backend/kb/schemas.py",
+        "backend/kb/config.py",
+        "backend/kb/reports.py",
         "backend/kb/ingestion/arxiv.py",
         "backend/kb/ingestion/rss.py",
         "backend/kb/ingestion/github_trending.py",
         "backend/kb/ingestion/run.py",
         "backend/kb/processing/llm.py",
         "backend/kb/processing/embeddings.py",
-        "backend/kb/reports.py",
-        "backend/kb/database.py",
-        "backend/kb/models.py",
-        "backend/kb/schemas.py",
+        "backend/kb/scripts/rescore_non_papers.py",
+        "backend/Dockerfile",
+        "backend/.dockerignore",
         "backend/tests/README.md",
+        "backend/tests/conftest.py",
         "backend/tests/test_api_smoke.py",
-        "backend/tests/test_processing_llm.py"
+        "backend/tests/test_processing_llm.py",
+        "backend/tests/test_reports.py",
+        "backend/tests/test_ingestion_rss.py"
       ],
       "claude_md": "backend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 17,
+        "scanned_files": 28,
         "high_confidence": true,
         "gaps": [
-          "未读取 backend/tests/conftest.py、test_processing_llm.py 等具体源代码（仅依赖 README 描述）",
-          "未读取 backend/.env / .env.example（若存在）",
-          "未读取 ingestion/__init__.py、processing/__init__.py（应仅是空模块导出）"
+          "未读取 backend/kb/ingestion/arxiv.py 与 github_trending.py 源代码（按 README 描述总结，关键字段如 cs.* 类目数与 polite-sleep 路径未直接证实）",
+          "未读取 backend/tests/conftest.py 内部细节（仅依赖 README 说明 _init_db / client 夹具）",
+          "未读取 backend/pyproject.toml 完整内容；extras 列表来自代码注释与 docker-compose 默认值",
+          "backend/kb/scripts/__init__.py 是否存在未确认（鉴于 README 用 -m kb.scripts.rescore_non_papers，应该是 package）",
+          "未读取 frontend/tests/e2e/ 下具体测试用例文件，无法列出场景矩阵"
         ]
       }
     },
@@ -74,62 +121,94 @@
       "id": "frontend",
       "path": "frontend",
       "language": "typescript",
-      "framework": "next.js 16 (app router) / react 19",
+      "framework": "next.js 16 (app router, standalone) / react 19",
       "entry_points": [
         "frontend/src/app/layout.tsx",
-        "frontend/src/app/page.tsx"
+        "frontend/src/app/page.tsx",
+        "frontend/next.config.ts",
+        "frontend/Dockerfile"
       ],
       "pages": [
-        "/ (Browse + Search)",
+        "/ (Browse + Search; default sort_by=total_score)",
         "/chat (RAG)",
-        "/paper/[id]",
+        "/paper/[id] (Universal Score axes: ScoreCircle x2 with per-source-type labels)",
         "/reports",
         "/reports/[id]",
         "/stats"
       ],
-      "api_client": "frontend/src/lib/api.ts",
-      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py)",
-      "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*, playwright.config.ts",
+      "next_config": {
+        "output": "standalone",
+        "redirects": ["/search → / (302, permanent: false)"],
+        "rewrites": ["/api/:path* → ${KB_BACKEND_URL}/api/:path*"],
+        "kb_backend_url_default": "http://127.0.0.1:8000",
+        "kb_backend_url_docker": "http://backend:8000",
+        "build_time_env": ["NEXT_PUBLIC_API_URL (baked into client bundle)", "KB_BACKEND_URL (baked into routes-manifest.json)", "NPM_REGISTRY"]
+      },
+      "api_client": "frontend/src/lib/api.ts (API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '' — defaults to same-origin via Next /api proxy)",
+      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py; adds quality_score / relevance_score / score_rationale and Stats.top_overall?)",
+      "score_labels": {
+        "paper": ["Originality", "Impact"],
+        "blog": ["Depth", "Actionability"],
+        "talk": ["Depth", "Actionability"],
+        "project": ["Innovation", "Maturity"]
+      },
+      "score_resolution": "_resolveScores(paper): paper rows fall back to originality_score/impact_score when universal axes are 0 (legacy data); non-paper rows always use universal axes directly. Mirrored in src/components/paper-card.tsx and src/app/paper/[id]/page.tsx.",
+      "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*, playwright.config.ts, next.config.ts, Dockerfile, .dockerignore",
       "tests": "frontend/tests/e2e/ (Playwright, chromium-only, mocked backend)",
       "scripts": {
         "dev": "next dev",
-        "build": "next build",
+        "build": "next build (produces .next/standalone)",
         "start": "next start",
         "lint": "eslint",
         "test:e2e": "playwright test"
       },
+      "docker": {
+        "dockerfile": "frontend/Dockerfile (3-stage: deps / builder / runner; alpine non-root nextjs:nodejs; HEALTHCHECK GET /)",
+        "dockerignore": "frontend/.dockerignore (excludes node_modules, .next, tests, playwright.config.ts, *.md, .git, .env*)",
+        "build_args": ["NEXT_PUBLIC_API_URL", "KB_BACKEND_URL", "NPM_REGISTRY"],
+        "runtime": "node server.js (standalone), HEALTHCHECK polls 127.0.0.1:3000/"
+      },
       "important_paths": [
         "frontend/AGENTS.md",
+        "frontend/next.config.ts",
         "frontend/playwright.config.ts",
+        "frontend/Dockerfile",
+        "frontend/.dockerignore",
         "frontend/tests/e2e/",
+        "frontend/src/app/layout.tsx",
+        "frontend/src/app/page.tsx",
         "frontend/src/app/chat/page.tsx",
-        "frontend/src/components/layout/",
-        "frontend/src/components/ui/",
+        "frontend/src/app/paper/[id]/page.tsx",
         "frontend/src/components/paper-card.tsx",
         "frontend/src/components/search-bar.tsx",
-        "frontend/src/lib/api.ts"
+        "frontend/src/lib/api.ts",
+        "frontend/src/lib/types.ts",
+        "frontend/src/app/globals.css"
       ],
       "claude_md": "frontend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 6,
+        "scanned_files": 12,
         "high_confidence": true,
         "gaps": [
-          "未深入 src/components/ui/* 各 shadcn 原语",
-          "未读取 src/app/paper/[id]/page.tsx、reports/[id]/page.tsx、stats/page.tsx 内部细节",
-          "未读取 next.config.*、eslint.config.*、tsconfig.json 具体配置",
+          "未深入 src/components/ui/* 各 shadcn 原语 (button/card/badge/skeleton/dialog/input/scroll-area)",
+          "未读取 src/app/chat/page.tsx / reports/[id]/page.tsx / stats/page.tsx 内部细节",
+          "未读取 next.config.ts 之外的 eslint.config.* / tsconfig.json / postcss.config.*",
           "未枚举 tests/e2e/ 下具体测试用例文件",
-          "前端 api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON"
+          "src/lib/api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON",
+          "src/components/layout/sidebar.tsx 与 header.tsx 未读取（导航结构未直接验证）"
         ]
       }
     }
   ],
   "root_artifacts": {
     "claude_md": "CLAUDE.md",
-    "readme": "README.md",
+    "readme": "README.md (now includes Docker Deployment + cpolar sections)",
     "start_script": "start.sh",
     "ci_workflow": ".github/workflows/ci.yml (3 jobs: backend pytest+cov / frontend tsc+eslint / frontend playwright)",
-    "docs_dir": "docs/ (present but empty/minimal)",
-    "omc_state": ".omc/",
+    "docker_compose": "docker-compose.yml (backend + frontend + opt-in daily profile; bind-mount ./backend/data → /app/data)",
+    "env_docker_example": ".env.docker.example (canonical operator config: provider keys, BACKEND_INSTALL_EXTRAS, KB_LANGUAGE, KB_CHAT_TOKEN, ingest gap knobs)",
+    "docs_dir": "docs/ (present but empty/minimal — no module-level CLAUDE.md created)",
+    "omc_state": ".omc/ (includes .omc/plans/autopilot-impl-scoring.md — implementation plan for the 2026-05-01 universal-axis migration)",
     "gitignore": ".gitignore (covers .venv, backend/data/, node_modules/, .next/, .omc state files)"
   },
   "ignore_strategy": {
@@ -142,27 +221,31 @@
       "*.gif", "*.mp4", "*.zip", "*.tar", "*.gz",
       "backend/.venv/**", "backend/data/**", "backend/data/chroma/**",
       ".pytest_cache/**", ".ruff_cache/**", ".mypy_cache/**",
-      "**/.omc/state/**", "**/.omc/sessions/**", "**/.omc/logs/**"
+      "**/.omc/state/**", "**/.omc/sessions/**", "**/.omc/logs/**",
+      "frontend/.next/**", "frontend/test-results/**", "frontend/playwright-report/**"
     ]
   },
   "coverage_summary": {
     "modules_total": 2,
     "modules_with_claude_md": 2,
-    "files_read_this_run": 13,
-    "files_read_cumulative": 23,
-    "estimated_repo_files": "n/a (not enumerated by Glob in this run)",
-    "coverage_percent_estimate": 78,
+    "files_read_this_run": 38,
+    "files_read_cumulative": 60,
+    "estimated_repo_files": "~150 (excluding node_modules/.venv/.next/data; rough estimate)",
+    "coverage_percent_estimate": 88,
     "truncated": false,
-    "notes": "Incremental refresh confirmed prior structure remains accurate; main deltas absorbed: deepseek provider, /api/chat bearer guard, GitHub Actions CI workflow, Playwright e2e suite. backend/tests/README.md verified to match described test layout."
+    "notes": "Major delta between 2026-04-25 16:50 and this run: universal score axes (paper/blog/talk/project rubrics), Chinese-language LLM mode (KB_LANGUAGE), Docker Compose deployment stack with separate Dockerfiles + .dockerignores + .env.docker.example, Next.js standalone build with /api/* reverse proxy (eliminates CORS), adaptive ingestion lookback window (KB_INGEST_*), cold-start uncapped processing/embedding, one-shot rescore_non_papers.py operations script, RSS feed pruning (AnandTech / Meta AI Blog removed), PaperOut.categories field_validator for legacy dict tags. All deltas verified against the actual modified files listed in the run's git status."
   },
   "next_steps": [
-    "枚举 frontend/tests/e2e/ 实际用例并在 frontend/CLAUDE.md 中列出场景矩阵（chat / browse / search 等）",
+    "扫描 frontend/tests/e2e/ 实际用例并在 frontend/CLAUDE.md 中列出场景矩阵（chat / browse / search 等）",
     "扫描 frontend/src/components/ui/* 以列出已落地的 shadcn 原语清单",
-    "读取 frontend/next.config.* / eslint.config.* / tsconfig.json 以记录构建/类型/lint 约定",
-    "若后端开启 KB_CHAT_TOKEN，在 frontend/src/lib/api.ts 增加 Bearer 注入并补 e2e 用例",
-    "扫描 backend/tests/conftest.py 与 test_api_smoke.py 验证 `/api/chat` 三态测试是否覆盖 deepseek provider 路由",
+    "读取 frontend/eslint.config.* / tsconfig.json / postcss.config.* 以记录构建/类型/lint 约定",
+    "若后端开启 KB_CHAT_TOKEN，在 frontend/src/lib/api.ts 增加 Bearer 注入并补 e2e 用例（同时考虑通过 server-side route handler 转发，避免 NEXT_PUBLIC_*）",
+    "深扫 backend/tests/conftest.py 验证 _init_db / client 夹具如何隔离 SQLite 与 ChromaDB",
+    "扫 backend/kb/ingestion/arxiv.py 与 github_trending.py 源码以核实 cs.* 类目列表与 polite-sleep 触发条件",
     "为 docs/ 目录补充实际内容或在根 CLAUDE.md 中标注其用途",
-    "如果引入 hermes cron 调度作业到生产，整理 ops/runbook 并链接进 backend/CLAUDE.md"
+    "如果引入 hermes cron 或 docker-compose --profile cron 调度作业到生产，在 backend/CLAUDE.md 增加 ops/runbook 链接",
+    "为 backend/kb/scripts/ 新增 README 或 __init__.py 注释，明确这是运维脚本目录而非业务代码",
+    "若未来引入 NEXT_PUBLIC_CHAT_TOKEN 或 server-side route handler 转发 Bearer，更新 frontend/CLAUDE.md 第三章并删除 'currently not implemented' 提示"
   ],
   "changelog": [
     {
@@ -173,7 +256,17 @@
     {
       "timestamp": "2026-04-25T15:26:48Z",
       "action": "incremental_refresh",
-      "summary": "Synced docs with code deltas since 09:59:45: (1) added deepseek LLM provider docs (config.py + llm.py _call_deepseek, KB_DEEPSEEK_*); (2) documented /api/chat Bearer Token guard via verify_chat_token + hmac.compare_digest (KB_CHAT_TOKEN); (3) added .github/workflows/ci.yml description (3-job CI); (4) added Playwright e2e block (playwright.config.ts, tests/e2e/, npm run test:e2e, @playwright/test devDep); (5) reflected backend/tests/README.md (~75 tests, ~74% coverage); (6) standardised module breadcrumbs to '[← 返回根]'."
+      "summary": "Synced docs with code deltas: deepseek LLM provider, /api/chat Bearer Token guard via verify_chat_token + hmac.compare_digest (KB_CHAT_TOKEN), .github/workflows/ci.yml (3-job CI), Playwright e2e suite, backend/tests/README.md."
+    },
+    {
+      "timestamp": "2026-04-25T16:50:00Z",
+      "action": "quality_gate_refresh",
+      "summary": "Documented KB_QUALITY_SCORE_THRESHOLD (default 7.0), is_processed buckets 0/1/2, /api/papers default-hides low quality, /api/stats split into processed/skipped_low_quality/pending."
+    },
+    {
+      "timestamp": "2026-05-02T08:57:04Z",
+      "action": "incremental_refresh",
+      "summary": "Major refresh covering deltas across all changed files in git status: (1) Universal Score Axes — Paper.quality_score / relevance_score / score_rationale columns with idempotent SQLite migration; per-source-type rubrics (paper=originality/impact mirrored to legacy fields, blog=depth/actionability, talk=depth/actionability, project=innovation/maturity); /api/papers sort_by adds quality_score|relevance_score|total_score (default total_score = sum of all four scoring fields); /api/stats adds top_overall (cross-type top-5 by max(quality, relevance)); reports.py orders by max(quality, relevance) so non-papers can show up; non-papers bypass quality gate, JSON parse failure / translated-keys / missing required keys all preserve is_processed=0 for retry. (2) Chinese-language LLM output — KB_LANGUAGE=zh injects _lang_instruction (full summary in Chinese) and _impact_lang_instruction (only score_rationale value in Chinese; JSON keys stay English); kb.daily --lang zh CLI override; daily report title 每日研究简报 — and Chinese section names. (3) Docker Compose deployment — root docker-compose.yml + .env.docker.example; backend/Dockerfile (python:3.12-slim, ARG INSTALL_EXTRAS=ml,llm-cloud, HEALTHCHECK /api/health, VOLUME /app/data); frontend/Dockerfile (3-stage standalone build, alpine non-root, HEALTHCHECK GET /); per-side .dockerignore; daily service via --profile cron. (4) Next.js standalone + reverse proxy — next.config.ts adds output:'standalone', /api/:path* → KB_BACKEND_URL rewrite, /search → / redirect; src/lib/api.ts API_BASE defaults to '' (same-origin), eliminating CORS in normal deployments. (5) Adaptive ingestion lookback — kb/ingestion/run.py::_compute_days_back uses KB_INGEST_EMPTY_DB_DAYS for cold-start, MAX(ingested_date) gap clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS] otherwise. (6) Cold-start uncapped processing/embedding — kb.daily detects whether any paper has been processed/embedded and drains the entire backlog if not, then caps at 100/run for steady state. (7) New ops script — backend/kb/scripts/rescore_non_papers.py (--dry-run / --limit / --source-type) backfills universal scores on legacy non-paper rows. (8) RSS feed pruning — removed AnandTech (defunct) and Meta AI Blog (no public RSS); 11 verified feeds remain; tag normalization (_tag_to_str + PaperOut.categories field_validator) handles legacy feedparser dict rows without 500. (9) Frontend universal-axes UI — paper-card.tsx and paper/[id]/page.tsx mirror SCORE_LABELS; _resolveScores does universal-first with paper-legacy fallback. (10) Tests — added per-rubric assertions (FAANG / TECHNICAL DEPTH / INNOVATION / MATURITY / ACTIONABILITY), Chinese-mode prompt assertions, JSON-key translation rejection test, top_overall test, LIKE-escape test, dict-categories backfill tests; suite grew from ~75 to ~95 cases. All deltas verified by reading the actual modified source files (kb/main.py, daily.py, database.py, models.py, schemas.py, config.py, reports.py, processing/llm.py, processing/embeddings.py, ingestion/rss.py, ingestion/run.py, scripts/rescore_non_papers.py; frontend next.config.ts, layout.tsx, page.tsx, paper/[id]/page.tsx, components/paper-card.tsx, lib/api.ts, lib/types.ts, app/globals.css; root README.md, docker-compose.yml, .env.docker.example, backend/Dockerfile, frontend/Dockerfile, both .dockerignore files; tests/test_api_smoke.py, test_processing_llm.py, test_reports.py, test_ingestion_rss.py)."
     }
   ]
 }

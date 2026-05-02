@@ -36,9 +36,15 @@ class Paper(Base):
 
     # Processed fields
     summary = Column(Text, default="")
+    # Paper-specific legacy axes (also mirrored from quality/relevance for papers).
     originality_score = Column(Float, default=0.0)
     impact_score = Column(Float, default=0.0, index=True)
     impact_rationale = Column(Text, default="")
+    # Universal axes used by all source_types. Per-type rubrics map their own
+    # dimension labels to these two fields; see kb/processing/llm.py.
+    quality_score = Column(Float, default=0.0, index=True)
+    relevance_score = Column(Float, default=0.0)
+    score_rationale = Column(Text, default="")
     is_processed = Column(Integer, default=0, index=True)  # 0=pending, 1=done, 2=skipped
 
     # Vector embedding ref (stored in ChromaDB separately)

@@ -13,6 +13,29 @@ const sourceIcons: Record<string, React.ReactNode> = {
   project: <GitFork className="h-3 w-3" />,
 };
 
+// Per-source-type score labels. The two values map onto the universal
+// quality_score and relevance_score fields; mirrors backend kb/reports.py.
+const SCORE_LABELS: Record<string, [string, string]> = {
+  paper: ["Originality", "Impact"],
+  blog: ["Depth", "Actionability"],
+  talk: ["Depth", "Actionability"],
+  project: ["Innovation", "Maturity"],
+};
+
+function _resolveScores(paper: Paper): { quality: number; relevance: number } {
+  // Papers: prefer the universal fields (canonical post-migration), fall back
+  // to legacy originality/impact only if universal is exactly zero (true for
+  // pre-migration rows that were scored before the universal-axis schema).
+  // Mirrors backend/kb/reports.py::_score_line.
+  if (paper.source_type === "paper") {
+    return {
+      quality: paper.quality_score || paper.originality_score,
+      relevance: paper.relevance_score || paper.impact_score,
+    };
+  }
+  return { quality: paper.quality_score, relevance: paper.relevance_score };
+}
+
 function ScoreBar({ label, score }: { label: string; score: number }) {
   const width = Math.round(score * 10);
   const color = score >= 7 ? "bg-emerald-500" : score >= 4 ? "bg-amber-500" : "bg-red-500";
@@ -28,6 +51,8 @@ function ScoreBar({ label, score }: { label: string; score: number }) {
 }
 
 export function PaperCard({ paper }: { paper: Paper }) {
+  const [qLabel, rLabel] = SCORE_LABELS[paper.source_type] ?? ["Quality", "Relevance"];
+  const { quality, relevance } = _resolveScores(paper);
   return (
     <Card className="bg-zinc-900 border-zinc-800 hover:border-zinc-700 transition-colors">
       <CardContent className="p-4">
@@ -57,8 +82,8 @@ export function PaperCard({ paper }: { paper: Paper }) {
         )}
 
         <div className="mt-3 space-y-1">
-          <ScoreBar label="Originality" score={paper.originality_score} />
-          <ScoreBar label="Impact" score={paper.impact_score} />
+          <ScoreBar label={qLabel} score={quality} />
+          <ScoreBar label={rLabel} score={relevance} />
         </div>
 
         <div className="flex items-center gap-3 mt-3">

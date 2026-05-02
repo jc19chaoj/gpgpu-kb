@@ -1,7 +1,7 @@
 # kb/schemas.py
 import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from kb.config import settings
 
@@ -25,8 +25,33 @@ class PaperOut(BaseModel):
     originality_score: float
     impact_score: float
     impact_rationale: str
+    # Universal score axes (all source_types). For papers these mirror
+    # originality_score/impact_score/impact_rationale; non-papers have
+    # type-specific dim labels resolved in the frontend.
+    quality_score: float = 0.0
+    relevance_score: float = 0.0
+    score_rationale: str = ""
 
     model_config = {"from_attributes": True}
+
+    @field_validator("categories", mode="before")
+    @classmethod
+    def _coerce_categories(cls, v):
+        # Legacy RSS rows persisted feedparser tag dicts ({'term', 'scheme',
+        # 'label'}) into the JSON column. Coerce to plain strings so old data
+        # doesn't 500 the API after the upstream ingestion fix.
+        if not v:
+            return []
+        out: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                if item:
+                    out.append(item)
+            elif isinstance(item, dict):
+                term = item.get("term") or item.get("label")
+                if isinstance(term, str) and term:
+                    out.append(term)
+        return out
 
 
 class PaperListOut(BaseModel):

@@ -1,7 +1,11 @@
 // src/lib/api.ts
 import { Paper, PaperListResponse, DailyReport, ChatRequest, ChatResponse, Stats } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Default to a relative URL so the browser hits the same origin it loaded from
+// and lets the Next server proxy /api/* to the backend (see next.config.ts
+// rewrites). Set NEXT_PUBLIC_API_URL only if you want to bypass that proxy and
+// hit the backend directly (must be reachable from every client browser).
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 async function fetchJSON<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
