@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState, Suspense } from "react";
-import { useSearchParams, useRouter } from "next/navigation";
+import { useEffect, useState, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 import { listPapers, listSources, searchPapers } from "@/lib/api";
 import { PaperListResponse, Source } from "@/lib/types";
 import { PaperCard } from "@/components/paper-card";
@@ -15,16 +15,26 @@ import { useT } from "@/lib/i18n/provider";
 import type { TranslationKey } from "@/lib/i18n/translations";
 
 function BrowseContent() {
+  // Read URL only as the *initial* hydration source. We can't use
+  // `router.push("/?type=...")` here because Next.js 16.2.x has a known
+  // regression that ignores same-pathname-different-search-params navigations
+  // when a prefetched route cache entry exists for that path
+  // (vercel/next.js#92187). Workaround: keep filter state in React, drive
+  // the address bar via `window.history.replaceState` so URLs remain
+  // shareable, and let `useSearchParams()` handle only the initial read.
   const searchParams = useSearchParams();
-  const router = useRouter();
   const query = searchParams.get("q") || undefined;
-  const typeFilter = searchParams.get("type") || "";
-  // Keep the raw URL string as the canonical dep — it's a primitive, so
-  // useCallback's Object.is comparison is stable across renders. The
-  // derived array is recomputed locally where it's used.
-  const sourceParam = searchParams.get("source") || "";
-  const selectedSources = sourceParam.split(",").filter(Boolean);
   const t = useT();
+
+  // Initial values from URL — only used on first render. Subsequent updates
+  // go through React state and `window.history.replaceState` to dodge the
+  // Next 16.2 router cache bug.
+  const [typeFilter, setTypeFilter] = useState<string>(
+    () => searchParams.get("type") || "",
+  );
+  const [selectedSources, setSelectedSources] = useState<string[]>(
+    () => (searchParams.get("source") || "").split(",").filter(Boolean),
+  );
 
   const [data, setData] = useState<PaperListResponse | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
@@ -40,25 +50,23 @@ function BrowseContent() {
       .catch(() => setSources([]));
   }, []);
 
-  const updateParams = useCallback(
-    (next: { type?: string; source?: string[] }) => {
-      const sp = new URLSearchParams(searchParams.toString());
-      if ("type" in next) {
-        if (next.type) sp.set("type", next.type);
-        else sp.delete("type");
-      }
-      if ("source" in next) {
-        if (next.source && next.source.length > 0) {
-          sp.set("source", next.source.join(","));
-        } else {
-          sp.delete("source");
-        }
-      }
-      const qs = sp.toString();
-      router.replace(qs ? `/?${qs}` : "/");
-    },
-    [router, searchParams],
-  );
+  // Sync browser URL whenever the local filter state changes. We use
+  // `window.history.replaceState` directly to avoid the Next 16.2 router
+  // cache regression (see comment at top of BrowseContent). The query (`?q=`)
+  // and any unrelated search params are preserved.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    if (typeFilter) sp.set("type", typeFilter);
+    else sp.delete("type");
+    if (selectedSources.length > 0) sp.set("source", selectedSources.join(","));
+    else sp.delete("source");
+    const qs = sp.toString();
+    const next = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+    if (next !== window.location.pathname + window.location.search) {
+      window.history.replaceState({}, "", next);
+    }
+  }, [typeFilter, selectedSources]);
 
   const onTypeChange = (newType: string) => {
     // Decision 5: drop selected source names whose type no longer matches.
@@ -68,20 +76,20 @@ function BrowseContent() {
           return s ? s.type === newType : true; // unknown source: keep until /api/sources fully resolves
         })
       : selectedSources;
-    updateParams({ type: newType, source: validNames });
+    setTypeFilter(newType);
+    setSelectedSources(validNames);
     setPage(1);
   };
 
   const onSourcesChange = (names: string[]) => {
-    updateParams({ source: names });
+    setSelectedSources(names);
     setPage(1);
   };
 
-  // Fetch on any param change. Inlined into useEffect (rather than wrapping
-  // in useCallback) because `sourceParam` is derived from
-  // `searchParams.get(...)` on every render — React Compiler can't prove
-  // that's referentially stable, so the useCallback shape would trip the
-  // `react-hooks/preserve-manual-memoization` rule.
+  // Fetch on any state change. Inlined into useEffect (no useCallback) so
+  // React Compiler doesn't trip on the array dep `selectedSources` — using
+  // `.join(",")` collapses it to a primitive that Object.is can compare.
+  const sourceKey = selectedSources.join(",");
   useEffect(() => {
     let cancelled = false;
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -94,7 +102,7 @@ function BrowseContent() {
           // existing pre-source-filter behavior); SourceFilter is hidden below.
           res = await searchPapers(query, { page, sort_by: sortBy, sort_dir: sortDir });
         } else {
-          const names = sourceParam.split(",").filter(Boolean);
+          const names = sourceKey ? sourceKey.split(",") : [];
           res = await listPapers({
             page,
             source_type: typeFilter || undefined,
@@ -113,7 +121,7 @@ function BrowseContent() {
     return () => {
       cancelled = true;
     };
-  }, [page, sortBy, sortDir, typeFilter, sourceParam, query]);
+  }, [page, sortBy, sortDir, typeFilter, sourceKey, query]);
 
   const TYPE_FILTERS: { value: string; labelKey: TranslationKey }[] = [
     { value: "", labelKey: "browse.filter.all" },
