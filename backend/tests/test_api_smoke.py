@@ -841,3 +841,75 @@ def test_daily_stage_pattern_matches_chinese_banner(client, monkeypatch):
     assert status_code == 200
     stages = [d for n, d in frames if n == "stage"]
     assert [s["index"] for s in stages] == [1, 2, 3, 4]
+
+
+# ─── Source list endpoint (browse page tag filter) ────────────────
+
+def _seed_source_papers(prefix: str) -> None:
+    """Insert 5 papers across 3 source_names so /api/sources can group/count.
+
+    Layout: 2 arxiv (paper, processed=1), 1 OpenAI (blog, processed=1),
+    1 SemiAnalysis (blog, processed=2 → low quality, must be hidden),
+    1 github (project, processed=0 → pending, must be hidden).
+    """
+    import datetime
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+
+    db = SessionLocal()
+    try:
+        for i, (sname, stype, processed) in enumerate([
+            ("arxiv", SourceType.PAPER, 1),
+            ("arxiv", SourceType.PAPER, 1),
+            ("OpenAI", SourceType.BLOG, 1),
+            ("SemiAnalysis", SourceType.BLOG, 2),
+            ("trending-repo", SourceType.PROJECT, 0),
+        ]):
+            db.add(Paper(
+                title=f"src-{prefix}-{i}",
+                abstract="",
+                summary="s" if processed else "",
+                authors=[],
+                organizations=[],
+                source_type=stype,
+                source_name=sname,
+                url=f"https://example.test/sources/{prefix}/{i}",
+                published_date=datetime.datetime(2026, 4, 25, tzinfo=datetime.UTC),
+                is_processed=processed,
+                quality_score=8.0 if processed == 1 else 0.0,
+                relevance_score=8.0 if processed == 1 else 0.0,
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_list_sources_returns_distinct_names_with_counts(client):
+    _seed_source_papers("counts")
+    r = client.get("/api/sources")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "sources" in body
+    by_name = {s["name"]: s for s in body["sources"]}
+    # arxiv: 2 active rows, OpenAI: 1 active row.
+    assert by_name["arxiv"]["count"] >= 2
+    assert by_name["arxiv"]["type"] == "paper"
+    assert by_name["OpenAI"]["count"] >= 1
+    assert by_name["OpenAI"]["type"] == "blog"
+
+
+def test_list_sources_excludes_low_quality_and_pending(client):
+    _seed_source_papers("excl")
+    r = client.get("/api/sources")
+    body = r.json()
+    names = {s["name"] for s in body["sources"]}
+    assert "SemiAnalysis" not in names  # is_processed=2
+    assert "trending-repo" not in names  # is_processed=0
+
+
+def test_list_sources_orders_by_count_desc(client):
+    _seed_source_papers("order")
+    r = client.get("/api/sources")
+    body = r.json()
+    counts = [s["count"] for s in body["sources"]]
+    assert counts == sorted(counts, reverse=True), body

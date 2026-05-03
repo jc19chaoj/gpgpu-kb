@@ -28,6 +28,8 @@ from kb.schemas import (
     DailyReportOut,
     ChatRequest,
     ChatResponse,
+    SourceItem,
+    SourcesOut,
 )
 
 logger = logging.getLogger(__name__)
@@ -406,6 +408,32 @@ def get_report(report_id: int, db: Session = Depends(get_db)):
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     return DailyReportOut.model_validate(report)
+
+
+# ─── Sources ──────────────────────────────────────────
+
+@app.get("/api/sources", response_model=SourcesOut)
+def list_sources(db: Session = Depends(get_db)):
+    """Distinct source_name buckets with row counts for the browse-page filter.
+
+    Only counts is_processed=1 rows so low-quality / pending entries don't
+    appear as filter tags. Ordered by count desc so the busiest sources
+    surface first in the UI.
+    """
+    rows = (
+        db.query(Paper.source_name, Paper.source_type, func.count(Paper.id))
+          .filter(Paper.is_processed == 1)
+          .group_by(Paper.source_name, Paper.source_type)
+          .order_by(func.count(Paper.id).desc())
+          .all()
+    )
+    items: list[SourceItem] = []
+    for name, stype, cnt in rows:
+        if not name:
+            continue
+        type_str = stype.value if hasattr(stype, "value") else str(stype)
+        items.append(SourceItem(name=name, type=type_str, count=cnt))
+    return SourcesOut(sources=items)
 
 
 # ─── Stats ────────────────────────────────────────────
