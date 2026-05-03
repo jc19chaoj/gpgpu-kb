@@ -8,6 +8,7 @@ import {
   ChatStreamEvent,
   DailyStatus,
   DailyStreamEvent,
+  SourcesResponse,
   Stats,
 } from "./types";
 
@@ -30,12 +31,27 @@ export async function listPapers(params?: {
   page?: number;
   page_size?: number;
   source_type?: string;
+  source_name?: string[]; // multi-select, joined with comma before sending
   sort_by?: string;
   sort_dir?: string;
 }): Promise<PaperListResponse> {
   const sp = new URLSearchParams();
-  if (params) Object.entries(params).forEach(([k, v]) => { if (v !== undefined) sp.set(k, String(v)); });
+  if (params) {
+    Object.entries(params).forEach(([k, v]) => {
+      if (v === undefined) return;
+      if (k === "source_name") {
+        const names = v as string[];
+        if (names.length > 0) sp.set("source_name", names.join(","));
+        return;
+      }
+      sp.set(k, String(v));
+    });
+  }
   return fetchJSON<PaperListResponse>(`/api/papers?${sp.toString()}`);
+}
+
+export async function listSources(): Promise<SourcesResponse> {
+  return fetchJSON<SourcesResponse>(`/api/sources`);
 }
 
 export async function getPaper(id: number): Promise<Paper> {
