@@ -15,6 +15,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Loader2, FileText } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useT } from "@/lib/i18n/provider";
 
 interface SourcePickerProps {
   open: boolean;
@@ -30,6 +31,7 @@ export function SourcePicker({ open, onOpenChange, onSelect }: SourcePickerProps
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSeq = useRef(0);
+  const t = useT();
 
   // Reset on open so a stale query doesn't persist between sessions.
   useEffect(() => {
@@ -76,11 +78,11 @@ export function SourcePicker({ open, onOpenChange, onSelect }: SourcePickerProps
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="bg-zinc-950 border-zinc-800 text-zinc-100 max-w-2xl">
+      <DialogContent className="bg-background border-border text-foreground max-w-2xl">
         <DialogHeader>
-          <DialogTitle className="text-zinc-100">Pick a source for this chat</DialogTitle>
-          <DialogDescription className="text-zinc-500">
-            Choose a paper, blog, project, or talk. Its full content will anchor the conversation.
+          <DialogTitle className="text-foreground">{t("picker.title")}</DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            {t("picker.description")}
           </DialogDescription>
         </DialogHeader>
 
@@ -88,26 +90,26 @@ export function SourcePicker({ open, onOpenChange, onSelect }: SourcePickerProps
           autoFocus
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Search by title, abstract, or summary..."
-          className="bg-zinc-900 border-zinc-800 text-zinc-100"
+          placeholder={t("picker.placeholder")}
+          className="bg-card border-border text-foreground"
         />
 
-        <ScrollArea className="h-[360px] mt-2 rounded-md border border-zinc-800">
+        <ScrollArea className="h-[360px] mt-2 rounded-md border border-border">
           <div className="p-2 space-y-1">
             {loading && (
-              <div className="flex items-center gap-2 text-sm text-zinc-500 p-3">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground p-3">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                Searching...
+                {t("picker.searching")}
               </div>
             )}
             {error && !loading && (
-              <div className="text-sm text-red-400 p-3">{error}</div>
+              <div className="text-sm text-destructive p-3">{error}</div>
             )}
             {!loading && !error && q.trim() && results.length === 0 && (
-              <div className="text-sm text-zinc-500 p-3">No matching sources.</div>
+              <div className="text-sm text-muted-foreground p-3">{t("picker.empty")}</div>
             )}
             {!loading && !error && !q.trim() && (
-              <div className="text-sm text-zinc-500 p-3">Type to search the knowledge base.</div>
+              <div className="text-sm text-muted-foreground p-3">{t("picker.hint")}</div>
             )}
             {results.map((p) => (
               <button
@@ -116,25 +118,25 @@ export function SourcePicker({ open, onOpenChange, onSelect }: SourcePickerProps
                 onClick={() => handlePick(p)}
                 className={cn(
                   "w-full text-left p-3 rounded-md transition-colors",
-                  "hover:bg-zinc-800/70 focus:bg-zinc-800/70 focus:outline-none",
+                  "hover:bg-muted/70 focus:bg-muted/70 focus:outline-none",
                 )}
               >
                 <div className="flex items-start gap-3">
-                  <FileText className="h-4 w-4 text-emerald-400 shrink-0 mt-1" />
+                  <FileText className="h-4 w-4 text-primary shrink-0 mt-1" />
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-zinc-100 line-clamp-2">{p.title}</div>
+                    <div className="text-sm font-medium text-foreground line-clamp-2">{p.title}</div>
                     <div className="flex items-center gap-2 mt-1 flex-wrap">
                       <Badge
                         variant="outline"
-                        className="text-[10px] border-zinc-700 text-zinc-400 capitalize"
+                        className="text-[10px] border-border text-muted-foreground capitalize"
                       >
                         {p.source_type}
                       </Badge>
                       {p.source_name && (
-                        <span className="text-[11px] text-zinc-500">{p.source_name}</span>
+                        <span className="text-[11px] text-muted-foreground">{p.source_name}</span>
                       )}
                       {(p.authors || []).length > 0 && (
-                        <span className="text-[11px] text-zinc-500 truncate">
+                        <span className="text-[11px] text-muted-foreground truncate">
                           {(p.authors || []).slice(0, 3).join(", ")}
                         </span>
                       )}

@@ -424,8 +424,9 @@ def test_chat_with_paper_id_uses_full_source(client, monkeypatch):
 
     captured: dict[str, str] = {}
 
-    def _fake_call_llm(prompt: str) -> str:
+    def _fake_call_llm(prompt: str, role: str = "fast") -> str:
         captured["prompt"] = prompt
+        captured["role"] = role
         return "anchored answer"
 
     from kb import main as main_mod
@@ -448,8 +449,9 @@ def test_chat_with_paper_id_404(client):
 def test_chat_with_history_injects_prior_turns(client, monkeypatch):
     captured: dict[str, str] = {}
 
-    def _fake_call_llm(prompt: str) -> str:
+    def _fake_call_llm(prompt: str, role: str = "fast") -> str:
         captured["prompt"] = prompt
+        captured["role"] = role
         return "history-aware answer"
 
     from kb import main as main_mod
@@ -526,8 +528,9 @@ def test_chat_stream_emits_sources_token_done(client, monkeypatch):
 
     captured: dict[str, str] = {}
 
-    def _fake_stream_llm(prompt: str):
+    def _fake_stream_llm(prompt: str, role: str = "fast"):
         captured["prompt"] = prompt
+        captured["role"] = role
         yield "Hello "
         yield "world"
 
@@ -556,8 +559,9 @@ def test_chat_stream_emits_sources_token_done(client, monkeypatch):
 def test_chat_stream_history_injects_prior_turns(client, monkeypatch):
     captured: dict[str, str] = {}
 
-    def _fake_stream_llm(prompt: str):
+    def _fake_stream_llm(prompt: str, role: str = "fast"):
         captured["prompt"] = prompt
+        captured["role"] = role
         yield "ok"
 
     from kb import main as main_mod
@@ -590,7 +594,7 @@ def test_chat_stream_empty_output_yields_placeholder(client, monkeypatch):
     event between sources and done — matches /api/chat's
     '(LLM produced no output)' contract."""
 
-    def _fake_stream_llm(prompt: str):
+    def _fake_stream_llm(prompt: str, role: str = "fast"):
         return
         yield  # makes this a generator function
 

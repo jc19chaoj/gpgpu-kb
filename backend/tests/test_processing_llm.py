@@ -19,7 +19,7 @@ def test_call_llm_uses_hermes_by_default(monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider", "hermes")
     monkeypatch.setitem(llm_mod._PROVIDERS, "hermes", mock_h)
     result = llm_mod.call_llm("test prompt")
-    mock_h.assert_called_once_with("test prompt")
+    mock_h.assert_called_once_with("test prompt", model=None)
     assert result == "hermes response"
 
 
@@ -31,7 +31,7 @@ def test_call_llm_routes_to_anthropic(monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider", "anthropic")
     monkeypatch.setitem(llm_mod._PROVIDERS, "anthropic", mock_a)
     result = llm_mod.call_llm("test prompt")
-    mock_a.assert_called_once_with("test prompt")
+    mock_a.assert_called_once_with("test prompt", model=None)
     assert result == "anthropic response"
 
 
@@ -43,7 +43,7 @@ def test_call_llm_routes_to_openai(monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider", "openai")
     monkeypatch.setitem(llm_mod._PROVIDERS, "openai", mock_o)
     result = llm_mod.call_llm("test prompt")
-    mock_o.assert_called_once_with("test prompt")
+    mock_o.assert_called_once_with("test prompt", model=None)
     assert result == "openai response"
 
 
@@ -55,7 +55,7 @@ def test_call_llm_unknown_provider_falls_back_to_hermes(monkeypatch):
     with patch.object(llm_mod, "_call_hermes", return_value="fallback") as mock_h:
         # Also remove "nonexistent" from _PROVIDERS in case it was added
         result = llm_mod.call_llm("test prompt")
-    mock_h.assert_called_once_with("test prompt")
+    mock_h.assert_called_once_with("test prompt", model=None)
     assert result == "fallback"
 
 
@@ -788,7 +788,7 @@ def test_stream_llm_yields_provider_chunks(monkeypatch):
     from kb import config
     from kb.processing import llm as llm_mod
 
-    def _mock_stream(prompt: str):
+    def _mock_stream(prompt: str, *, model=None):
         assert prompt == "test prompt"
         yield "alpha "
         yield "beta"
@@ -805,7 +805,7 @@ def test_stream_llm_silent_on_exception(monkeypatch):
     from kb import config
     from kb.processing import llm as llm_mod
 
-    def _bad_stream(prompt: str):
+    def _bad_stream(prompt: str, *, model=None):
         yield "first chunk"
         raise RuntimeError("boom")
 
@@ -821,7 +821,7 @@ def test_stream_llm_routes_to_anthropic(monkeypatch):
     from kb import config
     from kb.processing import llm as llm_mod
 
-    def _mock_stream(prompt: str):
+    def _mock_stream(prompt: str, *, model=None):
         yield "anthropic-stream"
 
     monkeypatch.setattr(config.settings, "llm_provider", "anthropic")
@@ -834,7 +834,7 @@ def test_stream_hermes_falls_back_to_call_hermes(monkeypatch):
     as a single chunk so the API contract holds across providers."""
     from kb.processing import llm as llm_mod
 
-    monkeypatch.setattr(llm_mod, "_call_hermes", lambda prompt: "full hermes body")
+    monkeypatch.setattr(llm_mod, "_call_hermes", lambda prompt, *, model=None: "full hermes body")
     chunks = list(llm_mod._stream_hermes("p"))
     assert chunks == ["full hermes body"]
 
@@ -844,5 +844,134 @@ def test_stream_hermes_empty_yields_nothing(monkeypatch):
     should produce zero chunks rather than yielding an empty string."""
     from kb.processing import llm as llm_mod
 
-    monkeypatch.setattr(llm_mod, "_call_hermes", lambda prompt: "")
+    monkeypatch.setattr(llm_mod, "_call_hermes", lambda prompt, *, model=None: "")
     assert list(llm_mod._stream_hermes("p")) == []
+
+
+# ─── role overlay (fast / expert) ─────────────────────────────────
+#
+# The expert role layers KB_LLM_EXPERT_PROVIDER + KB_LLM_EXPERT_MODEL
+# on top of the fast baseline. These tests pin down the exact rules of
+# that overlay so accidental regressions are caught by the suite.
+
+
+def test_call_llm_expert_uses_expert_provider(monkeypatch):
+    """When llm_expert_provider is set, role=expert routes to it, NOT
+    to the fast-role llm_provider."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    mock_fast = MagicMock(return_value="fast-response")
+    mock_expert = MagicMock(return_value="expert-response")
+    monkeypatch.setattr(config.settings, "llm_provider", "openai")
+    monkeypatch.setattr(config.settings, "llm_expert_provider", "anthropic")
+    monkeypatch.setattr(config.settings, "llm_expert_model", None)
+    monkeypatch.setitem(llm_mod._PROVIDERS, "openai", mock_fast)
+    monkeypatch.setitem(llm_mod._PROVIDERS, "anthropic", mock_expert)
+
+    result = llm_mod.call_llm("p", role="expert")
+
+    assert result == "expert-response"
+    mock_expert.assert_called_once_with("p", model=None)
+    mock_fast.assert_not_called()
+
+
+def test_call_llm_expert_falls_back_to_fast_when_unset(monkeypatch):
+    """With llm_expert_provider=None, role=expert must use llm_provider."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    mock_fast = MagicMock(return_value="fast-response")
+    monkeypatch.setattr(config.settings, "llm_provider", "openai")
+    monkeypatch.setattr(config.settings, "llm_expert_provider", None)
+    monkeypatch.setattr(config.settings, "llm_expert_model", None)
+    monkeypatch.setitem(llm_mod._PROVIDERS, "openai", mock_fast)
+
+    result = llm_mod.call_llm("p", role="expert")
+
+    assert result == "fast-response"
+    mock_fast.assert_called_once_with("p", model=None)
+
+
+def test_call_llm_expert_model_override_passed_to_provider(monkeypatch):
+    """llm_expert_model should reach the provider function as model=...
+    so the provider can swap in a different model name."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    mock_expert = MagicMock(return_value="ok")
+    monkeypatch.setattr(config.settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(config.settings, "llm_expert_provider", "deepseek")
+    monkeypatch.setattr(config.settings, "llm_expert_model", "deepseek-reasoner")
+    monkeypatch.setitem(llm_mod._PROVIDERS, "deepseek", mock_expert)
+
+    llm_mod.call_llm("p", role="expert")
+
+    mock_expert.assert_called_once_with("p", model="deepseek-reasoner")
+
+
+def test_call_llm_fast_role_ignores_expert_model(monkeypatch):
+    """The fast role must pass model=None even when llm_expert_model is set,
+    so daily batch jobs keep using the provider's default model."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    mock_fast = MagicMock(return_value="ok")
+    monkeypatch.setattr(config.settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(config.settings, "llm_expert_provider", "anthropic")
+    monkeypatch.setattr(config.settings, "llm_expert_model", "deepseek-reasoner")
+    monkeypatch.setitem(llm_mod._PROVIDERS, "deepseek", mock_fast)
+
+    # Default role is "fast"
+    llm_mod.call_llm("p")
+
+    mock_fast.assert_called_once_with("p", model=None)
+
+
+def test_stream_llm_expert_uses_expert_provider(monkeypatch):
+    """Streaming mirror of the call_llm expert-routing test."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    seen: list[tuple[str, str | None]] = []
+
+    def _fast_stream(prompt: str, *, model=None):
+        seen.append(("fast", model))
+        yield "fast"
+
+    def _expert_stream(prompt: str, *, model=None):
+        seen.append(("expert", model))
+        yield "expert-chunk"
+
+    monkeypatch.setattr(config.settings, "llm_provider", "openai")
+    monkeypatch.setattr(config.settings, "llm_expert_provider", "anthropic")
+    monkeypatch.setattr(config.settings, "llm_expert_model", None)
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "openai", _fast_stream)
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "anthropic", _expert_stream)
+
+    chunks = list(llm_mod.stream_llm("p", role="expert"))
+
+    assert chunks == ["expert-chunk"]
+    assert seen == [("expert", None)]
+
+
+def test_stream_llm_expert_model_override(monkeypatch):
+    """llm_expert_model must propagate into the streaming provider's
+    model kwarg too, not just the non-streaming call_llm path."""
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    seen_models: list[str | None] = []
+
+    def _expert_stream(prompt: str, *, model=None):
+        seen_models.append(model)
+        yield "x"
+
+    monkeypatch.setattr(config.settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(config.settings, "llm_expert_provider", "deepseek")
+    monkeypatch.setattr(config.settings, "llm_expert_model", "deepseek-reasoner")
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "deepseek", _expert_stream)
+
+    list(llm_mod.stream_llm("p", role="expert"))
+
+    assert seen_models == ["deepseek-reasoner"]

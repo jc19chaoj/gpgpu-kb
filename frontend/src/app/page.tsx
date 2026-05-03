@@ -10,23 +10,26 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowDown, ArrowUp } from "lucide-react";
+import { useT } from "@/lib/i18n/provider";
+import type { TranslationKey } from "@/lib/i18n/translations";
 
-const SORT_OPTIONS = [
-  { value: "total_score", label: "Score" },
-  { value: "published_date", label: "Date" },
+const SORT_OPTIONS: { value: string; labelKey: TranslationKey }[] = [
+  { value: "total_score", labelKey: "browse.sort.score" },
+  { value: "published_date", labelKey: "browse.sort.date" },
 ];
 
-const TYPE_FILTERS = [
-  { value: "", label: "All" },
-  { value: "paper", label: "Papers" },
-  { value: "blog", label: "Blogs" },
-  { value: "project", label: "Projects" },
-  { value: "talk", label: "Talks" },
+const TYPE_FILTERS: { value: string; labelKey: TranslationKey }[] = [
+  { value: "", labelKey: "browse.filter.all" },
+  { value: "paper", labelKey: "browse.filter.papers" },
+  { value: "blog", labelKey: "browse.filter.blogs" },
+  { value: "project", labelKey: "browse.filter.projects" },
+  { value: "talk", labelKey: "browse.filter.talks" },
 ];
 
 function BrowseContent() {
   const searchParams = useSearchParams();
   const query = searchParams.get("q") || undefined;
+  const t = useT();
 
   const [data, setData] = useState<PaperListResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -67,10 +70,12 @@ function BrowseContent() {
       <div className="space-y-4 mb-6">
         <div className="flex items-baseline gap-3 flex-wrap">
           <h1 className="text-base sm:text-lg font-semibold truncate">
-            {query ? `Search: "${query}"` : "Browse"}
+            {query ? `${t("browse.search")} "${query}"` : t("browse.title")}
           </h1>
           {data && (
-            <span className="text-xs sm:text-sm text-zinc-500">{data.total} items</span>
+            <span className="text-xs sm:text-sm text-muted-foreground">
+              {t("browse.items", { count: data.total })}
+            </span>
           )}
         </div>
 
@@ -85,15 +90,15 @@ function BrowseContent() {
                 className="cursor-pointer text-xs"
                 onClick={() => { setTypeFilter(f.value); setPage(1); }}
               >
-                {f.label}
+                {t(f.labelKey)}
               </Badge>
             ))}
           </div>
 
-          <div className="h-4 w-px bg-zinc-800" />
+          <div className="h-4 w-px bg-border" />
 
-          <div className="flex items-center gap-2 text-xs text-zinc-400">
-            <span>Sort:</span>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>{t("browse.sort")}</span>
             {SORT_OPTIONS.map((opt) => (
               <Button
                 key={opt.value}
@@ -110,7 +115,7 @@ function BrowseContent() {
                   setPage(1);
                 }}
               >
-                {opt.label}
+                {t(opt.labelKey)}
                 {sortBy === opt.value && (
                   sortDir === "desc" ? <ArrowDown className="ml-1 h-3 w-3" /> : <ArrowUp className="ml-1 h-3 w-3" />
                 )}
@@ -123,7 +128,7 @@ function BrowseContent() {
       {loading && (
         <div className="space-y-3">
           {Array.from({ length: 5 }).map((_, i) => (
-            <Skeleton key={i} className="h-32 w-full bg-zinc-900" />
+            <Skeleton key={i} className="h-32 w-full bg-card" />
           ))}
         </div>
       )}
@@ -139,13 +144,16 @@ function BrowseContent() {
           {data.total > data.page_size && (
             <div className="flex items-center justify-center gap-2 mt-6">
               <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-                Previous
+                {t("browse.pagination.previous")}
               </Button>
-              <span className="text-sm text-zinc-400">
-                Page {data.page} of {Math.ceil(data.total / data.page_size)}
+              <span className="text-sm text-muted-foreground">
+                {t("browse.pagination.page", {
+                  page: data.page,
+                  total: Math.ceil(data.total / data.page_size),
+                })}
               </span>
               <Button variant="outline" size="sm" disabled={page >= Math.ceil(data.total / data.page_size)} onClick={() => setPage((p) => p + 1)}>
-                Next
+                {t("browse.pagination.next")}
               </Button>
             </div>
           )}
@@ -153,9 +161,9 @@ function BrowseContent() {
       )}
 
       {!loading && data?.papers.length === 0 && (
-        <div className="text-center py-16 text-zinc-500">
-          <p className="text-lg mb-2">No papers found</p>
-          <p className="text-sm">Try adjusting your filters or run the ingestion pipeline first.</p>
+        <div className="text-center py-16 text-muted-foreground">
+          <p className="text-lg mb-2">{t("browse.empty.title")}</p>
+          <p className="text-sm">{t("browse.empty.hint")}</p>
         </div>
       )}
     </div>
@@ -164,7 +172,7 @@ function BrowseContent() {
 
 export default function BrowsePage() {
   return (
-    <Suspense fallback={<div className="max-w-4xl mx-auto p-4 sm:p-6 space-y-3">{Array.from({length:5}).map((_,i)=><Skeleton key={i} className="h-32 w-full bg-zinc-900"/>)}</div>}>
+    <Suspense fallback={<div className="max-w-4xl mx-auto p-4 sm:p-6 space-y-3">{Array.from({length:5}).map((_,i)=><Skeleton key={i} className="h-32 w-full bg-card"/>)}</div>}>
       <BrowseContent />
     </Suspense>
   );

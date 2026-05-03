@@ -20,9 +20,43 @@ from kb.models import Paper, SourceType
 logger = logging.getLogger(__name__)
 
 
-# ─── Provider implementations ─────────────────────────────────────
+# ─── Role resolution ──────────────────────────────────────────────
+#
+# Two roles share the same `_PROVIDERS` / `_STREAM_PROVIDERS` registries:
+#   - "fast"   (default): summarization, scoring, daily report.
+#                         Uses settings.llm_provider + the provider's default model.
+#   - "expert"          : /api/chat and /api/chat/stream.
+#                         Overlays `llm_expert_provider` / `llm_expert_model`
+#                         onto the fast baseline; any unset field silently
+#                         falls back to the fast value (zero-config backcompat).
 
-def _call_hermes(prompt: str) -> str:
+def _resolve_role(role: str) -> tuple[str, str | None]:
+    """Return (provider_name, model_override) for the given role.
+
+    `model_override=None` means "let the provider use its own default
+    (settings.<provider>_model)" — provider implementations below treat
+    None as a no-op and read the per-provider setting themselves.
+    """
+    if role == "expert":
+        return (
+            settings.llm_expert_provider or settings.llm_provider,
+            settings.llm_expert_model,  # may be None → provider uses its default
+        )
+    # "fast" / anything else → default/fast role
+    return (settings.llm_provider, None)
+
+
+# ─── Provider implementations ─────────────────────────────────────
+#
+# Each provider accepts an optional `model` override. When None the
+# provider reads `settings.<provider>_model` (current behavior). This
+# lets the expert role swap in a different model name without needing
+# a parallel set of `*_expert_model` fields per provider.
+
+def _call_hermes(prompt: str, *, model: str | None = None) -> str:
+    # Hermes CLI has no --model flag; the override is accepted for API
+    # symmetry but ignored. A custom expert model under hermes would
+    # require changing the local hermes config.
     try:
         result = subprocess.run(
             ["hermes", "ask", "--prompt", prompt, "--quiet", "--skip-context-files"],
@@ -41,7 +75,7 @@ def _call_hermes(prompt: str) -> str:
     return result.stdout.strip()
 
 
-def _call_anthropic(prompt: str) -> str:
+def _call_anthropic(prompt: str, *, model: str | None = None) -> str:
     if not settings.anthropic_api_key:
         logger.error("KB_LLM_PROVIDER=anthropic but no ANTHROPIC_API_KEY is set")
         return ""
@@ -52,7 +86,7 @@ def _call_anthropic(prompt: str) -> str:
         return ""
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     msg = client.messages.create(
-        model=settings.anthropic_model,
+        model=model or settings.anthropic_model,
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -60,7 +94,7 @@ def _call_anthropic(prompt: str) -> str:
     return "".join(parts).strip()
 
 
-def _call_openai(prompt: str) -> str:
+def _call_openai(prompt: str, *, model: str | None = None) -> str:
     if not settings.openai_api_key:
         logger.error("KB_LLM_PROVIDER=openai but no OPENAI_API_KEY is set")
         return ""
@@ -71,14 +105,14 @@ def _call_openai(prompt: str) -> str:
         return ""
     client = openai.OpenAI(api_key=settings.openai_api_key)
     resp = client.chat.completions.create(
-        model=settings.openai_model,
+        model=model or settings.openai_model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2048,
     )
     return (resp.choices[0].message.content or "").strip()
 
 
-def _call_deepseek(prompt: str) -> str:
+def _call_deepseek(prompt: str, *, model: str | None = None) -> str:
     if not settings.deepseek_api_key:
         logger.error("KB_LLM_PROVIDER=deepseek but no DEEPSEEK_API_KEY is set")
         return ""
@@ -92,7 +126,7 @@ def _call_deepseek(prompt: str) -> str:
         base_url=settings.deepseek_base_url,
     )
     resp = client.chat.completions.create(
-        model=settings.deepseek_model,
+        model=model or settings.deepseek_model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2048,
         timeout=settings.llm_timeout_seconds,
@@ -108,16 +142,26 @@ _PROVIDERS = {
 }
 
 
-def call_llm(prompt: str) -> str:
-    """Public LLM call. Picks provider via settings.llm_provider."""
-    provider = _PROVIDERS.get(settings.llm_provider)
+def call_llm(prompt: str, role: str = "fast") -> str:
+    """Public LLM call. Picks provider + model via role.
+
+    - role="fast"   (default): summarization / scoring / reports.
+    - role="expert"         : /api/chat & /api/chat/stream.
+
+    See `_resolve_role` for how expert overlays onto fast.
+    """
+    provider_name, model_override = _resolve_role(role)
+    provider = _PROVIDERS.get(provider_name)
     if provider is None:
-        logger.error("Unknown KB_LLM_PROVIDER=%r; falling back to hermes", settings.llm_provider)
+        logger.error(
+            "Unknown KB_LLM_PROVIDER=%r (role=%s); falling back to hermes",
+            provider_name, role,
+        )
         provider = _call_hermes
     try:
-        return provider(prompt)
+        return provider(prompt, model=model_override)
     except Exception:
-        logger.exception("LLM provider %s raised", settings.llm_provider)
+        logger.exception("LLM provider %s raised (role=%s)", provider_name, role)
         return ""
 
 
@@ -127,13 +171,15 @@ def call_llm(prompt: str) -> str:
 # Hermes is a subprocess and cannot truly stream — it yields its full output
 # as a single chunk so the API contract holds across providers.
 
-def _stream_hermes(prompt: str) -> Iterator[str]:
-    text = _call_hermes(prompt)
+def _stream_hermes(prompt: str, *, model: str | None = None) -> Iterator[str]:
+    # Hermes cannot truly stream (subprocess); the `model` kwarg is accepted
+    # for API symmetry but forwarded to `_call_hermes` which ignores it.
+    text = _call_hermes(prompt, model=model)
     if text:
         yield text
 
 
-def _stream_anthropic(prompt: str) -> Iterator[str]:
+def _stream_anthropic(prompt: str, *, model: str | None = None) -> Iterator[str]:
     if not settings.anthropic_api_key:
         logger.error("KB_LLM_PROVIDER=anthropic but no ANTHROPIC_API_KEY is set")
         return
@@ -144,7 +190,7 @@ def _stream_anthropic(prompt: str) -> Iterator[str]:
         return
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     with client.messages.stream(
-        model=settings.anthropic_model,
+        model=model or settings.anthropic_model,
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
@@ -182,23 +228,25 @@ def _stream_openai_compatible(
             yield text
 
 
-def _stream_openai(prompt: str) -> Iterator[str]:
+def _stream_openai(prompt: str, *, model: str | None = None) -> Iterator[str]:
     if not settings.openai_api_key:
         logger.error("KB_LLM_PROVIDER=openai but no OPENAI_API_KEY is set")
         return
     yield from _stream_openai_compatible(
-        prompt, api_key=settings.openai_api_key, model=settings.openai_model
+        prompt,
+        api_key=settings.openai_api_key,
+        model=model or settings.openai_model,
     )
 
 
-def _stream_deepseek(prompt: str) -> Iterator[str]:
+def _stream_deepseek(prompt: str, *, model: str | None = None) -> Iterator[str]:
     if not settings.deepseek_api_key:
         logger.error("KB_LLM_PROVIDER=deepseek but no DEEPSEEK_API_KEY is set")
         return
     yield from _stream_openai_compatible(
         prompt,
         api_key=settings.deepseek_api_key,
-        model=settings.deepseek_model,
+        model=model or settings.deepseek_model,
         base_url=settings.deepseek_base_url,
     )
 
@@ -211,20 +259,24 @@ _STREAM_PROVIDERS = {
 }
 
 
-def stream_llm(prompt: str) -> Iterator[str]:
+def stream_llm(prompt: str, role: str = "fast") -> Iterator[str]:
     """Public streaming LLM call. Mirrors `call_llm`'s contract:
-    on any failure the generator ends silently — never raises."""
-    provider = _STREAM_PROVIDERS.get(settings.llm_provider)
+    on any failure the generator ends silently — never raises.
+
+    Role semantics identical to `call_llm` (see `_resolve_role`).
+    """
+    provider_name, model_override = _resolve_role(role)
+    provider = _STREAM_PROVIDERS.get(provider_name)
     if provider is None:
         logger.error(
-            "Unknown KB_LLM_PROVIDER=%r; falling back to hermes (stream)",
-            settings.llm_provider,
+            "Unknown KB_LLM_PROVIDER=%r (role=%s); falling back to hermes (stream)",
+            provider_name, role,
         )
         provider = _stream_hermes
     try:
-        yield from provider(prompt)
+        yield from provider(prompt, model=model_override)
     except Exception:
-        logger.exception("LLM stream provider %s raised", settings.llm_provider)
+        logger.exception("LLM stream provider %s raised (role=%s)", provider_name, role)
         # silent end: matches call_llm's empty-string contract
 
 

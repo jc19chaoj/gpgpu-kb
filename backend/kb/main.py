@@ -330,7 +330,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
     """Non-streaming chat. Kept for backwards compat and as a fallback for
     HTTP clients that can't consume SSE."""
     prompt, sources = _build_chat_context(req, db)
-    answer = call_llm(prompt) or "(LLM produced no output)"
+    answer = call_llm(prompt, role="expert") or "(LLM produced no output)"
     return ChatResponse(answer=answer, sources=sources)
 
 
@@ -362,7 +362,7 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
         # 2) tokens — stream_llm is silent on error, so emitted_any tells us
         #    whether to send a placeholder (matches the non-stream contract).
         emitted_any = False
-        for chunk in stream_llm(prompt):
+        for chunk in stream_llm(prompt, role="expert"):
             if chunk:
                 emitted_any = True
                 yield _sse_event("token", {"content": chunk})

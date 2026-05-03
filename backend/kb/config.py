@@ -40,7 +40,13 @@ class Settings(BaseSettings):
 
     # LLM provider abstraction
     # Options: "hermes" (default — uses local hermes CLI), "anthropic", "openai", "deepseek"
+    # `llm_provider` is the *fast* role (summarization / scoring / daily report).
+    # `llm_expert_provider` / `llm_expert_model` layer on top for the *expert*
+    # role used by /api/chat & /api/chat/stream. When either is None, the expert
+    # role silently falls back to the fast-role value (zero-config backcompat).
     llm_provider: str = "hermes"
+    llm_expert_provider: str | None = None
+    llm_expert_model: str | None = None
     llm_timeout_seconds: int = 180
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-4-6"

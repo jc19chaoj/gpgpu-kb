@@ -16,6 +16,9 @@ import { cn } from "@/lib/utils";
 import type { Conversation } from "@/hooks/use-conversation-history";
 import type { Paper } from "@/lib/types";
 import { SourcePicker } from "./source-picker";
+import { useLocale } from "@/lib/i18n/provider";
+import { formatDate } from "@/lib/i18n/format";
+import type { Locale } from "@/lib/i18n/translations";
 
 interface ChatRightSidebarProps {
   conversations: Conversation[];
@@ -28,16 +31,20 @@ interface ChatRightSidebarProps {
   onSelectPaper: (paper: Paper | null) => void;
 }
 
-function _formatTimestamp(ts: number): string {
+function _formatTimestamp(
+  ts: number,
+  locale: Locale,
+  t: (key: Parameters<ReturnType<typeof useLocale>["t"]>[0], params?: Record<string, string | number>) => string,
+): string {
   const diff = Date.now() - ts;
   const minute = 60_000;
   const hour = 60 * minute;
   const day = 24 * hour;
-  if (diff < minute) return "just now";
-  if (diff < hour) return `${Math.floor(diff / minute)}m ago`;
-  if (diff < day) return `${Math.floor(diff / hour)}h ago`;
-  if (diff < 7 * day) return `${Math.floor(diff / day)}d ago`;
-  return new Date(ts).toLocaleDateString();
+  if (diff < minute) return t("chat.time.justNow");
+  if (diff < hour) return t("chat.time.minutes", { n: Math.floor(diff / minute) });
+  if (diff < day) return t("chat.time.hours", { n: Math.floor(diff / hour) });
+  if (diff < 7 * day) return t("chat.time.days", { n: Math.floor(diff / day) });
+  return formatDate(ts, locale);
 }
 
 export function ChatRightSidebar({
@@ -51,19 +58,20 @@ export function ChatRightSidebar({
   onSelectPaper,
 }: ChatRightSidebarProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
+  const { locale, t } = useLocale();
 
   return (
-    <aside className="hidden lg:flex w-72 shrink-0 flex-col border-l border-zinc-800 bg-zinc-950/60">
+    <aside className="hidden lg:flex w-72 shrink-0 flex-col border-l border-border bg-sidebar/60">
       <Tabs defaultValue="history" className="flex-1 flex flex-col">
         <div className="px-3 pt-3">
-          <TabsList className="w-full bg-zinc-900 border border-zinc-800">
-            <TabsTrigger value="history" className="flex-1 data-[state=active]:bg-zinc-800">
+          <TabsList className="w-full bg-card border border-border">
+            <TabsTrigger value="history" className="flex-1 data-[state=active]:bg-muted">
               <History className="h-3.5 w-3.5 mr-1.5" />
-              History
+              {t("chat.tabs.history")}
             </TabsTrigger>
-            <TabsTrigger value="source" className="flex-1 data-[state=active]:bg-zinc-800">
+            <TabsTrigger value="source" className="flex-1 data-[state=active]:bg-muted">
               <PinIcon className="h-3.5 w-3.5 mr-1.5" />
-              Source
+              {t("chat.tabs.source")}
             </TabsTrigger>
           </TabsList>
         </div>
@@ -73,19 +81,19 @@ export function ChatRightSidebar({
             <Button
               onClick={onNewChat}
               size="sm"
-              className="w-full bg-emerald-600 hover:bg-emerald-700 text-white"
+              className="w-full bg-primary hover:bg-primary/90 text-primary-foreground"
             >
               <MessageSquarePlus className="h-4 w-4 mr-2" />
-              New chat
+              {t("chat.newChat")}
             </Button>
           </div>
           <ScrollArea className="flex-1 px-2 pb-3">
             {!hydrated && (
-              <div className="text-xs text-zinc-600 px-2 py-3">Loading…</div>
+              <div className="text-xs text-muted-foreground/70 px-2 py-3">{t("chat.history.loading")}</div>
             )}
             {hydrated && conversations.length === 0 && (
-              <div className="text-xs text-zinc-500 px-2 py-3">
-                No saved conversations yet. Start chatting and your sessions will appear here.
+              <div className="text-xs text-muted-foreground px-2 py-3">
+                {t("chat.history.empty")}
               </div>
             )}
             {hydrated && conversations.map((c) => (
@@ -94,15 +102,15 @@ export function ChatRightSidebar({
                 className={cn(
                   "group flex items-start gap-2 rounded-md px-2 py-2 text-sm transition-colors cursor-pointer mb-0.5",
                   c.id === activeId
-                    ? "bg-zinc-800 text-zinc-100"
-                    : "text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-100",
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                 )}
                 onClick={() => onSelectConversation(c.id)}
               >
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium truncate">{c.title}</div>
-                  <div className="flex items-center gap-2 text-[11px] text-zinc-500">
-                    <span>{_formatTimestamp(c.updatedAt)}</span>
+                  <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                    <span>{_formatTimestamp(c.updatedAt, locale, t)}</span>
                     {c.paperTitle && (
                       <span className="flex items-center gap-1 truncate">
                         <FileText className="h-3 w-3 shrink-0" />
@@ -117,8 +125,8 @@ export function ChatRightSidebar({
                     e.stopPropagation();
                     onDeleteConversation(c.id);
                   }}
-                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 -m-1 rounded hover:bg-zinc-700/60 text-zinc-500 hover:text-zinc-100"
-                  aria-label="Delete conversation"
+                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 -m-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+                  aria-label={t("chat.history.delete")}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
@@ -128,20 +136,19 @@ export function ChatRightSidebar({
         </TabsContent>
 
         <TabsContent value="source" className="flex-1 mt-2 px-3 pb-3">
-          <p className="text-xs text-zinc-500 mb-3">
-            Pin a single source. Its full content (PDF text for arXiv) is loaded into every
-            prompt instead of relying on retrieval.
+          <p className="text-xs text-muted-foreground mb-3">
+            {t("chat.source.intro")}
           </p>
           {selectedPaper ? (
-            <div className="rounded-md border border-emerald-800/40 bg-emerald-950/20 p-3 mb-2">
+            <div className="rounded-md border border-primary/30 bg-primary/10 p-3 mb-2">
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-start gap-2 min-w-0">
-                  <FileText className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <FileText className="h-4 w-4 text-primary shrink-0 mt-0.5" />
                   <div className="min-w-0">
-                    <div className="text-sm font-medium text-zinc-100 line-clamp-3">
+                    <div className="text-sm font-medium text-foreground line-clamp-3">
                       {selectedPaper.title}
                     </div>
-                    <div className="text-[11px] text-zinc-500 mt-1 capitalize">
+                    <div className="text-[11px] text-muted-foreground mt-1 capitalize">
                       {selectedPaper.source_type} · {selectedPaper.source_name}
                     </div>
                   </div>
@@ -149,23 +156,23 @@ export function ChatRightSidebar({
                 <button
                   type="button"
                   onClick={() => onSelectPaper(null)}
-                  className="p-1 -m-1 rounded text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800/60"
-                  aria-label="Clear source"
+                  className="p-1 -m-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/60"
+                  aria-label={t("chat.source.clear")}
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
             </div>
           ) : (
-            <div className="text-xs text-zinc-600 mb-2 italic">No source pinned (using RAG).</div>
+            <div className="text-xs text-muted-foreground/70 mb-2 italic">{t("chat.source.empty")}</div>
           )}
           <Button
             onClick={() => setPickerOpen(true)}
             size="sm"
             variant="outline"
-            className="w-full border-zinc-700 text-zinc-100 bg-zinc-900 hover:bg-zinc-800"
+            className="w-full border-border text-foreground bg-card hover:bg-muted"
           >
-            {selectedPaper ? "Change source" : "Pick source"}
+            {selectedPaper ? t("chat.source.change") : t("chat.source.pick")}
           </Button>
         </TabsContent>
       </Tabs>

@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChatRightSidebar } from "@/components/chat/chat-right-sidebar";
 import { useConversationHistory } from "@/hooks/use-conversation-history";
+import { useT } from "@/lib/i18n/provider";
 
 interface DisplayMessage extends ChatMessage {
   sources?: Paper[];
@@ -21,21 +22,26 @@ interface DisplayMessage extends ChatMessage {
   error?: boolean;
   /** transient: actively streaming tokens; placeholder shown if content empty */
   streaming?: boolean;
+  /** transient: i18n welcome card; content is resolved at render-time from t() */
+  welcome?: boolean;
 }
 
+// Welcome card: kept as a sentinel object whose `content` is overridden at
+// render time via t("chat.welcome"). The `welcome` flag is what
+// _stripDisplay uses to exclude it from history (rather than reference
+// equality, which would break when the locale switch rebuilds it).
 const WELCOME: DisplayMessage = {
   role: "assistant",
-  content:
-    "I'm your GPGPU research assistant. Ask me anything about papers, architectures, optimizations, or trends in the knowledge base. Pin a source on the right to chat with a single paper or blog (arXiv PDFs are loaded in full).",
+  content: "",
+  welcome: true,
 };
 
 function _stripDisplay(messages: DisplayMessage[]): ChatMessage[] {
   // Persist & send only the role/content fields. `sources` is renderer-only;
-  // `error` and `streaming` are transient. Drop the welcome card too — it's
-  // the assistant's intro, not part of the actual chat history.
+  // `error`, `streaming` and `welcome` are transient. Drop the welcome card
+  // — it's the assistant's intro, not part of the actual chat history.
   return messages
-    .filter((m, i) => !(i === 0 && m === WELCOME))
-    .filter((m) => !m.error && !m.streaming)
+    .filter((m) => !m.welcome && !m.error && !m.streaming)
     .map(({ role, content }) => ({ role, content }));
 }
 
@@ -43,6 +49,7 @@ function ChatContent() {
   const history = useConversationHistory();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const t = useT();
   const [messages, setMessages] = useState<DisplayMessage[]>([WELCOME]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -243,8 +250,8 @@ function ChatContent() {
       //   - errored:    show error bubble; don't persist
       const showError = errored && !accumulated;
       const finalContent = showError
-        ? "Sorry, I couldn't process that query. Is the backend running?"
-        : accumulated || "(LLM produced no output)";
+        ? t("chat.error.generic")
+        : accumulated || t("chat.empty");
 
       setMessages((prev) => {
         const last = prev[prev.length - 1];
@@ -296,14 +303,15 @@ function ChatContent() {
   const sourceBanner = useMemo(() => {
     if (!selectedPaper) return null;
     return (
-      <div className="mx-4 sm:mx-6 mt-3 mb-1 rounded-md border border-emerald-800/40 bg-emerald-950/20 px-3 py-2 flex items-center gap-2 text-xs text-emerald-200">
+      <div className="mx-4 sm:mx-6 mt-3 mb-1 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 flex items-center gap-2 text-xs text-primary">
         <PinIcon className="h-3.5 w-3.5 shrink-0" />
         <span className="truncate">
-          Anchored to: <span className="font-medium">{selectedPaper.title}</span>
+          {t("chat.banner.anchored")}{" "}
+          <span className="font-medium">{selectedPaper.title}</span>
         </span>
       </div>
     );
-  }, [selectedPaper]);
+  }, [selectedPaper, t]);
 
   return (
     <div className="flex h-full">
@@ -312,44 +320,52 @@ function ChatContent() {
           {sourceBanner}
           <ScrollArea className="flex-1 px-4 sm:px-6">
             <div className="space-y-4 py-4">
-              {messages.map((msg, i) => (
-                <div key={i} className="flex gap-3">
-                  <div className="shrink-0 mt-1">
-                    {msg.role === "assistant" ? (
-                      <Cpu className={msg.error ? "h-5 w-5 text-red-400" : "h-5 w-5 text-emerald-400"} />
-                    ) : (
-                      <User className="h-5 w-5 text-blue-400" />
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-zinc-400 mb-1">
-                      {msg.role === "assistant" ? "Assistant" : "You"}
+              {messages.map((msg, i) => {
+                // The welcome card's content is resolved at render-time so
+                // it tracks the active locale without rewriting the messages
+                // array on language switch.
+                const content = msg.welcome ? t("chat.welcome") : msg.content;
+                return (
+                  <div key={i} className="flex gap-3">
+                    <div className="shrink-0 mt-1">
+                      {msg.role === "assistant" ? (
+                        <Cpu className={msg.error ? "h-5 w-5 text-destructive" : "h-5 w-5 text-primary"} />
+                      ) : (
+                        // User stays in a cool blue so the two roles remain
+                        // visually distinguishable against a warm theme.
+                        <User className="h-5 w-5 text-sky-500 dark:text-sky-400" />
+                      )}
                     </div>
-                    <div className="prose prose-invert prose-sm max-w-none text-zinc-300">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-                    </div>
-                    {msg.sources && msg.sources.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-zinc-800">
-                        <p className="text-xs text-zinc-500 mb-2">Sources:</p>
-                        <div className="flex flex-wrap gap-2">
-                          {msg.sources.map((s) => (
-                            <Link key={s.id} href={`/paper/${s.id}`}>
-                              <Badge
-                                variant="outline"
-                                className="cursor-pointer hover:bg-zinc-800 text-xs border-zinc-700 text-zinc-400"
-                              >
-                                <FileText className="h-3 w-3 mr-1" />
-                                {s.title.slice(0, 60)}
-                                {s.title.length > 60 ? "..." : ""}
-                              </Badge>
-                            </Link>
-                          ))}
-                        </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-muted-foreground mb-1">
+                        {msg.role === "assistant" ? t("chat.role.assistant") : t("chat.role.you")}
                       </div>
-                    )}
+                      <div className="prose prose-sm dark:prose-invert max-w-none text-foreground/85">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+                      </div>
+                      {msg.sources && msg.sources.length > 0 && (
+                        <div className="mt-3 pt-3 border-t border-border">
+                          <p className="text-xs text-muted-foreground mb-2">{t("chat.sources")}</p>
+                          <div className="flex flex-wrap gap-2">
+                            {msg.sources.map((s) => (
+                              <Link key={s.id} href={`/paper/${s.id}`}>
+                                <Badge
+                                  variant="outline"
+                                  className="cursor-pointer hover:bg-muted text-xs border-border text-muted-foreground"
+                                >
+                                  <FileText className="h-3 w-3 mr-1" />
+                                  {s.title.slice(0, 60)}
+                                  {s.title.length > 60 ? "..." : ""}
+                                </Badge>
+                              </Link>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {/* Pre-token spinner: only while we're waiting on the first
                   streamed chunk. Once tokens start flowing the streaming
                   placeholder bubble already gives live feedback. */}
@@ -357,9 +373,9 @@ function ChatContent() {
                 && messages[messages.length - 1]?.streaming
                 && !messages[messages.length - 1]?.content && (
                 <div className="flex gap-3">
-                  <Loader2 className="h-5 w-5 text-emerald-400 animate-spin shrink-0 mt-1" />
-                  <div className="text-sm text-zinc-500">
-                    {selectedPaper ? "Reading the source..." : "Searching knowledge base..."}
+                  <Loader2 className="h-5 w-5 text-primary animate-spin shrink-0 mt-1" />
+                  <div className="text-sm text-muted-foreground">
+                    {selectedPaper ? t("chat.loading.reading") : t("chat.loading.search")}
                   </div>
                 </div>
               )}
@@ -367,7 +383,7 @@ function ChatContent() {
             </div>
           </ScrollArea>
 
-          <div className="border-t border-zinc-800 p-3 sm:p-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-zinc-950/80 backdrop-blur-sm">
+          <div className="border-t border-border p-3 sm:p-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-background/80 backdrop-blur-sm">
             <div className="flex items-center gap-2">
               <Input
                 value={input}
@@ -375,19 +391,21 @@ function ChatContent() {
                 onKeyDown={handleKeyDown}
                 placeholder={
                   selectedPaper
-                    ? `Ask about "${selectedPaper.title.slice(0, 40)}..."`
-                    : "Ask about GPU architectures, attention, LLMs..."
+                    ? t("chat.placeholder.anchored", {
+                        title: selectedPaper.title.slice(0, 40),
+                      })
+                    : t("chat.placeholder.default")
                 }
                 enterKeyHint="send"
-                className="flex-1 bg-zinc-900 border-zinc-800 text-base sm:text-sm h-10 sm:h-9"
+                className="flex-1 bg-card border-border text-base sm:text-sm h-10 sm:h-9"
                 disabled={loading}
               />
               {loading ? (
                 <Button
                   type="button"
                   size="icon"
-                  aria-label="Stop generating"
-                  className="bg-red-600 hover:bg-red-700 h-10 w-10 sm:h-9 sm:w-9 shrink-0"
+                  aria-label={t("chat.stop")}
+                  className="bg-destructive hover:bg-destructive/90 text-white h-10 w-10 sm:h-9 sm:w-9 shrink-0"
                   onClick={handleStop}
                 >
                   <Square className="h-4 w-4" />
@@ -396,19 +414,19 @@ function ChatContent() {
                 <Button
                   type="submit"
                   size="icon"
-                  aria-label="Send"
+                  aria-label={t("chat.send")}
                   disabled={!input.trim()}
-                  className="bg-emerald-600 hover:bg-emerald-700 h-10 w-10 sm:h-9 sm:w-9 shrink-0"
+                  className="bg-primary hover:bg-primary/90 text-primary-foreground h-10 w-10 sm:h-9 sm:w-9 shrink-0"
                   onClick={handleSend}
                 >
                   <Send className="h-4 w-4" />
                 </Button>
               )}
             </div>
-            <p className="text-[10px] text-zinc-600 mt-2 hidden sm:block">
+            <p className="text-[10px] text-muted-foreground/70 mt-2 hidden sm:block">
               {selectedPaper
-                ? "Anchored to a single source — the LLM sees its full content."
-                : "Answers are based on papers in the knowledge base. Results may vary by processing state."}
+                ? t("chat.disclaimer.anchored")
+                : t("chat.disclaimer.default")}
             </p>
           </div>
         </div>

@@ -10,11 +10,14 @@ import { Calendar } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Link from "next/link";
+import { useLocale } from "@/lib/i18n/provider";
+import { formatLongDate } from "@/lib/i18n/format";
 
 export default function ReportDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [report, setReport] = useState<DailyReport | null>(null);
   const [loading, setLoading] = useState(true);
+  const { locale, t } = useLocale();
 
   useEffect(() => {
     if (!id) return;
@@ -24,18 +27,18 @@ export default function ReportDetailPage() {
   if (loading) {
     return (
       <div className="max-w-3xl mx-auto p-6 space-y-4">
-        <Skeleton className="h-8 w-3/4 bg-zinc-900" />
-        <Skeleton className="h-96 w-full bg-zinc-900" />
+        <Skeleton className="h-8 w-3/4 bg-card" />
+        <Skeleton className="h-96 w-full bg-card" />
       </div>
     );
   }
 
   if (!report) {
     return (
-      <div className="max-w-3xl mx-auto p-6 text-center py-16 text-zinc-500">
-        <p>Report not found.</p>
-        <Link href="/reports" className="text-sm text-emerald-400 hover:underline mt-2 inline-block">
-          Back to reports
+      <div className="max-w-3xl mx-auto p-6 text-center py-16 text-muted-foreground">
+        <p>{t("reports.notFound")}</p>
+        <Link href="/reports" className="text-sm text-primary hover:underline mt-2 inline-block">
+          {t("reports.back")}
         </Link>
       </div>
     );
@@ -43,23 +46,24 @@ export default function ReportDetailPage() {
 
   return (
     <div className="max-w-3xl mx-auto p-6">
-      <Link href="/reports" className="text-xs text-zinc-500 hover:text-zinc-300 mb-4 inline-block">
-        ← Back to reports
+      <Link href="/reports" className="text-xs text-muted-foreground hover:text-foreground mb-4 inline-block">
+        {t("reports.back")}
       </Link>
       <div className="flex items-center gap-3 mb-6">
-        <Calendar className="h-5 w-5 text-emerald-400" />
+        <Calendar className="h-5 w-5 text-primary" />
         <div>
           <h1 className="text-lg font-semibold">{report.title}</h1>
-          <p className="text-sm text-zinc-500">
-            {new Date(report.date).toLocaleDateString("en-US", {
-              weekday: "long", year: "numeric", month: "long", day: "numeric",
-            })}
+          <p className="text-sm text-muted-foreground">
+            {formatLongDate(report.date, locale)}
           </p>
         </div>
       </div>
-      <Card className="bg-zinc-900 border-zinc-800">
+      <Card className="bg-card border-border">
         <CardContent className="p-6">
-          <div className="prose prose-invert prose-sm max-w-none text-zinc-300">
+          {/* prose-invert is dark-mode-only; gate with Tailwind's dark: variant
+              so the light theme uses the standard prose colors that auto-pick
+              foreground from current text color. */}
+          <div className="prose prose-sm dark:prose-invert max-w-none text-foreground/85">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {report.content}
             </ReactMarkdown>
