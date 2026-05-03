@@ -65,7 +65,8 @@
 
 | 函数 | 后端端点 | 用途 |
 | --- | --- | --- |
-| `listPapers(params)` | `GET /api/papers` | 列表 + 过滤/排序 |
+| `listPapers(params)` | `GET /api/papers` | 列表 + 过滤/排序。`params.source_name?: string[]` 多选时**前端 join `","`** 再发，后端 split 成 `IN (...)` |
+| **`listSources()`**（**本轮新增**） | **`GET /api/sources`** | 浏览页 SourceFilter 数据源；返回 `{ sources: Source[] }`，每条 `{ name, type, count }` |
 | `getPaper(id)` | `GET /api/papers/{id}` | 详情；deep-link 进 chat 时也调它解析 `?paperId=` |
 | `searchPapers(q, params)` | `GET /api/papers/search` | 语义/关键字检索；SourcePicker 强制 `semantic:false` |
 | `chat(request)` | `POST /api/chat` | **非流式** RAG / source-anchored；通过 `_chatPayload(request)` 清理 undefined / null 后再 POST |
@@ -86,6 +87,8 @@
 | `ChatMessage` | `{ role: "user" \| "assistant"; content: string }` | 没有 system role |
 | `ChatRequest` | `{ query, top_k?, paper_id?, history? }` | – |
 | `ChatStreamEvent` | discriminated union `sources \| token \| error \| done` | 与后端 `_sse_event` 镜像 |
+| **`Source`**（**新**） | `{ name: string; type: string; count: number }` | `type` 与后端 `SourceType` enum value 镜像（`"paper" \| "blog" \| "project" \| "talk"`） |
+| **`SourcesResponse`**（**新**） | `{ sources: Source[] }` | `listSources()` 返回值 |
 | **`DailyStatus`**（**新**） | `{ running: boolean; started_at: string \| null; current_stage: DailyStageName \| null }` | `getDailyStatus()` 返回值 |
 | **`DailyStageName`**（**新**） | `"ingestion" \| "processing" \| "embedding" \| "report"` | 与后端 `_STAGE_NAMES` 镜像 |
 | **`DailyStreamEvent`**（**新**） | discriminated union `started \| stage \| log \| error \| done` | `runDailyStream()` yield 的事件；`stage` 含 `index: 1\|2\|3\|4` 与 `name: DailyStageName`；与后端 `_sse_event` 镜像，新增事件类型时**两侧都要加**且更新 `_parseDailyFrame` |
@@ -167,6 +170,7 @@ frontend/
    │  ├─ chat/              # chat 子组件
    │  ├─ paper-card.tsx
    │  ├─ search-bar.tsx
+   │  ├─ source-filter.tsx      # ★ 本轮新增：分组折叠 + tag 多选 SourceFilter
    │  ├─ language-switcher.tsx  # ★ 新
    │  └─ theme-switcher.tsx     # ★ 新
    ├─ hooks/
@@ -194,6 +198,27 @@ frontend/
 ## 八、Chat 模块（流式版本细节，不变）
 
 详见上一轮文档（`chatStream` async generator / `abortRef` / `streaming` placeholder / `_chatPayload` / `_parseSSEFrame`）。
+
+---
+
+## 八.5、Browse 页 SourceFilter（本轮新增）
+
+文件：`src/components/source-filter.tsx` + `src/app/page.tsx`（`BrowseContent`）。
+
+**UI 形态**：左栏 type radio（All / Papers / Blogs / Talks / Projects）下方追加 SourceFilter 区块——按 `source_type` 分 4 组（paper/blog/project/talk），每组可折叠（chevron 旋转 90°），tag 用 shadcn `Badge`（selected = `default` solid，unselected = `outline`），格式 `name · count`。`onClick` 切 selected 集合，`onChange(names)` 上抛父级。
+
+**type → source 联动**（**Decision 5**）：当 `typeFilter` 非空时，SourceFilter 只渲染对应那一组——其它组直接隐藏。同时父级 `onTypeChange` 在切 type 时**静默 drop** `selectedSources` 里 type 不匹配的条目（依据 `sources.find(s => s.name === name).type`，未知 source 暂时保留直到 `/api/sources` 解析完）。`?q=` 搜索模式下 SourceFilter **不渲染**（搜索路径忽略 type/source 过滤是后端契约现状）。
+
+**URL state**（`?type=paper&source=arxiv,vLLM Blog`）：
+
+- **初始读**：`useSearchParams()` 在首次渲染时取 `type` / `source`，喂进 `useState` 初值。
+- **后续写**：filter 变化走 React `setState`，**URL 同步用 `window.history.replaceState`**——**不**用 `router.push/replace`。
+- **为什么不用 router**：Next.js 16.2.x 已知 router cache 回归（vercel/next.js#92187）使 `router.push/replace` 在"同 pathname、不同 search"导航时**静默 no-op**——侧栏 `<Link href="/">` 被 prefetch 触发缓存命中即复现。`window.history.replaceState` 绕开整个 router 栈，URL 仍可分享，SSR/CSR 链接行为不变。
+- **trade-off**：因为不走 router，浏览器后退 / 前进按钮**不会**自动重新渲染 BrowseContent（filter state 是 React 内部的）。如果未来 Next 修了这个 bug，改回 `router.replace` 即可获得 back/forward 同步。
+
+**fetch 触发**：`useEffect([page, sortBy, sortDir, typeFilter, sourceKey, query])` 内 inline 调 `listPapers({ source_name: names })`；`sourceKey = selectedSources.join(",")` 是个**派生 primitive**，作 dependency 让 `Object.is` 比较稳定，**不要**直接把 `selectedSources` 数组放进 deps（React Compiler 会拒绝 + 引用每次 render 不稳）。
+
+**i18n keys**：`browse.filter.sources` / `.expand` / `.collapse`（en + zh 两侧都加）。group label 复用既有 `browse.filter.papers` / `.blogs` / `.projects` / `.talks`。
 
 ---
 
@@ -554,6 +579,7 @@ function _parseDailyFrame(raw: string): DailyStreamEvent | null {
 | `frontend/src/components/layout/{app-shell,header,sidebar}.tsx` | dashboard 布局；**header 加入两组 switcher**；**sidebar i18n 化** |
 | `frontend/src/components/{language,theme}-switcher.tsx` | **新**：segmented control |
 | `frontend/src/components/paper-card.tsx` | 列表行（含 SCORE_LABELS） |
+| `frontend/src/components/source-filter.tsx` | **本轮新增**：Browse 页 source_name 多选过滤组件 |
 | `frontend/src/components/chat/{chat-right-sidebar,source-picker}.tsx` | 聊天侧栏与 picker |
 | `frontend/src/hooks/use-conversation-history.ts` | localStorage CRUD |
 | `frontend/src/lib/api.ts` | API 客户端（含 `chat()` + `chatStream()` + **`getDailyStatus`** + **`runDailyStream`** + **`DailyConflictError`**） |
@@ -572,4 +598,5 @@ function _parseDailyFrame(raw: string): DailyStreamEvent | null {
 | 2026-05-02 08:57:04 | 增量刷新 | Next 16 standalone build / `/api/*` 反代 / Universal Score Axes / Docker |
 | 2026-05-02 20:12:04 | 增量刷新 | 多轮 Chat + Source pin + `/chat?paperId=` 深链 + 移动端响应式 |
 | 2026-05-02 21:18:53 | 增量刷新 | SSE 流式聊天 `chatStream` async generator + Stop 按钮 + `streaming` placeholder + 切换会话/卸载/deep-link 自动 abort |
+| **2026-05-03 23:00:00** | **增量刷新** | **Browse 页 Source 名称多选过滤**。① **新组件 `src/components/source-filter.tsx`**：按 `source_type` 分 4 组（paper/blog/project/talk），每组可折叠（chevron 旋转 90°），tag 用 shadcn `Badge`（selected = `default` solid，unselected = `outline`），`name · count` 文本；`onClick` 切 selected 集合，`onChange(names)` 上抛父级。`typeFilter` 非空时只渲染对应组（**Decision 5**）。`testid` 命名 `source-filter` / `source-tag-{name}` 给 e2e。② **types**（`src/lib/types.ts`）：新增 `Source { name; type; count }` + `SourcesResponse { sources: Source[] }`。③ **API 客户端**（`src/lib/api.ts`）：新增 `listSources()`（`GET /api/sources`）；`listPapers` 签名扩展 `source_name?: string[]`，**前端 `.join(",")`** 后再发 query string，后端 split 成 `IN (...)`。④ **Browse 页重构**（`src/app/page.tsx::BrowseContent`）：`typeFilter` / `selectedSources` 退回 React `useState`（初始值取自 `useSearchParams()`），URL 同步**改用 `window.history.replaceState`**——**绕开 Next.js 16.2.x 已知 router cache 回归 vercel/next.js#92187**（侧栏 `<Link href="/">` prefetch 触发缓存命中后 `router.push/replace` 在"同 pathname、不同 search"导航时会**静默 no-op**）。trade-off：浏览器 back/forward 不再自动重新渲染 BrowseContent；如未来 Next 修了这个 bug 改回 `router.replace` 即可。`onTypeChange` 切 type 时**静默 drop** `selectedSources` 里 type 不匹配的条目。`fetch` 走 `useEffect([page, sortBy, sortDir, typeFilter, sourceKey, query])`，`sourceKey = selectedSources.join(",")` 是派生 primitive 给 React Compiler 通过——**不要**直接把 `selectedSources` 数组放进 deps。`?q=` 搜索模式下 SourceFilter 不渲染。⑤ **i18n keys**（`src/lib/i18n/translations.ts`）：en + zh 各加 3 条 — `browse.filter.sources` / `browse.filter.sources.expand` / `browse.filter.sources.collapse`；group label 复用既有 `browse.filter.{papers,blogs,projects,talks}`。⑥ **测试**（`frontend/tests/e2e/browse.spec.ts`）：+2 例 — `source filter tag click updates URL & list` + `switching type silently drops mismatched sources`，都 mock 了 `/api/sources` + `/api/papers` 响应；为避免 Playwright 复用旧 `next start` 实例命中陈旧代码，e2e 实例显式跑在 port 3010 + `baseURL: 'http://127.0.0.1:3010'`（`playwright.config.ts` 中），与开发用的 3000 端口隔离。⑦ **gitignore**（`frontend/.gitignore`）：新增 `/test-results/` `/playwright-report/` `/playwright/.cache/` 避免 Playwright 产物污染 git。⑧ **不影响**：theme / locale / chat / reports / stats / paper detail / 移动端响应式 / hooks / 既有 paper-card / search-bar 全部不动。所有 delta 已通过直接读取 `frontend/src/components/source-filter.tsx` / `frontend/src/app/page.tsx` / `frontend/src/lib/{api,types}.ts` / `frontend/src/lib/i18n/translations.ts` / `frontend/tests/e2e/browse.spec.ts` 源码核对。 |
 | **2026-05-03 22:34:43** | **增量刷新** | **Themed i18n shell + reports 页 Run-Now SSE 进度面板**。① **i18n 模块（新）**：`src/lib/i18n/{provider.tsx,translations.ts,format.ts}`。`LocaleProvider` 用 React Context + localStorage `gpgpu-kb.locale.v1` 持久化；SSR 期间永远 `DEFAULT_LOCALE="en"`，mount 后才反水到持久化值；`useEffect` 内同步 `document.documentElement.lang`。`translations.ts` 是 `en` / `zh` 双层对象（~110 keys）+ `TranslationKey = keyof typeof translations.en`（**en 是 source of truth**）。`format.ts::formatLongDate(value, locale)` 用 `Date.toLocaleDateString(LOCALE_TAG[locale], opts)` 包成 locale-aware 长日期。`_interpolate` 仅支持 `{name}` placeholder，**不支持 ICU plurals**。② **theme 模块（新）**：`src/lib/theme/provider.tsx`。`THEME_STORAGE_KEY="gpgpu-kb.theme.v1"` / `DEFAULT_THEME="dark"` / `THEMES=["light","dark"]`。`useEffect` 同步 `document.documentElement.classList.toggle("dark", ...)`。**FOUC-prevention**：`app/layout.tsx` 头部 inline `<script dangerouslySetInnerHTML={{__html: THEME_INIT_SCRIPT}}>` 在 React 挂载前先读 localStorage 切 `<html>` class——painted body 永远不闪。这段 inline script 与 `THEME_STORAGE_KEY` 字面量都是硬编码，改时两处同步。`<html lang="en" className="dark" suppressHydrationWarning>` 静默 React 关于 class/lang mismatch 的告警。③ **新主题：Cream Linen + Walnut Hearth**（`src/app/globals.css`）：彻底替换原 `bg-zinc-950 text-zinc-100` 硬编码暗色为 oklch 双主题。`@theme inline` 把所有 shadcn 设计 token（`--color-card` / `--color-primary` / `--color-sidebar` / `--color-chart-1..5` / `--color-destructive` / 等）映射到 `:root` (Cream Linen, parchment + caramel amber + chestnut) 与 `.dark` (Walnut Hearth, walnut bark + roasted cocoa + toasted amber + oat-mist) 两套 oklch 变量。`@custom-variant dark (&:is(.dark *))` 显式声明 dark 变体。`viewport.themeColor` dual-mode 跟系统 `prefers-color-scheme` 切换地址栏 tint（与 `<html class>` 是两套独立信号）。**编码规范变更**：从此不要再用 `bg-zinc-...` 硬编码，统一用语义 token（`bg-background` / `bg-card` / `bg-sidebar` 等）。④ **AppShell 重构**（`src/components/layout/{app-shell,header,sidebar}.tsx`）：根 `layout.tsx` 包 `<ThemeProvider><LocaleProvider><AppShell>`；`AppShell` 用 React 19 的"在 render 中 derive state from path"模式（`if (pathname !== lastPath) setOpen(false)`）。`Header` 加入 `<ThemeSwitcher />` + `<LanguageSwitcher />` 两组 segmented control（pill + 滑动 thumb，`pointer-events-none` 不抢点击；ThemeSwitcher 的 thumb hydrated 前 opacity=0 防 SSR snapshot painted under wrong tab）。`Sidebar` 全部 `t("nav.*")` + 版本号读 `package.json::version`。⑤ **后端：手动触发 daily pipeline + SSE 进度（新端点，详见 `backend/CLAUDE.md`）**：`GET /api/daily/status` + `POST /api/daily/stream`，**都挂 `verify_chat_token`**；事件序列 `started → stage(≤4) → log(N) → done\|error`，15s idle 发 `: keepalive\n\n` SSE comment 帧；并发第二个 POST → HTTP 409。⑥ **前端 reports 页重写**（`src/app/reports/page.tsx`）：新增 `RunPhase = "idle"\|"starting"\|"running"\|"done"\|"error"` + `RunState`（`phase / startedAt / activeIndex / errorMessage / conflict`）。Mount 时 `getDailyStatus()` 探测他 tab in-flight run（命中则 phase=running + conflict=true，按钮永久 disable）。`handleRun` 起 `AbortController` 串到 `runDailyStream({signal})`，`for await` 跑 events；`applyEvent` switch 5 个事件（`started\|stage\|log\|error\|done`）切状态 + appendLog。`MAX_LOG_LINES=2000` 防冷启动 100k 行 OOM。终止三态：done → 刷新 reports；error → 红色 RunPanel + log 面板；AbortError → 静默（用户主动取消）。`RunPanel` 含状态 header + 4 个 `StagePill`（pending/running/done/error 四色）+ 折叠 log 面板（`<pre whitespace-pre-wrap break-words font-mono>`）+ 完成后的 Reload 按钮。`formatRelativeTime(iso, locale)` 4 桶简易实现（just now / Xm / Xh / Xd ago，对应中文）。⑦ **前端 API 客户端扩展**（`src/lib/api.ts`）：新增 `getDailyStatus()`（`GET /api/daily/status`）+ `runDailyStream({ signal? })` async generator（`POST /api/daily/stream`，body `"{}"`，`Accept: text/event-stream`）+ `DailyConflictError extends Error`（HTTP 409 时抛）+ `_parseDailyFrame`（**关键：跳过 `:` 开头的 keepalive 注释帧 + 跳过空行**，否则 `JSON.parse` 会在 keepalive 帧上 throw）。`reader.releaseLock()` 仍在 try/catch 内调（abort 后 releaseLock throws，安全 swallow）。⑧ **前端 types 扩展**（`src/lib/types.ts`）：新增 `DailyStatus { running, started_at, current_stage }` / `DailyStageName = "ingestion"\|"processing"\|"embedding"\|"report"` / `DailyStreamEvent` discriminated union（`started\|stage\|log\|error\|done`）。`Stats.top_overall` 字段不变。⑨ **i18n key 覆盖**：translations.ts 新增 `reports.run.*` 18 个 key（button / busy / startedAt / alreadyRunning / conflict / failed / connectionLost / complete / reload / viewLogs / hideLogs / logsEmpty / stage.{ingestion,processing,embedding,report}）+ `theme.{switch,light,dark}` + `lang.{switch,english,chinese}` + `shell.{openMenu,closeMenu,version}` + `nav.primary` 等 shell-level keys。所有 zh 翻译就位（暗黑/明亮 / 数据采集 / 摘要与评分 / 向量化 / 生成简报 / 立即运行流水线 / 流水线运行中…… 等）。⑩ **不影响**：`/api/chat` / `/api/chat/stream` 多轮 / source-anchored / fast-expert 双角色 / SSE 流式 chat / per-source ingest 冷启动 / sitemap blog / DB schema / migration / Docker / 已有 provider 行为全部不动。所有 delta 已通过直接读取 `frontend/src/app/reports/page.tsx` / `frontend/src/lib/api.ts` / `frontend/src/lib/types.ts` / `frontend/src/lib/i18n/{provider.tsx,translations.ts,format.ts}` / `frontend/src/lib/theme/provider.tsx` / `frontend/src/app/layout.tsx` / `frontend/src/app/globals.css` / `frontend/src/components/layout/{app-shell,header,sidebar}.tsx` / `frontend/src/components/{language-switcher,theme-switcher}.tsx` / `backend/kb/main.py` / `backend/tests/test_api_smoke.py` 源码核对。 |
