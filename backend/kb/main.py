@@ -108,6 +108,7 @@ def list_papers(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     source_type: str | None = None,
+    source_name: str | None = Query(None, max_length=500),
     sort_by: str = Query(
         "total_score",
         pattern="^(published_date|impact_score|originality_score|quality_score|relevance_score|total_score|ingested_date)$",
@@ -123,6 +124,12 @@ def list_papers(
         q = q.filter(Paper.is_processed == 1)
     if source_type:
         q = q.filter(Paper.source_type == source_type)
+    if source_name:
+        # Comma-separated multi-select: ?source_name=arxiv,OpenAI → SQL IN (...).
+        # 50-item cap is defensive; the UI today exposes ~14 distinct sources.
+        names = [n.strip() for n in source_name.split(",") if n.strip()][:50]
+        if names:
+            q = q.filter(Paper.source_name.in_(names))
 
     if sort_by == "total_score":
         # Papers store scores in originality/impact; blog/project/talk store

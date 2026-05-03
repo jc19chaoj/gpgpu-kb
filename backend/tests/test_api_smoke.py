@@ -913,3 +913,108 @@ def test_list_sources_orders_by_count_desc(client):
     body = r.json()
     counts = [s["count"] for s in body["sources"]]
     assert counts == sorted(counts, reverse=True), body
+
+
+# ─── /api/papers source_name filter (browse page) ─────────────────
+
+def _seed_namespaced_source_papers(prefix: str) -> dict[str, str]:
+    """Insert 4 active papers across 3 prefix-namespaced source_names so the
+    /api/papers source_name filter tests can assert exact counts even when
+    the session-scoped DB carries rows from earlier tests.
+
+    Returns a name map: {"arxiv_key", "openai_key", "semi_key"} → actual
+    namespaced source_name strings. Layout:
+      - 2 arxiv_key (paper, processed=1)
+      - 1 openai_key (blog, processed=1)
+      - 1 semi_key (blog, processed=1)
+    """
+    import datetime
+    from kb.database import SessionLocal
+    from kb.models import Paper, SourceType
+
+    names = {
+        "arxiv": f"arxiv-{prefix}",
+        "openai": f"openai-{prefix}",
+        "semi": f"semi-{prefix}",
+    }
+    rows = [
+        (names["arxiv"], SourceType.PAPER),
+        (names["arxiv"], SourceType.PAPER),
+        (names["openai"], SourceType.BLOG),
+        (names["semi"], SourceType.BLOG),
+    ]
+    db = SessionLocal()
+    try:
+        for i, (sname, stype) in enumerate(rows):
+            db.add(Paper(
+                title=f"flt-{prefix}-{i}",
+                abstract="",
+                summary="s",
+                authors=[],
+                organizations=[],
+                source_type=stype,
+                source_name=sname,
+                url=f"https://example.test/flt/{prefix}/{i}",
+                published_date=datetime.datetime(2026, 4, 25, tzinfo=datetime.UTC),
+                is_processed=1,
+                quality_score=8.0,
+                relevance_score=8.0,
+            ))
+        db.commit()
+    finally:
+        db.close()
+    return names
+
+
+def test_list_papers_filters_by_single_source_name(client):
+    names = _seed_namespaced_source_papers("single")
+    r = client.get("/api/papers", params={"source_name": names["arxiv"], "page_size": 100})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 2
+    assert all(p["source_name"] == names["arxiv"] for p in body["papers"])
+
+
+def test_list_papers_filters_by_multiple_source_names(client):
+    names = _seed_namespaced_source_papers("multi")
+    r = client.get(
+        "/api/papers",
+        params={"source_name": f"{names['arxiv']},{names['openai']}", "page_size": 100},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 2 arxiv + 1 OpenAI = 3 active rows.
+    assert body["total"] == 3
+    returned_names = {p["source_name"] for p in body["papers"]}
+    assert returned_names == {names["arxiv"], names["openai"]}
+
+
+def test_list_papers_source_name_empty_value_is_ignored(client):
+    """Defensive: ?source_name= (empty string) must NOT filter to zero rows.
+    The frontend may emit an empty value during URL rewrite races; this test
+    locks in the 'empty == no filter' behavior."""
+    _seed_namespaced_source_papers("empty")
+    r = client.get("/api/papers", params={"source_name": "", "page_size": 100})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Without filter, total should include at least our 4 seeded active rows.
+    assert body["total"] >= 4
+
+
+def test_list_papers_source_name_combined_with_source_type(client):
+    """AND combination with the existing source_type filter: arxiv is
+    type=paper, so combining source_type=blog with source_name including
+    arxiv should leave only the OpenAI blog row."""
+    names = _seed_namespaced_source_papers("combo")
+    r = client.get(
+        "/api/papers",
+        params={
+            "source_type": "blog",
+            "source_name": f"{names['arxiv']},{names['openai']}",
+            "page_size": 100,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 1
+    assert body["papers"][0]["source_name"] == names["openai"]
