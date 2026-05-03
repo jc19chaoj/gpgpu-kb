@@ -23,13 +23,27 @@ ARXIV_CATEGORIES = [
 ]
 
 
-def fetch_recent_papers(days_back: int = 1) -> list[dict]:
+def fetch_recent_papers(days_back: int | None = 1) -> list[dict]:
     """Fetch recent papers from ArXiv.
 
     Queries each category independently (rather than ORing them in one query)
     so that no single high-volume category like cs.AI can starve the others
     when MAX_RESULTS is hit.
+
+    `days_back` semantics:
+        * int → explicit override, applied to every category.
+        * None → cold-start-aware lookback for `source_name="arxiv"` via
+          `kb.ingestion.run._lookback_for_source`. Behaves identically to
+          the global gap on existing DBs (since every arxiv row shares the
+          same source_name) but stays consistent with the per-source model
+          used by RSS / sitemap fetchers.
     """
+    if days_back is None:
+        # Lazy import: run.py imports this fetcher at top level.
+        from kb.ingestion.run import _lookback_for_source
+        days_back = _lookback_for_source("arxiv")
+        logger.info("[arxiv] lookback=%dd (per-source)", days_back)
+
     client = arxiv.Client()
     cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days_back)
     seen_urls: set[str] = set()

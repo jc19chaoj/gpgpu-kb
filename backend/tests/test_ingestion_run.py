@@ -24,7 +24,12 @@ def clean_papers():
         db.close()
 
 
-def _seed_paper(ingested_date: datetime.datetime, url: str) -> None:
+def _seed_paper(
+    ingested_date: datetime.datetime,
+    url: str,
+    source_name: str = "arxiv",
+    source_type=None,
+) -> None:
     from kb.database import SessionLocal
     from kb.models import Paper, SourceType
 
@@ -35,8 +40,8 @@ def _seed_paper(ingested_date: datetime.datetime, url: str) -> None:
             authors=[],
             organizations=[],
             abstract="",
-            source_type=SourceType.PAPER,
-            source_name="arxiv",
+            source_type=source_type or SourceType.PAPER,
+            source_name=source_name,
             url=url,
             ingested_date=ingested_date,
             published_date=ingested_date,
@@ -102,12 +107,93 @@ def test_compute_days_back_tolerates_naive_legacy_datetime(clean_papers):
     assert run_mod.settings.ingest_gap_min_days <= result <= run_mod.settings.ingest_gap_max_days
 
 
+# ─── _lookback_for_source (per-source cold-start) ─────────────────
+
+
+def test_lookback_for_source_unknown_source_returns_cold_start(clean_papers):
+    """The core "new source = automatic 30-day backfill" guarantee: if the
+    DB has zero rows under a given source_name, the per-source helper must
+    fall back to settings.ingest_empty_db_days, even when other sources
+    have very recent rows. Without this, adding a new RSS feed would only
+    get 1 day of content."""
+    from kb.ingestion import run as run_mod
+
+    _seed_paper(
+        datetime.datetime.now(datetime.UTC),
+        "https://example.test/run/lookback-existing",
+        source_name="arxiv",
+    )
+    assert (
+        run_mod._lookback_for_source("brand-new-feed-not-yet-seen")
+        == run_mod.settings.ingest_empty_db_days
+    )
+
+
+def test_lookback_for_source_existing_source_returns_gap(clean_papers):
+    """A mature source with a recent row should report its own gap, not
+    cold-start, even if other (newer) sources are missing entirely."""
+    from kb.ingestion import run as run_mod
+
+    _seed_paper(
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=4),
+        "https://example.test/run/lookback-arxiv-4d",
+        source_name="arxiv",
+    )
+    assert run_mod._lookback_for_source("arxiv") == 4
+
+
+def test_lookback_for_source_isolates_per_source(clean_papers):
+    """Two sources with very different last-seen timestamps must report
+    independent windows — that's the whole point of the per-source design."""
+    from kb.ingestion import run as run_mod
+
+    now = datetime.datetime.now(datetime.UTC)
+    _seed_paper(
+        now - datetime.timedelta(days=2),
+        "https://example.test/run/iso-arxiv",
+        source_name="arxiv",
+    )
+    _seed_paper(
+        now - datetime.timedelta(days=10),
+        "https://example.test/run/iso-openai",
+        source_name="OpenAI",
+    )
+
+    assert run_mod._lookback_for_source("arxiv") == 2
+    assert run_mod._lookback_for_source("OpenAI") == 10
+    # Brand-new source still cold-starts despite other sources being mature.
+    assert (
+        run_mod._lookback_for_source("totally-new-source")
+        == run_mod.settings.ingest_empty_db_days
+    )
+
+
+def test_lookback_for_source_none_matches_global(clean_papers):
+    """Passing None must match the legacy global semantics, since
+    _compute_days_back is now a thin wrapper around it."""
+    from kb.ingestion import run as run_mod
+
+    _seed_paper(
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=5),
+        "https://example.test/run/none-global",
+    )
+    assert run_mod._lookback_for_source(None) == run_mod._compute_days_back() == 5
+
+
 # ─── run_ingestion source propagation ─────────────────────────────
 
 
 def _spy_run_ingestion(run_mod, **call_kwargs):
-    """Patch all three fetchers + savers; return the captured days_back map."""
-    captured: dict[str, int] = {}
+    """Patch all four fetchers + savers; return the captured days_back map.
+
+    The fourth fetcher is `fetch_recent_sitemap_posts` (LMSYS / SGLang and any
+    other sitemap-only blog source). The orchestrator now transparently
+    propagates whatever `days_back` was passed to `run_ingestion` (including
+    None, which signals "let each fetcher compute its own per-source window")
+    so the captured value mirrors the input — fetchers do the per-source
+    lookup themselves via `_lookback_for_source`.
+    """
+    captured: dict[str, int | None] = {}
 
     def make_spy(name):
         def spy(days_back):
@@ -117,6 +203,7 @@ def _spy_run_ingestion(run_mod, **call_kwargs):
 
     with patch.object(run_mod, "fetch_recent_papers", side_effect=make_spy("arxiv")), \
          patch.object(run_mod, "fetch_recent_posts", side_effect=make_spy("rss")), \
+         patch.object(run_mod, "fetch_recent_sitemap_posts", side_effect=make_spy("sitemap_blogs")), \
          patch.object(run_mod, "fetch_trending_repos", side_effect=make_spy("github")), \
          patch.object(run_mod, "save_papers", return_value=0), \
          patch.object(run_mod, "save_posts", return_value=0), \
@@ -126,18 +213,24 @@ def _spy_run_ingestion(run_mod, **call_kwargs):
     return captured
 
 
-def test_run_ingestion_propagates_cold_start_window_to_all_sources(clean_papers):
+def test_run_ingestion_default_propagates_none_to_all_sources(clean_papers):
+    """Without an explicit override, `run_ingestion` hands None to every
+    fetcher so each one can compute its own per-source-name lookback. This
+    is what enables "add a new feed → next run automatically backfills 30
+    days for that feed only" without expanding the window for every other
+    source.
+    """
     from kb.ingestion import run as run_mod
 
     captured = _spy_run_ingestion(run_mod)
-    assert captured == {"arxiv": run_mod.settings.ingest_empty_db_days,
-                        "rss": run_mod.settings.ingest_empty_db_days,
-                        "github": run_mod.settings.ingest_empty_db_days}
+    assert captured == {"arxiv": None, "rss": None,
+                        "sitemap_blogs": None, "github": None}
 
 
 def test_run_ingestion_explicit_override_takes_precedence(clean_papers):
-    """An explicit days_back must skip MAX() and propagate as-is, even when
-    a recent paper would otherwise produce a smaller window."""
+    """An explicit days_back must skip per-source lookup and propagate
+    as-is, even when a recent paper would otherwise produce a smaller
+    window. Used for tests and one-off operator backfills."""
     from kb.ingestion import run as run_mod
 
     _seed_paper(
@@ -145,4 +238,4 @@ def test_run_ingestion_explicit_override_takes_precedence(clean_papers):
         "https://example.test/run/override",
     )
     captured = _spy_run_ingestion(run_mod, days_back=7)
-    assert captured == {"arxiv": 7, "rss": 7, "github": 7}
+    assert captured == {"arxiv": 7, "rss": 7, "sitemap_blogs": 7, "github": 7}

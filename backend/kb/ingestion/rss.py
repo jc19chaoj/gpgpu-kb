@@ -24,9 +24,12 @@ def _tag_to_str(tag) -> str:
     return ""
 
 
-# Feeds verified active as of 2026-04. Update this list when feeds rot.
+# Feeds verified active as of 2026-05. Update this list when feeds rot.
 # Removed: AnandTech (site shut down in 2024, /rss redirects to forums HTML);
 #          Meta AI Blog (ai.meta.com/blog/feed/ returns 404, no public RSS).
+# Note: SGLang / LMSYS (lmsys.org) does NOT have a native RSS — its blog is a
+# Next.js SPA with no /feed.xml. It's pulled via the sitemap-based scraper in
+# `kb.ingestion.sitemap_blog` instead, not from this list.
 FEEDS = [
     # Chip / Architecture
     ("https://semiengineering.com/feed/", "Semiconductor Engineering"),
@@ -39,6 +42,9 @@ FEEDS = [
     ("https://huggingface.co/blog/feed.xml", "Hugging Face Blog"),
     ("https://developer.nvidia.com/blog/feed", "NVIDIA Developer Blog"),
     ("https://research.nvidia.com/rss.xml", "NVIDIA Research"),
+    # Inference engines
+    # vLLM uses Jekyll under vllm.ai; the rss.xml lives under /blog/.
+    ("https://vllm.ai/blog/rss.xml", "vLLM Blog"),
     # Systems / Performance personalities
     # lilianweng.github.io serves the Atom feed at /index.xml, not /feed.xml.
     ("https://lilianweng.github.io/index.xml", "Lilian Weng"),
@@ -47,12 +53,35 @@ FEEDS = [
 ]
 
 
-def fetch_recent_posts(days_back: int = 1) -> list[dict]:
-    """Fetch recent blog posts from RSS feeds."""
-    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days_back)
+def fetch_recent_posts(days_back: int | None = 1) -> list[dict]:
+    """Fetch recent blog posts from RSS feeds.
+
+    `days_back` semantics:
+        * int → applied uniformly to every feed (legacy behavior, useful for
+          tests and one-off backfills).
+        * None → each feed gets its own per-`source_name` cold-start-aware
+          window. A feed whose `source_name` has no rows in the DB yet (i.e.
+          newly added to FEEDS) gets `settings.ingest_empty_db_days` (30 by
+          default), while mature feeds keep their tight gap-based window.
+    """
+    # Lazy import to avoid circular dependency at module load time:
+    # run.py already imports `fetch_recent_posts` from this module, so a
+    # top-level `from kb.ingestion.run import ...` here would fail during
+    # the partial load of run.py. Pulling the symbol inside the function
+    # body sidesteps the bootstrap order entirely.
+    from kb.ingestion.run import _lookback_for_source
+
+    now = datetime.datetime.now(datetime.UTC)
     posts: list[dict] = []
 
     for feed_url, source_name in FEEDS:
+        per_feed_days = (
+            days_back if days_back is not None
+            else _lookback_for_source(source_name)
+        )
+        cutoff = now - datetime.timedelta(days=per_feed_days)
+        logger.info("[rss] %s: lookback=%dd", source_name, per_feed_days)
+
         try:
             feed = feedparser.parse(feed_url)
         except Exception:

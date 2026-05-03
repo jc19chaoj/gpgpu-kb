@@ -208,6 +208,90 @@ class TestFetchRecentPosts:
         source_names = {p["source_name"] for p in posts}
         assert source_names == {"Blog A", "Blog B"}
 
+    def test_per_feed_cold_start_when_days_back_is_none(self):
+        """When `days_back=None`, each feed must compute its own
+        cold-start-aware window via `_lookback_for_source(source_name)`.
+
+        Concretely: if the DB has a recent row under "MatureBlog" but no
+        row under "FreshBlog", the mature feed should use a tight gap
+        window (so an old post is filtered out) while the fresh feed
+        should use the cold-start window (so the same-aged post is kept).
+        This is the user-visible "add a new feed → automatic 30-day
+        backfill" guarantee.
+        """
+        from kb.database import SessionLocal
+        from kb.models import Paper
+
+        # Seed a row under "MatureBlog" so its lookback resolves to the
+        # tight gap (≈ ingest_gap_min_days), and leave "FreshBlog" empty
+        # so it cold-starts.
+        db = SessionLocal()
+        try:
+            db.query(Paper).delete()
+            db.add(Paper(
+                title="seed",
+                authors=[],
+                organizations=[],
+                abstract="",
+                source_type=SourceType.BLOG,
+                source_name="MatureBlog",
+                url="https://example.test/rss/seed-mature",
+                ingested_date=datetime.datetime.now(datetime.UTC),
+                published_date=datetime.datetime.now(datetime.UTC),
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        # An entry 10 days old: should be FILTERED OUT by the mature
+        # feed's tight 1-day window, but KEPT by the fresh feed's
+        # 30-day cold-start window.
+        ten_days_ago = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=10)
+        old_parsed = (
+            ten_days_ago.year, ten_days_ago.month, ten_days_ago.day,
+            ten_days_ago.hour, ten_days_ago.minute, ten_days_ago.second,
+            0, 0, 0,
+        )
+        mature_entry = _entry(
+            "Post in mature feed",
+            "https://mature.example/p10d",
+            published_parsed=old_parsed,
+        )
+        fresh_entry = _entry(
+            "Post in fresh feed",
+            "https://fresh.example/p10d",
+            published_parsed=old_parsed,
+        )
+        feeds = [
+            ("https://mature.example/feed", "MatureBlog"),
+            ("https://fresh.example/feed", "FreshBlog"),
+        ]
+        feed_mature = _make_feed([mature_entry])
+        feed_fresh = _make_feed([fresh_entry])
+
+        try:
+            with patch("kb.ingestion.rss.FEEDS", feeds):
+                with patch(
+                    "kb.ingestion.rss.feedparser.parse",
+                    side_effect=[feed_mature, feed_fresh],
+                ):
+                    posts = fetch_recent_posts(days_back=None)
+
+            # Mature feed's 10-day-old post is dropped; fresh feed's is kept.
+            urls = {p["url"] for p in posts}
+            assert urls == {"https://fresh.example/p10d"}, (
+                f"Expected only fresh-feed post; got {urls}"
+            )
+        finally:
+            db = SessionLocal()
+            try:
+                db.query(Paper).filter(
+                    Paper.url == "https://example.test/rss/seed-mature"
+                ).delete()
+                db.commit()
+            finally:
+                db.close()
+
 
 # ---------------------------------------------------------------------------
 # save_posts

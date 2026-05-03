@@ -7,7 +7,9 @@
 > 于 `2026-04-25 16:50` 增量刷新（质量门 `is_processed=2` / `KB_QUALITY_SCORE_THRESHOLD`），
 > 于 `2026-05-02 08:57:04` 增量刷新（Universal Score Axes / 中文 LLM 输出 / Docker 镜像 / 自适应 ingest 回看窗 / 冷启动批处理 / 非论文 rescore 脚本 / RSS 源精简),
 > 于 `2026-05-02 20:12:04` 增量刷新（多轮 Chat 历史 + 单 source 锚定模式 + `kb.processing.pdf` PDF 全文加载（pypdf 默认依赖、`Paper.full_text` 列）+ uvicorn `--timeout-keep-alive 75` keep-alive 修复），
-> 于 **`2026-05-02 21:18:53`** 增量刷新（**SSE 流式聊天 `/api/chat/stream` + 共享 `_build_chat_context` + `stream_llm` 抽象（`_STREAM_PROVIDERS` 字典）+ `_stream_openai_compatible` 公共体 + `_stream_anthropic` text_stream + chat 系统 prompt 改为中文硬编码**）。
+> 于 `2026-05-02 21:18:53` 增量刷新（SSE 流式聊天 `/api/chat/stream` + 共享 `_build_chat_context` + `stream_llm` 抽象（`_STREAM_PROVIDERS` 字典）+ `_stream_openai_compatible` 公共体 + `_stream_anthropic` text_stream + chat 系统 prompt 改为中文硬编码），
+> 于 `2026-05-02 23:32:00` 增量刷新（新增 vLLM Blog 进 RSS FEEDS（12 个源）+ 新模块 `kb/ingestion/sitemap_blog.py` 覆盖无原生 RSS 的 SPA 站点（首条来源 LMSYS / SGLang Blog）+ `kb/ingestion/run.py` 编排独立 stage `results["sitemap_blogs"]` + 12+ 例单元测试 + orchestrator 测试升级到 4 fetcher，pytest 174/174）。
+> 于 **`2026-05-03 09:44:00`** 增量刷新（**ingestion 冷启动改为 per-`Paper.source_name` 判定：`kb/ingestion/run.py` 新增 `_lookback_for_source(source_name)`，4 个 fetcher 签名统一 `days_back: int | None`（None 时各自走 per-source 窗口；ArXiv / GitHub 用 aggregate `source_name="arxiv"` / `"github"`，RSS / sitemap_blog 在循环内 per-feed / per-source 调用）；新增 RSS feed 进 `FEEDS` 或 sitemap 源进 `SITEMAP_SOURCES` 后下次 daily 自动 30 天 backfill 该源；测试 174 → 180 pass**）。
 
 ---
 
@@ -28,7 +30,7 @@
 | --- | --- |
 | `kb/main.py` (`app = FastAPI(...)`) | API 应用对象；`lifespan` 中初始化日志、`init_db()`、后台预热 EmbeddingStore（`asyncio.create_task`，不阻塞 startup）；`/api/chat` 与 **`/api/chat/stream`（SSE）** 共享 `_build_chat_context` + `_format_history` |
 | `kb/daily.py` (`run_daily_pipeline`) | 完整每日流水线（ingest → process → embed → report）；冷启动检测 + `--lang zh` 切换 |
-| `kb/ingestion/run.py` (`run_ingestion`) | 仅运行采集阶段；`_compute_days_back()` 自适应回看窗 |
+| `kb/ingestion/run.py` (`run_ingestion`) | 仅运行采集阶段；`days_back: int \| None`，None 时**每个 fetcher 自己走 per-`source_name` 冷启动**（见 `_lookback_for_source`）；`_compute_days_back()` 退化为 `_lookback_for_source(None)` 薄包装 |
 | `kb/processing/llm.py` (`run_processing`) | 仅运行 LLM 处理阶段，`batch_size=None` 表示无上限 |
 | `kb/processing/llm.py` (`call_llm` / **`stream_llm`**) | LLM 调用门面：`call_llm` 返回完整字符串（用于 summary/scoring 与 `/api/chat`）；**`stream_llm` 增量 yield 文本片段（用于 `/api/chat/stream`）；任何 provider 失败均返回空 / 静默结束 generator** |
 | `kb/processing/embeddings.py` (`index_unindexed_papers`) | 仅运行向量化阶段，`batch_size=None` 表示无上限 |
@@ -206,11 +208,12 @@ event: <name>\ndata: <json>\n\n
 | 文件 | 职责 | 关键点 |
 | --- | --- | --- |
 | `arxiv.py` | 9 个 cs.* 类目逐一查，按 `submitted_date` 倒排，截至 `cutoff` | 单查询而非 OR，避免高量类目（cs.AI）饿死其它 |
-| `rss.py` | **11 个精选 RSS 源**（截至 2026-04 验证可用） | `feedparser`；`bozo` 仅警告不拒收；`_tag_to_str` 把 feedparser 的 `term/scheme/label` 字典规范化为 `list[str]` 入库 |
+| `rss.py` | **12 个精选 RSS 源**（截至 2026-05 验证可用，本轮新增 vLLM Blog `https://vllm.ai/blog/rss.xml`） | `feedparser`；`bozo` 仅警告不拒收；`_tag_to_str` 把 feedparser 的 `term/scheme/label` 字典规范化为 `list[str]` 入库 |
+| `sitemap_blog.py` | **本轮新增**：sitemap-driven blog scraper，覆盖没有原生 RSS 的 SPA 站点（当前内置 1 个源：LMSYS / SGLang Blog `https://lmsys.org/sitemap.xml` + `path_prefix="https://lmsys.org/blog/"`） | stdlib `xml.etree.ElementTree` 解析 sitemap → `<lastmod>` 预过滤 → 单 `httpx.Client` 顺序 GET 每篇 → 正则抽 `<meta og:* / twitter:* / article:*>` → 兼容 `April 29, 2026` 等人写日期；网络/解析失败一律 logger.warning + skip 不抛；`_MAX_ARTICLES_PER_SOURCE=60` 防 DoS；`default_categories` 给每条预贴静态标签（如 `("sglang","lmsys")`） |
 | `github_trending.py` | GitHub Search API 按 17 个关键词查 `pushed:>yesterday` | 无 token 时 10 req/min 易 429，建议设 `GITHUB_TOKEN`；带 token 后切到带 polite sleep 的 30 req/min 路径 |
-| `run.py` | 编排上述三步，每步独立 try/except；`_compute_days_back` 自适应回看窗 | 单源失败不影响其它；空库 → `KB_INGEST_EMPTY_DB_DAYS`，否则 `now - max(ingested_date)` clamped 到 `[min, max]` |
+| `run.py` | 编排 arxiv → rss → sitemap_blog（独立 stage，复用 `save_posts`，写到 `results["sitemap_blogs"]`）→ github_trending；每步独立 try/except；**`_lookback_for_source(source_name)` per-source 冷启动**（`days_back is None` 时每个 fetcher 各自调；`_compute_days_back` 是 `_lookback_for_source(None)` 的薄包装） | 单源失败不影响其它；该 `source_name` 下 `MAX(ingested_date)` 为 NULL → `KB_INGEST_EMPTY_DB_DAYS` 冷启动 backfill；否则 `now - max(...)` clamped 到 `[min, max]`。**新增任意 RSS feed / sitemap 源后，下次 daily 自动 30 天 backfill 那一条 source_name** |
 
-去重统一采用 `Paper.url` 是否已存在。
+去重统一采用 `Paper.url` 是否已存在。`sitemap_blog` 写入的 `Paper.url` 取页面 `og:url`（不存在时回退 sitemap `<loc>`），所以重定向（如 lmsys.org → www.lmsys.org）不会破坏 dedup 稳定性——同一页跨 run 始终落在同一 canonical URL。
 
 ### `kb/processing/`
 
@@ -275,6 +278,31 @@ event: <name>\ndata: <json>\n\n
 
 目的：避免后到的 RSS / GitHub 项目被 ArXiv 队列前缀（一次 ingestion 可能新增几百行）饿死。
 
+### Per-Source ingest 冷启动（`kb.ingestion.run`）
+
+与上一节"批处理冷启动"是**两套独立机制，判定维度不同**——这一节说的是"采集回看窗"。
+
+`_lookback_for_source(source_name: str | None) -> int`（`kb/ingestion/run.py`）查 `MAX(Paper.ingested_date)` filtered by `source_name`：
+
+- 该 `source_name` 下没有任何已入库行 → 返回 `settings.ingest_empty_db_days`（默认 30）→ **冷启动 backfill**。
+- 否则按 `now - MAX(...)` 计算 gap，clamp 到 `[ingest_gap_min_days, ingest_gap_max_days]`。
+- `source_name=None` 跳过过滤，返回旧"全局 gap"——`_compute_days_back()` 就是这个。
+
+4 个 fetcher 签名都是 `days_back: int | None`：
+
+| fetcher | None 时调用 | 粒度 |
+| --- | --- | --- |
+| `fetch_recent_papers` | `_lookback_for_source("arxiv")` | aggregate（一次调用作用所有 9 个 cs.* 类目） |
+| `fetch_recent_posts` | `_lookback_for_source(source_name)` per feed in `FEEDS` | 每条 RSS feed 独立 |
+| `fetch_recent_sitemap_posts` | `_lookback_for_source(source.source_name)` per `SitemapSource` | 每条 sitemap 源独立 |
+| `fetch_trending_repos` | `_lookback_for_source("github")` | aggregate（一次调用作用所有 17 个关键词） |
+
+`run_ingestion(days_back=None)` 直接把 None 透传给所有 fetcher，每个 fetcher 自己计算窗口（log 里打 `days_back=per-source (cold-start aware)`）。`run_ingestion(days_back=N)` 显式 int 仍透传作 override（log 打 `days_back=N (explicit override)`），CI / 一次性 backfill 使用。
+
+**用户可见效果**：在 `kb/ingestion/rss.py::FEEDS` 里加一行新 RSS feed `("https://x.com/feed", "X Blog")`，或在 `kb/ingestion/sitemap_blog.py::SITEMAP_SOURCES` 里加一条新 `SitemapSource(source_name="...", ...)`，**下次 daily 跑下去会只对这一条 source_name 做 30 天 backfill**（DB 里没有该 source_name 的行 → 命中冷启动分支），其它成熟源继续走窄窗——不再被某条最近被刷的 feed / arxiv 把窗口拉成 1 天。
+
+**循环 import 规避**：`run.py` 在顶层 `from kb.ingestion.rss import ...` 等，4 个 fetcher 模块如果在顶层反向 `from kb.ingestion.run import _lookback_for_source` 会触发"partial module"错误。所有 4 个 fetcher 都用**函数体内的 lazy import**（仅在真的需要 per-source 计算时才执行），避开了模块加载时序问题。新增 fetcher 时务必沿用同款写法。
+
 ### 运维脚本（`kb/scripts/`）
 
 | 脚本 | 作用 |
@@ -309,14 +337,16 @@ POST /api/chat[/stream] {paper_id, query, history}
 
 ## 七、测试与质量
 
-测试套件已落地，详见 `backend/tests/README.md`。**~115 用例，<2 秒，无网络**。
+测试套件已落地，详见 `backend/tests/README.md`。**~180 用例，<10 秒，无网络**。
 
 | 测试文件 | 覆盖 |
 | --- | --- |
 | `conftest.py` | 隔离临时 SQLite、autouse `_init_db`、session 级 `client` |
 | `test_api_smoke.py` | 路由注册、404、参数校验、Bearer Token 守卫、质量门、universal sort fields、`top_overall`、LIKE 通配符转义、旧 RSS dict-categories 兼容、chat `paper_id` 模式 prompt 含全文 token + sources 仅含目标 paper / `paper_id` 不存在 → 404 / `history[]` 注入 prompt / role pattern 校验（system 拒绝 422）/ `history` `max_length=40` 上限、**`/api/chat/stream` 5 例（`_drain_sse` 辅助；happy path 事件序列 sources→token→done + sources 仅含目标 paper + token 累计 = 完整输出 + 全文 token 进 prompt；history 注入；paper_id 不存在 → 流开始前 HTTP 404；空输出 → 占位 `(LLM produced no output)`；system role → 流开始前 422）** |
 | `test_ingestion_arxiv.py` | 类目去重、cutoff、`save_papers` 幂等 |
-| `test_ingestion_rss.py` | bozo / cutoff / dedup / 多 feed 聚合 / tags 规范化 |
+| `test_ingestion_rss.py` | bozo / cutoff / dedup / 多 feed 聚合 / tags 规范化 / **per-feed 冷启动**（mature feed 1d 窗口丢弃 10d 老 entry，新 feed 30d 窗口保留） |
+| `test_ingestion_sitemap_blog.py` | `_parse_iso_datetime` 多格式 / `_parse_loose_datetime` 含 `April 29, 2026` LMSYS 风格 / `_parse_sitemap` 命名空间 + 损坏 XML / `_extract_meta` 双向属性顺序 + entity 解码 / `_build_post` 形状契约 / 端到端 happy path（命中 1 条 + 跳过索引页 + 跳过 off-prefix）/ sitemap 网络失败 → [] / 损坏 sitemap → [] / `<lastmod>` 早于 cutoff 的 URL **跳过 fetch**（流量预算）/ 单页失败不影响其它 / 缺 og:title 跳过 / sitemap 无 lastmod 但 `article:published_time` 早 → 二次 cutoff 跳过 / fallback published_date 至 sitemap lastmod / **per-source 冷启动**（mature `SitemapSource` 1d 窗口跳过 10d 老 URL 不发 GET，fresh `SitemapSource` 30d 窗口保留）。**全程 `_FakeClient` 替换 `httpx.Client`，零真实网络** |
+| `test_ingestion_run.py` | `_compute_days_back` 边界 + tz-naive 兼容、**`_lookback_for_source` 4 例（unknown source 走冷启动 / existing source 走 gap / 多 source 隔离 / `None` 等价 `_compute_days_back`）**、4 个 fetcher 同步 days_back 传播（默认 `None`，显式 int override 仍透传）|
 | `test_ingestion_github.py` | auth 头、403 短路、polite sleep |
 | `test_processing_llm.py` | provider 路由、`_clamp_score`、`_sanitize`、4 个 source_type rubric、质量门分桶、non-paper 永远 `is_processed=1`、paper 镜像到 legacy 字段、中文模式 prompt 注入、JSON 键必须英文、**`stream_llm` 5 例（路由到 `_STREAM_PROVIDERS[provider]`；mid-stream 异常被静默吞掉但保留已 yield 的 chunk；anthropic 路由；`_stream_hermes` 单 chunk fallback；`_call_hermes` 返空时 `_stream_hermes` 不 yield 空串）** |
 | `test_processing_embeddings.py` | 单例锁、ML 缺失时优雅降级 |
@@ -379,7 +409,8 @@ KB_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
 - **`/api/chat[/stream]` 突然 401？** 检查 `KB_CHAT_TOKEN` 是否在 `.env` 或宿主环境被设置；前端目前未携带该头，开启 token 后需要在 `frontend/src/lib/api.ts` 中追加。
 - **既存非论文行 `quality_score=0.0`？** 这是 universal scoring 之前 ingest 的行，跑一次 `python -m kb.scripts.rescore_non_papers --dry-run` 看清单，确认后去掉 `--dry-run` 即可回填。
 - **修改 `KB_LANGUAGE` 后已有数据没变？** 语言只影响"未来打分 / 未来日报"，已存进 SQLite 的 `summary` / `score_rationale` / `daily_reports.content` 不会自动重译；如需切换可手动 `UPDATE papers SET is_processed=0 WHERE ...` 触发重处理。**注意**：本轮起 `/api/chat[/stream]` 的 prompt 已硬编码为中文，**不再受 `KB_LANGUAGE` 控制**——切换 chat 输出语言需要直接改 `_build_chat_context` 模板。
-- **`run_daily_pipeline` 看到第一次跑了所有论文之后突然变慢？** 这就是冷启动机制——第二次起每次只处理 100 条；这是预期。
+- **`run_daily_pipeline` 看到第一次跑了所有论文之后突然变慢？** 这就是处理 / 嵌入冷启动机制——第二次起每次只处理 / 嵌入 100 条；这是预期（与 ingest 回看无关）。
+- **新加 RSS feed 后 daily 只抓到 0 篇？** 不会再发生。Per-source ingest 冷启动会探测到这个 `source_name` 在库里没有任何已入库行，下次 daily 自动给它 30 天 backfill（见 `_lookback_for_source`）。如果你之前手动跑过 `kb.ingestion.run --days-back 1` 已经种了一行就破坏了冷启动条件——清掉那行（`DELETE FROM papers WHERE source_name='...' AND ...`）让 source 重新进入冷启动状态，或显式 `python -m kb.ingestion.run --days-back 30` 兜底（注意：这是个 Python 模块，没有 `--days-back` CLI 参数，需手动改 `if __name__ == "__main__":` 调用或写一行临时脚本 `python -c "from kb.ingestion.run import run_ingestion; run_ingestion(days_back=30)"`）。
 - **聊天页随机 "Sorry, I couldn't process that query"？** 通常是 uvicorn keep-alive 与 Next 反代连接池的 ECONNRESET 竞态；已在 `Dockerfile` 与 `run_api.sh` 加 `--timeout-keep-alive 75` 修复。如果仍发生，检查中间是否还有别的反代（cpolar / nginx）也需同步调高 idle timeout，并确保未对 `text/event-stream` 做缓冲（响应头 `X-Accel-Buffering: no` 已加，但部分代理需要全局开关）。
 - **`/api/chat/stream` 返回 200 但前端没 token？** 排查链：① 查 `Network` 面板的 EventStream 视图看是否真有 `event: token` 帧到达；② 中间反代是否对 `text/event-stream` 做了 buffering（nginx 默认对 chunked response 缓冲）；③ provider 是否真的在 stream（hermes 一次性返回是预期的）；④ keep-alive 是否被 30 s 之类的极短 idle timeout 砍掉。
 - **source-anchored chat 抽出的全文是乱码？** 多半是 URL 指向 HTML 页面而非 PDF 但被 `_looks_like_pdf_url` 误判；扩白名单时务必 `.endswith(".pdf")` 或显式 substring，否则 pypdf 解析 HTML 会输出乱码并被缓存。需要时手动 `UPDATE papers SET full_text='' WHERE id=...` 清缓存。
@@ -417,7 +448,7 @@ backend/
    │  ├─ arxiv.py
    │  ├─ rss.py            # 11 源 + tag 规范化
    │  ├─ github_trending.py
-   │  └─ run.py            # _compute_days_back 自适应回看窗
+   │  └─ run.py            # _lookback_for_source per-source 冷启动 + run_ingestion 透传 None / int
    ├─ processing/
    │  ├─ llm.py            # provider 抽象（4 种）+ 4 rubric + 中英双语 + stream_llm + _stream_openai_compatible 公共体
    │  ├─ embeddings.py     # ChromaDB + sentence-transformers
@@ -437,4 +468,6 @@ backend/
 | 2026-04-25 16:50 | 质量门 | 新增 `KB_QUALITY_SCORE_THRESHOLD`（默认 7.0），`summarize_and_score` 落桶 `is_processed=1`/`2`/`0`；阈值用 `max(originality, impact)` 比较；`/api/papers` 与 `/api/papers/search` 默认仅返 `is_processed=1`；`/api/stats` 拆三档；新增 8 个测试覆盖分桶逻辑 |
 | 2026-05-02 08:57:04 | 增量刷新 | ① Universal Score Axes（4 rubrics + paper legacy 镜像 + universal sort + top_overall）② 中文 LLM 输出 `KB_LANGUAGE` ③ Docker 镜像 + compose ④ 自适应 ingest 回看窗 ⑤ 冷启动批处理 ⑥ 运维脚本 `rescore_non_papers.py` ⑦ RSS 源精简到 11 个 ⑧ schemas `categories` field_validator |
 | 2026-05-02 20:12:04 | 增量刷新 | ① `/api/chat` 多轮 + source-anchored 双模式：`schemas.ChatMessage` (`role` ∈ {user, assistant})；`ChatRequest.paper_id: int \| None` + `history: list[ChatMessage]`（`max_length=40`）；`main.py::_format_history`（`_HISTORY_TURN_CAP=12`，单条 4 000 字符 cap）；`paper_id` 模式跳过 RAG，调 `fetch_full_text` 拼 prompt（≤60 000 字符），`sources` 仅返该 paper，缺失 → 404。② `kb/processing/pdf.py`（新）：`fetch_full_text(paper_id)` — `httpx.Client.stream` 流式下载（20 MB / 30 s 上限）→ `pypdf.PdfReader` 抽取 → `[:120 000]` 截断写回 `Paper.full_text`；非 PDF URL → `summary + abstract` fallback **且不写库**；`Paper.full_text` 列加入 `_BACKCOMPAT_COLUMNS`；`pypdf>=5.0` 提为默认依赖。③ uvicorn keep-alive：`Dockerfile.CMD` 与 `run_api.sh` 都加 `--timeout-keep-alive 75`，修复 Next 反代 ECONNRESET 竞态。④ 测试：新增 `tests/test_processing_pdf.py`（5 例），`test_api_smoke.py` 加 5 例 chat-mode；套件 ~95 → ~105。 |
-| **2026-05-02 21:18:53** | **增量刷新** | ① **`/api/chat/stream` SSE 端点（新）**（`kb/main.py`）：返回 `text/event-stream`，事件序列固定 `sources → token... → done`，可选 `error`；token 流空时发占位 `(LLM produced no output)`；header `Cache-Control: no-cache` + `X-Accel-Buffering: no`；**与 `/api/chat` 共享 `verify_chat_token` 守卫与新抽出的 `_build_chat_context(req, db) -> (prompt, sources)`**——HTTPException（如 paper_id 404）必须在 `event_stream()` 之外抛出，让客户端见到正常 HTTP 错误而非空 SSE。新增 `_sse_event(event, data)` helper（`json.dumps(..., ensure_ascii=False)` 保中文紧凑）。② **`stream_llm` 抽象（新）**（`kb/processing/llm.py`）：与 `call_llm` 平行的公开 API；`_STREAM_PROVIDERS = {hermes, anthropic, openai, deepseek}`；任何 provider 失败静默 `return`（generator 结束，从不 raise，对齐 `call_llm` 的空字符串契约）。`_stream_anthropic` 走 `client.messages.stream(...).text_stream`；新抽出 `_stream_openai_compatible(api_key, model, base_url=None)` 公共体被 `_stream_openai` 与 `_stream_deepseek` 复用（`stream=True` + `chunk.choices[0].delta.content`）；`_stream_hermes` 因子进程不能真正流式，实现为"调 `_call_hermes` 拿全文 → yield 单 chunk（空字符串则不 yield）"。③ **Chat 系统 prompt 改为中文硬编码**（`_build_chat_context`）：从英文 "You are an expert GPGPU chip architect ..." 改成 "你是一名资深的 GPGPU 芯片架构助理 ..."，结尾"请用简体中文作答"。**`KB_LANGUAGE` 不再影响 chat prompt（仅影响 summarization / scoring / reports）**；要回退英文需直接改模板。④ **`backend/Dockerfile` / `backend/run_api.sh`** 内容相对上轮无新 delta（`--timeout-keep-alive 75` 已在位），但本轮 SSE 长连接对其依赖性更强，Dockerfile 注释新增 ECONNRESET 竞态背景说明（uvicorn 5 s 默认 vs Next fetch agent 连接池）。⑤ **测试**：`test_api_smoke.py` 加 5 例 SSE（`_drain_sse` 辅助 + happy path 事件序列校验 + history 注入 + 404 在流开始前抛 + 空输出占位 + system role 422）；`test_processing_llm.py` 加 5 例 streaming（路由 / 异常静默吞掉但保留已 yield chunk / anthropic 路由 / hermes fallback / hermes 空时不 yield）。套件 ~105 → ~115。所有 delta 已通过直接读取 `kb/main.py` / `kb/processing/llm.py` / `tests/test_api_smoke.py` / `tests/test_processing_llm.py` / `Dockerfile` / `run_api.sh` 源码核对。 |
+| 2026-05-02 21:18:53 | 增量刷新 | ① **`/api/chat/stream` SSE 端点（新）**（`kb/main.py`）：返回 `text/event-stream`，事件序列固定 `sources → token... → done`，可选 `error`；token 流空时发占位 `(LLM produced no output)`；header `Cache-Control: no-cache` + `X-Accel-Buffering: no`；**与 `/api/chat` 共享 `verify_chat_token` 守卫与新抽出的 `_build_chat_context(req, db) -> (prompt, sources)`**——HTTPException（如 paper_id 404）必须在 `event_stream()` 之外抛出，让客户端见到正常 HTTP 错误而非空 SSE。新增 `_sse_event(event, data)` helper（`json.dumps(..., ensure_ascii=False)` 保中文紧凑）。② **`stream_llm` 抽象（新）**（`kb/processing/llm.py`）：与 `call_llm` 平行的公开 API；`_STREAM_PROVIDERS = {hermes, anthropic, openai, deepseek}`；任何 provider 失败静默 `return`（generator 结束，从不 raise，对齐 `call_llm` 的空字符串契约）。`_stream_anthropic` 走 `client.messages.stream(...).text_stream`；新抽出 `_stream_openai_compatible(api_key, model, base_url=None)` 公共体被 `_stream_openai` 与 `_stream_deepseek` 复用（`stream=True` + `chunk.choices[0].delta.content`）；`_stream_hermes` 因子进程不能真正流式，实现为"调 `_call_hermes` 拿全文 → yield 单 chunk（空字符串则不 yield）"。③ **Chat 系统 prompt 改为中文硬编码**（`_build_chat_context`）：从英文 "You are an expert GPGPU chip architect ..." 改成 "你是一名资深的 GPGPU 芯片架构助理 ..."，结尾"请用简体中文作答"。**`KB_LANGUAGE` 不再影响 chat prompt（仅影响 summarization / scoring / reports）**；要回退英文需直接改模板。④ **`backend/Dockerfile` / `backend/run_api.sh`** 内容相对上轮无新 delta（`--timeout-keep-alive 75` 已在位），但本轮 SSE 长连接对其依赖性更强，Dockerfile 注释新增 ECONNRESET 竞态背景说明（uvicorn 5 s 默认 vs Next fetch agent 连接池）。⑤ **测试**：`test_api_smoke.py` 加 5 例 SSE（`_drain_sse` 辅助 + happy path 事件序列校验 + history 注入 + 404 在流开始前抛 + 空输出占位 + system role 422）；`test_processing_llm.py` 加 5 例 streaming（路由 / 异常静默吞掉但保留已 yield chunk / anthropic 路由 / hermes fallback / hermes 空时不 yield）。套件 ~105 → ~115。所有 delta 已通过直接读取 `kb/main.py` / `kb/processing/llm.py` / `tests/test_api_smoke.py` / `tests/test_processing_llm.py` / `Dockerfile` / `run_api.sh` 源码核对。 |
+| 2026-05-02 23:32:00 | 增量刷新 | 新增博客来源（vLLM Blog 进 RSS FEEDS / LMSYS · SGLang Blog 走 sitemap-driven scraper）+ 新模块 `kb/ingestion/sitemap_blog.py`（`SitemapSource` dataclass + sitemap.xml 解析 + per-page og:* meta 抽取 + 60 篇/源 上限）+ `kb/ingestion/run.py` 编排独立 stage `results["sitemap_blogs"]` + 30 例左右 sitemap_blog 单元测试 + orchestrator 测试升级到 4 fetcher。套件 ~115 → 174 pass。 |
+| **2026-05-03 09:44:00** | **增量刷新** | **Per-`source_name` ingest 冷启动**。① **`kb/ingestion/run.py`**：新增 `_lookback_for_source(source_name: str \| None)`（带可选 `WHERE Paper.source_name = :name` 过滤），与 `_compute_days_back` 共用 clamp 逻辑；该 source_name 下 MAX(ingested_date) 为 NULL → `settings.ingest_empty_db_days`（30）走冷启动。`_compute_days_back()` 退化为 `_lookback_for_source(None)` 薄包装。`run_ingestion(days_back: int \| None)` 不再在顶部统一算一次——直接透传 None / int 给 4 个 fetcher，每个自己决定窗口；日志区分 `per-source (cold-start aware)` 与 `explicit override`。② **fetcher 签名统一为 `days_back: int \| None`**：`fetch_recent_papers` 调 `_lookback_for_source("arxiv")`、`fetch_trending_repos` 调 `_lookback_for_source("github")`（aggregate `source_name`，行为与今天一致）；`fetch_recent_posts` 在 `for feed_url, source_name in FEEDS` 循环里 per-feed 调用（每条 feed 独立打 `[rss] X: lookback=Yd`）；`fetch_recent_sitemap_posts` 在 `for source in SITEMAP_SOURCES` 循环里 per-`SitemapSource` 调用。**4 个 fetcher 都用函数体内的 lazy import 取 `_lookback_for_source`** 避开 run.py ↔ 4 个 fetcher 模块的双向 top-level import 顺序问题。③ **效果**：在 `FEEDS` 加新 feed 或 `SITEMAP_SOURCES` 加新源后，下次 daily 自动只对那条新 source_name 做 30 天 backfill。④ **测试**：`test_ingestion_run.py` `_seed_paper` 加 `source_name` 形参；新增 4 例 `_lookback_for_source` 单元（unknown source 走冷启动 / existing source 走 gap / 多 source 隔离 / `None` 等价 `_compute_days_back`）；`_spy_run_ingestion` 改捕 `int \| None`；`test_run_ingestion_propagates_cold_start_window_to_all_sources` → `test_run_ingestion_default_propagates_none_to_all_sources`（断言 4 fetcher 都收 None）；override 测试不变。`test_ingestion_rss.py` 加 `test_per_feed_cold_start_when_days_back_is_none`（mature feed 1d 窗口丢弃 10d 老 entry / fresh feed 30d 窗口保留）。`test_ingestion_sitemap_blog.py` 加 `test_per_source_cold_start_when_days_back_is_none`（mature `SitemapSource` per-source pre-filter 阻止 GET / fresh `SitemapSource` 保留）。⑤ **测试套件 174 → 180 pass**（`pytest tests/ -q` 离线 6.6s）。⑥ **`daily.py::_is_cold_start` / `_is_embedding_cold_start`** 不动（处理 / 嵌入批冷启动是不同维度）；`KB_INGEST_*` config 沿用；API / 前端 / DB / migration 不动。⑦ **CLAUDE.md** 同步：第三章 fetcher 表更新；第六章新增"Per-Source ingest 冷启动"段落详述 4 fetcher 粒度矩阵 + lazy import 规避循环；测试表加新覆盖；变更记录新增本条目。所有 delta 已通过直接读取 `kb/ingestion/run.py` / `kb/ingestion/rss.py` / `kb/ingestion/sitemap_blog.py` / `kb/ingestion/arxiv.py` / `kb/ingestion/github_trending.py` / `tests/test_ingestion_run.py` / `tests/test_ingestion_rss.py` / `tests/test_ingestion_sitemap_blog.py` 源码核对。 |

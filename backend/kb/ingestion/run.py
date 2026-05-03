@@ -9,22 +9,39 @@ from kb.config import settings
 from kb.database import SessionLocal
 from kb.ingestion.arxiv import fetch_recent_papers, save_papers
 from kb.ingestion.rss import fetch_recent_posts, save_posts
+from kb.ingestion.sitemap_blog import fetch_recent_sitemap_posts
 from kb.ingestion.github_trending import fetch_trending_repos, save_repos
 from kb.models import Paper
 
 logger = logging.getLogger(__name__)
 
 
-def _compute_days_back() -> int:
-    """Pick a lookback window. Empty DB → cold-start backfill; otherwise the
-    gap since the most recent ingested_date, clamped to [min, max].
+def _lookback_for_source(source_name: str | None) -> int:
+    """Pick a lookback window for a single source (or the whole table).
 
-    All three bounds come from `kb.config.settings` (KB_INGEST_*) so operators
-    can tune the cold-start window or relax the cap for big backfills.
+    Empty source (no rows with that `source_name`) → cold-start backfill of
+    `settings.ingest_empty_db_days`; otherwise the gap since
+    `MAX(Paper.ingested_date)` for that source, clamped to
+    `[ingest_gap_min_days, ingest_gap_max_days]`.
+
+    Passing `source_name=None` skips the filter and returns the legacy
+    "global" window — useful for the back-compat `_compute_days_back`
+    wrapper. Per-source filtering is what makes adding a new feed /
+    sitemap source automatically trigger a 30-day backfill on its first
+    daily run: no rows with the new `source_name` exist yet, so MAX(...)
+    is NULL and we fall through to the cold-start branch — even when
+    other long-running sources have very recent rows.
+
+    All three bounds come from `kb.config.settings` (KB_INGEST_*) so
+    operators can tune the cold-start window or relax the cap for big
+    backfills.
     """
     db = SessionLocal()
     try:
-        last = db.query(func.max(Paper.ingested_date)).scalar()
+        q = db.query(func.max(Paper.ingested_date))
+        if source_name is not None:
+            q = q.filter(Paper.source_name == source_name)
+        last = q.scalar()
     finally:
         db.close()
 
@@ -40,17 +57,30 @@ def _compute_days_back() -> int:
     )
 
 
+def _compute_days_back() -> int:
+    """Legacy global lookback (no source filter). Kept as a thin wrapper
+    around `_lookback_for_source(None)` so existing callers / tests that
+    rely on the "any source" semantics continue to work.
+    """
+    return _lookback_for_source(None)
+
+
 def run_ingestion(days_back: int | None = None) -> dict[str, int]:
     """Run all ingestion sources. Returns counts.
 
-    When `days_back` is None, the orchestrator picks a value based on
-    `MAX(Paper.ingested_date)` so the lookback window automatically
-    matches the time since the last successful run. Pass an explicit
-    integer to override (useful for tests and one-off backfills).
+    When `days_back` is None, each fetcher computes its own lookback per
+    `Paper.source_name` (see `_lookback_for_source`). Adding a new RSS
+    feed or sitemap source therefore auto-triggers a 30-day backfill for
+    that specific source on the next run, while mature sources keep
+    their narrow gap-based window.
+
+    Pass an explicit integer to override every source uniformly — useful
+    for tests and one-off backfills.
     """
     if days_back is None:
-        days_back = _compute_days_back()
-    logger.info("[ingestion] days_back=%d", days_back)
+        logger.info("[ingestion] days_back=per-source (cold-start aware)")
+    else:
+        logger.info("[ingestion] days_back=%d (explicit override)", days_back)
 
     results: dict[str, int] = {}
 
@@ -71,6 +101,19 @@ def run_ingestion(days_back: int | None = None) -> dict[str, int]:
         logger.exception("[ingestion] rss stage failed")
         results["blogs"] = 0
     logger.info("[ingestion]   %d new posts", results["blogs"])
+
+    # Sitemap-driven blog sources (sites with no native RSS, e.g. LMSYS / SGLang).
+    # Kept as a separate stage with its own try/except so a flaky scraper
+    # can't poison the RSS counts above. Reuses save_posts + Paper.url
+    # uniqueness for dedup.
+    logger.info("[ingestion] Fetching sitemap-based blog posts...")
+    try:
+        sitemap_posts = fetch_recent_sitemap_posts(days_back=days_back)
+        results["sitemap_blogs"] = save_posts(sitemap_posts)
+    except Exception:
+        logger.exception("[ingestion] sitemap_blog stage failed")
+        results["sitemap_blogs"] = 0
+    logger.info("[ingestion]   %d new posts", results["sitemap_blogs"])
 
     logger.info("[ingestion] Fetching GitHub repos...")
     try:
