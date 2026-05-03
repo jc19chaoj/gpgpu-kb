@@ -104,3 +104,19 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=settings.chat_query_max_len)
     top_k: int = Field(10, ge=1, le=settings.chat_top_k_max)
     semantic: bool = True
+
+
+class SourceItem(BaseModel):
+    """One distinct (source_name, source_type) bucket with its row count.
+
+    Surfaces what `source_name` values exist in the knowledge base so the
+    frontend can render filter tags without hardcoding the RSS / sitemap
+    source list. Only `is_processed=1` rows are counted.
+    """
+    name: str
+    type: str  # mirrors SourceType enum value: "paper" | "blog" | "project" | "talk"
+    count: int
+
+
+class SourcesOut(BaseModel):
+    sources: list[SourceItem]
