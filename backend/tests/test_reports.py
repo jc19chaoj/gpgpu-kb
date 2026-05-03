@@ -232,7 +232,7 @@ def test_report_prompt_includes_chinese_instruction_zh(monkeypatch):
 
     captured_prompts = []
 
-    def _capture_llm(prompt):
+    def _capture_llm(prompt, **kwargs):
         captured_prompts.append(prompt)
         return "## 报告\n内容"
 
@@ -301,7 +301,7 @@ def test_report_includes_non_paper_rows():
 
     captured: list[str] = []
 
-    def _capture(prompt):
+    def _capture(prompt, **kwargs):
         captured.append(prompt)
         return "## Report\nContent."
 

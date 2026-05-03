@@ -53,10 +53,19 @@ def _resolve_role(role: str) -> tuple[str, str | None]:
 # lets the expert role swap in a different model name without needing
 # a parallel set of `*_expert_model` fields per provider.
 
-def _call_hermes(prompt: str, *, model: str | None = None) -> str:
-    # Hermes CLI has no --model flag; the override is accepted for API
-    # symmetry but ignored. A custom expert model under hermes would
-    # require changing the local hermes config.
+# Default per-call output cap. Set generously so daily reports / chat /
+# summarization can all run to completion without being chopped off mid-
+# sentence. Anthropic *requires* `max_tokens` so we always pass one;
+# OpenAI / DeepSeek treat it as an upper bound (they stop as soon as the
+# model is done), so a high default is harmless for short outputs. Stays
+# within claude-sonnet-4's standard output ceiling.
+_DEFAULT_MAX_TOKENS = 16000
+
+
+def _call_hermes(prompt: str, *, model: str | None = None, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
+    # Hermes CLI has no --model or --max-tokens flag; both overrides are
+    # accepted for API symmetry but ignored. A custom expert model under
+    # hermes would require changing the local hermes config.
     try:
         result = subprocess.run(
             ["hermes", "ask", "--prompt", prompt, "--quiet", "--skip-context-files"],
@@ -75,7 +84,7 @@ def _call_hermes(prompt: str, *, model: str | None = None) -> str:
     return result.stdout.strip()
 
 
-def _call_anthropic(prompt: str, *, model: str | None = None) -> str:
+def _call_anthropic(prompt: str, *, model: str | None = None, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
     if not settings.anthropic_api_key:
         logger.error("KB_LLM_PROVIDER=anthropic but no ANTHROPIC_API_KEY is set")
         return ""
@@ -87,14 +96,14 @@ def _call_anthropic(prompt: str, *, model: str | None = None) -> str:
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     msg = client.messages.create(
         model=model or settings.anthropic_model,
-        max_tokens=2048,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
     parts = [b.text for b in msg.content if getattr(b, "type", "") == "text"]
     return "".join(parts).strip()
 
 
-def _call_openai(prompt: str, *, model: str | None = None) -> str:
+def _call_openai(prompt: str, *, model: str | None = None, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
     if not settings.openai_api_key:
         logger.error("KB_LLM_PROVIDER=openai but no OPENAI_API_KEY is set")
         return ""
@@ -107,12 +116,12 @@ def _call_openai(prompt: str, *, model: str | None = None) -> str:
     resp = client.chat.completions.create(
         model=model or settings.openai_model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2048,
+        max_tokens=max_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
 
 
-def _call_deepseek(prompt: str, *, model: str | None = None) -> str:
+def _call_deepseek(prompt: str, *, model: str | None = None, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
     if not settings.deepseek_api_key:
         logger.error("KB_LLM_PROVIDER=deepseek but no DEEPSEEK_API_KEY is set")
         return ""
@@ -128,7 +137,7 @@ def _call_deepseek(prompt: str, *, model: str | None = None) -> str:
     resp = client.chat.completions.create(
         model=model or settings.deepseek_model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2048,
+        max_tokens=max_tokens,
         timeout=settings.llm_timeout_seconds,
     )
     return (resp.choices[0].message.content or "").strip()
@@ -142,11 +151,20 @@ _PROVIDERS = {
 }
 
 
-def call_llm(prompt: str, role: str = "fast") -> str:
+def call_llm(
+    prompt: str,
+    role: str = "fast",
+    *,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
+) -> str:
     """Public LLM call. Picks provider + model via role.
 
     - role="fast"   (default): summarization / scoring / reports.
     - role="expert"         : /api/chat & /api/chat/stream.
+    - max_tokens             : per-call output budget. Defaults to
+                               _DEFAULT_MAX_TOKENS (16000). Callers can
+                               override per-call if they want a tighter
+                               or looser cap.
 
     See `_resolve_role` for how expert overlays onto fast.
     """
@@ -159,7 +177,7 @@ def call_llm(prompt: str, role: str = "fast") -> str:
         )
         provider = _call_hermes
     try:
-        return provider(prompt, model=model_override)
+        return provider(prompt, model=model_override, max_tokens=max_tokens)
     except Exception:
         logger.exception("LLM provider %s raised (role=%s)", provider_name, role)
         return ""

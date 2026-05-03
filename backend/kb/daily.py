@@ -43,9 +43,10 @@ def _is_cold_start() -> bool:
 def _is_embedding_cold_start() -> bool:
     """True if no processed paper has been embedded yet.
 
-    Mirrors `_is_cold_start` but for the embedding stage: on the first run
-    that produces a large batch of `is_processed=1` papers, we want to
-    drain the whole backlog instead of capping at 100.
+    Kept for logging / observability only — the embedding stage no longer
+    applies a per-run cap (operator preference is to always drain the
+    entire `is_processed=1 AND chroma_id=""` backlog), so cold-start
+    detection is informational.
     """
     db = SessionLocal()
     try:
@@ -94,10 +95,11 @@ def run_daily_pipeline() -> None:
 
     print(_t("\n[3/4] EMBEDDING", "\n[3/4] 向量化"))
     embed_cold_start = _is_embedding_cold_start()
-    embed_batch = None if embed_cold_start else 100
     if embed_cold_start:
         logger.info("[embedding] cold start detected — indexing entire backlog")
-    indexed = index_unindexed_papers(batch_size=embed_batch)
+    else:
+        logger.info("[embedding] indexing entire pending backlog (no cap)")
+    indexed = index_unindexed_papers(batch_size=None)
 
     print(_t("\n[4/4] DAILY REPORT", "\n[4/4] 每日简报"))
     generate_daily_report()

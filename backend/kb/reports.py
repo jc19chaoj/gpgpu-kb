@@ -76,13 +76,13 @@ def generate_daily_report(date: datetime.date | None = None) -> DailyReport:
             return report
 
         paper_summaries = []
-        for p in papers[:15]:
+        for p in papers:
             paper_summaries.append(
                 f"### {p.title}\n"
                 f"*Authors:* {', '.join((p.authors or [])[:5])}\n"
                 f"*Type:* {p.source_type} | *Source:* {p.source_name}\n"
                 f"{_score_line(p)}\n"
-                f"*Summary:* {(p.summary or '')[:500]}\n"
+                f"*Summary:* {p.summary or ''}\n"
             )
 
         context = "\n\n".join(paper_summaries)
@@ -117,7 +117,7 @@ Write a professional, technical report. No fluff. Keep it concise but informativ
 
         content = call_llm(prompt) or "(LLM produced no output)"
         report = _upsert_report(
-            db, existing, start, date, content, [p.id for p in papers[:15]]
+            db, existing, start, date, content, [p.id for p in papers]
         )
         logger.info("[reports] Generated report for %s: %d papers covered", date.isoformat(), len(papers))
         return report

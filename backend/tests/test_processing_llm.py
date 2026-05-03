@@ -19,7 +19,9 @@ def test_call_llm_uses_hermes_by_default(monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider", "hermes")
     monkeypatch.setitem(llm_mod._PROVIDERS, "hermes", mock_h)
     result = llm_mod.call_llm("test prompt")
-    mock_h.assert_called_once_with("test prompt", model=None)
+    mock_h.assert_called_once_with(
+        "test prompt", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
     assert result == "hermes response"
 
 
@@ -31,7 +33,9 @@ def test_call_llm_routes_to_anthropic(monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider", "anthropic")
     monkeypatch.setitem(llm_mod._PROVIDERS, "anthropic", mock_a)
     result = llm_mod.call_llm("test prompt")
-    mock_a.assert_called_once_with("test prompt", model=None)
+    mock_a.assert_called_once_with(
+        "test prompt", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
     assert result == "anthropic response"
 
 
@@ -43,7 +47,9 @@ def test_call_llm_routes_to_openai(monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider", "openai")
     monkeypatch.setitem(llm_mod._PROVIDERS, "openai", mock_o)
     result = llm_mod.call_llm("test prompt")
-    mock_o.assert_called_once_with("test prompt", model=None)
+    mock_o.assert_called_once_with(
+        "test prompt", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
     assert result == "openai response"
 
 
@@ -55,7 +61,9 @@ def test_call_llm_unknown_provider_falls_back_to_hermes(monkeypatch):
     with patch.object(llm_mod, "_call_hermes", return_value="fallback") as mock_h:
         # Also remove "nonexistent" from _PROVIDERS in case it was added
         result = llm_mod.call_llm("test prompt")
-    mock_h.assert_called_once_with("test prompt", model=None)
+    mock_h.assert_called_once_with(
+        "test prompt", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
     assert result == "fallback"
 
 
@@ -872,7 +880,9 @@ def test_call_llm_expert_uses_expert_provider(monkeypatch):
     result = llm_mod.call_llm("p", role="expert")
 
     assert result == "expert-response"
-    mock_expert.assert_called_once_with("p", model=None)
+    mock_expert.assert_called_once_with(
+        "p", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
     mock_fast.assert_not_called()
 
 
@@ -890,7 +900,9 @@ def test_call_llm_expert_falls_back_to_fast_when_unset(monkeypatch):
     result = llm_mod.call_llm("p", role="expert")
 
     assert result == "fast-response"
-    mock_fast.assert_called_once_with("p", model=None)
+    mock_fast.assert_called_once_with(
+        "p", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
 
 
 def test_call_llm_expert_model_override_passed_to_provider(monkeypatch):
@@ -907,7 +919,9 @@ def test_call_llm_expert_model_override_passed_to_provider(monkeypatch):
 
     llm_mod.call_llm("p", role="expert")
 
-    mock_expert.assert_called_once_with("p", model="deepseek-reasoner")
+    mock_expert.assert_called_once_with(
+        "p", model="deepseek-reasoner", max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
 
 
 def test_call_llm_fast_role_ignores_expert_model(monkeypatch):
@@ -925,7 +939,9 @@ def test_call_llm_fast_role_ignores_expert_model(monkeypatch):
     # Default role is "fast"
     llm_mod.call_llm("p")
 
-    mock_fast.assert_called_once_with("p", model=None)
+    mock_fast.assert_called_once_with(
+        "p", model=None, max_tokens=llm_mod._DEFAULT_MAX_TOKENS,
+    )
 
 
 def test_stream_llm_expert_uses_expert_provider(monkeypatch):
