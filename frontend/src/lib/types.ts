@@ -107,3 +107,16 @@ export interface Stats {
     relevance_score: number;
   }[];
 }
+
+// Distinct source_name bucket from GET /api/sources. Surfaces what source
+// values exist in the knowledge base so the browse page can render filter
+// tags without hardcoding the (growing) RSS / sitemap source list.
+export interface Source {
+  name: string;
+  type: string; // "paper" | "blog" | "project" | "talk"
+  count: number;
+}
+
+export interface SourcesResponse {
+  sources: Source[];
+}
