@@ -72,6 +72,28 @@ export type ChatStreamEvent =
   | { type: "error"; message: string }
   | { type: "done" };
 
+// Daily pipeline status (snapshot from GET /api/daily/status). Used by the
+// /reports page to render the right initial button state on page load —
+// crucially, a refresh while a run is in-flight should show "running" not
+// "idle".
+export interface DailyStatus {
+  running: boolean;
+  started_at: string | null;
+  current_stage: DailyStageName | null;
+}
+
+export type DailyStageName = "ingestion" | "processing" | "embedding" | "report";
+
+// SSE events emitted by /api/daily/stream. Mirrors backend `_sse_event(...)`
+// in kb/main.py::daily_stream. Adding a new event variant requires updating
+// both sides + `_parseDailyFrame` in lib/api.ts.
+export type DailyStreamEvent =
+  | { type: "started"; started_at: string }
+  | { type: "stage"; index: 1 | 2 | 3 | 4; name: DailyStageName }
+  | { type: "log"; line: string }
+  | { type: "error"; message: string }
+  | { type: "done" };
+
 export interface Stats {
   total_papers: number;
   processed: number;

@@ -14,11 +14,12 @@ from kb.reports import generate_daily_report
 
 logger = logging.getLogger(__name__)
 
-# Per-run cap once the backlog has been worked through at least once.
-# Cold-start runs (nothing has been scored yet) ignore the cap so blog/repo
-# items aren't starved by the 382-deep ArXiv prefix in the is_processed=0
-# queue.
-_PROCESSING_BATCH_SIZE: int = 100
+# Per-run cap for the processing stage.
+# Set to None to drain the entire `is_processed=0` backlog every run (no cap).
+# Historically capped at 100 to bound API spend; operator preference is now to
+# always run to completion. Cold-start detection still works the same way and
+# becomes a no-op since both branches now use None.
+_PROCESSING_BATCH_SIZE: int | None = None
 
 
 def _t(en: str, zh: str) -> str:
@@ -77,6 +78,18 @@ def run_daily_pipeline() -> None:
     batch_size = None if cold_start else _PROCESSING_BATCH_SIZE
     if cold_start:
         logger.info("[processing] cold start detected — processing entire backlog")
+
+    db = SessionLocal()
+    try:
+        pending_count = db.query(Paper).filter(Paper.is_processed == 0).count()
+    finally:
+        db.close()
+    cap_label = "no cap" if batch_size is None else str(batch_size)
+    logger.info(
+        "[processing] %d papers pending in queue (cold_start=%s, cap=%s)",
+        pending_count, cold_start, cap_label,
+    )
+
     processed = run_processing(batch_size=batch_size)
 
     print(_t("\n[3/4] EMBEDDING", "\n[3/4] 向量化"))

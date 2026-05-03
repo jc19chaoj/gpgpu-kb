@@ -615,3 +615,229 @@ def test_chat_stream_history_role_validated(client):
         {"query": "hi", "history": [{"role": "system", "content": "rogue"}]},
     )
     assert status == 422
+
+
+# ─── Daily pipeline (manual trigger + SSE progress) ──────────────
+
+
+def _drain_daily_sse(client) -> tuple[int, str, list[tuple[str, dict]]]:
+    """POST /api/daily/stream and parse the SSE body. Mirrors _drain_sse
+    but for the daily endpoint (which takes an empty JSON body)."""
+    import json as _json
+
+    with client.stream("POST", "/api/daily/stream", json={}) as r:
+        st = r.status_code
+        ct = r.headers.get("content-type", "")
+        if st != 200:
+            "".join(r.iter_text())
+            return st, ct, []
+        body = "".join(r.iter_text())
+
+    frames: list[tuple[str, dict]] = []
+    for raw in body.split("\n\n"):
+        if not raw.strip():
+            continue
+        # Skip SSE comment frames (": keepalive").
+        if all(line.startswith(":") or not line for line in raw.split("\n")):
+            continue
+        ev = ""
+        data = ""
+        for line in raw.split("\n"):
+            if line.startswith("event:"):
+                ev = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data += line[len("data:"):].strip()
+        if ev:
+            frames.append((ev, _json.loads(data) if data else {}))
+    return st, ct, frames
+
+
+def _patch_daily(monkeypatch, fake_pipeline):
+    """Replace `kb.daily.run_daily_pipeline` for the duration of one test.
+
+    The worker thread does `from kb.daily import run_daily_pipeline` *inside*
+    its body so the import happens after the patch is applied — patching
+    via setattr on the module is therefore enough."""
+    from kb import daily as daily_mod
+
+    monkeypatch.setattr(daily_mod, "run_daily_pipeline", fake_pipeline)
+
+
+def _reset_daily_state():
+    """Force-clear the daily run singleton between tests so 409s from one
+    test don't leak into the next. The session-scoped TestClient shares the
+    app instance with all tests."""
+    from kb.main import _daily_state
+
+    # Purposely bypass the public end() so we also drop a stale Queue if a
+    # previous test crashed mid-run.
+    with _daily_state._lock:
+        _daily_state._running = False
+        _daily_state._started_at = None
+        _daily_state._current_stage = None
+        _daily_state._queue = None
+
+
+def test_daily_status_idle_by_default(client):
+    _reset_daily_state()
+    r = client.get("/api/daily/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"running": False, "started_at": None, "current_stage": None}
+
+
+def test_daily_stream_emits_started_stages_and_done(client, monkeypatch):
+    """Happy path: a fake pipeline that prints the same stage banners as
+    kb/daily.py drives a full sequence of started → 4 stages → done."""
+    _reset_daily_state()
+
+    def _fake_pipeline():
+        # Match the prefix kb/daily.py prints — _STAGE_PATTERN keys off [N/4].
+        print("[1/4] INGESTION")
+        print("[2/4] PROCESSING")
+        print("[3/4] EMBEDDING")
+        print("[4/4] DAILY REPORT")
+        print("Pipeline complete!")
+
+    _patch_daily(monkeypatch, _fake_pipeline)
+
+    status_code, ct, frames = _drain_daily_sse(client)
+    assert status_code == 200
+    assert "text/event-stream" in ct
+
+    events = [name for name, _ in frames]
+    assert events[0] == "started"
+    assert events[-1] == "done"
+
+    # Exactly one stage event per [N/4] header, in order, even though log
+    # events are interleaved.
+    stages = [d for n, d in frames if n == "stage"]
+    assert [s["index"] for s in stages] == [1, 2, 3, 4]
+    assert [s["name"] for s in stages] == ["ingestion", "processing", "embedding", "report"]
+
+    # The banner lines should also have made it through as `log` events.
+    log_lines = [d["line"] for n, d in frames if n == "log"]
+    assert any("INGESTION" in line for line in log_lines)
+    assert any("Pipeline complete!" in line for line in log_lines)
+
+
+def test_daily_stream_concurrent_returns_409(client, monkeypatch):
+    """A second POST while a run is in flight must return HTTP 409 — the
+    first run owns the singleton lock."""
+    _reset_daily_state()
+
+    import threading
+    release = threading.Event()
+    started = threading.Event()
+
+    def _fake_pipeline():
+        started.set()
+        # Hold the worker open until the test releases it.
+        release.wait(timeout=5)
+
+    _patch_daily(monkeypatch, _fake_pipeline)
+
+    # Start the first run in a background thread so we can poke the API
+    # while it's still in-flight.
+    first_result: dict[str, object] = {}
+
+    def _drain_first():
+        try:
+            first_result["status"], _, first_result["frames"] = _drain_daily_sse(client)
+        finally:
+            release.set()
+
+    t = threading.Thread(target=_drain_first, daemon=True)
+    t.start()
+    try:
+        # Wait until the worker has actually started so the lock is held.
+        assert started.wait(timeout=5), "fake pipeline did not start"
+
+        # Status must reflect the in-flight run.
+        st = client.get("/api/daily/status")
+        assert st.status_code == 200
+        assert st.json()["running"] is True
+
+        # Second POST must conflict.
+        with client.stream("POST", "/api/daily/stream", json={}) as r:
+            assert r.status_code == 409
+            "".join(r.iter_text())
+    finally:
+        release.set()
+        t.join(timeout=10)
+
+    # The first stream still completes cleanly.
+    assert first_result.get("status") == 200
+
+
+def test_daily_stream_pipeline_exception_emits_error(client, monkeypatch):
+    """If the pipeline raises, the stream must surface an `error` frame
+    (and NOT a `done` frame) before the terminator."""
+    _reset_daily_state()
+
+    def _fake_pipeline():
+        raise RuntimeError("boom from fake pipeline")
+
+    _patch_daily(monkeypatch, _fake_pipeline)
+
+    status_code, _, frames = _drain_daily_sse(client)
+    assert status_code == 200
+    events = [name for name, _ in frames]
+    assert "error" in events
+    # The terminal `done` is suppressed when an error has already been
+    # emitted — clients should treat `error` as terminal.
+    assert events.count("done") == 0
+    err_payload = next(d for n, d in frames if n == "error")
+    assert "boom" in err_payload["message"]
+
+
+def test_daily_endpoints_require_token_when_set(client, monkeypatch):
+    """Both /api/daily/status and /api/daily/stream are guarded by the
+    same Bearer token as /api/chat — must 401 on bad / missing token."""
+    _reset_daily_state()
+    from kb import config
+
+    monkeypatch.setattr(config.settings, "chat_token", "daily-test-token")
+    try:
+        # Anonymous → 401
+        r = client.get("/api/daily/status")
+        assert r.status_code == 401, r.text
+        with client.stream("POST", "/api/daily/stream", json={}) as resp:
+            assert resp.status_code == 401
+            "".join(resp.iter_text())
+
+        # Wrong token → 401
+        r = client.get(
+            "/api/daily/status",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert r.status_code == 401, r.text
+
+        # Correct token must NOT be 401 (200 expected for status; stream
+        # may also 200 — we don't drain it here to keep state clean).
+        r = client.get(
+            "/api/daily/status",
+            headers={"Authorization": "Bearer daily-test-token"},
+        )
+        assert r.status_code != 401, r.text
+    finally:
+        monkeypatch.setattr(config.settings, "chat_token", None)
+
+
+def test_daily_stage_pattern_matches_chinese_banner(client, monkeypatch):
+    """The pipeline prints localized stage headers when KB_LANGUAGE=zh —
+    `[N/4]` prefix is identical, so stage detection must still fire."""
+    _reset_daily_state()
+
+    def _fake_pipeline():
+        print("[1/4] 数据采集")
+        print("[2/4] 处理（摘要 + 打分）")
+        print("[3/4] 向量化")
+        print("[4/4] 每日简报")
+
+    _patch_daily(monkeypatch, _fake_pipeline)
+
+    status_code, _, frames = _drain_daily_sse(client)
+    assert status_code == 200
+    stages = [d for n, d in frames if n == "stage"]
+    assert [s["index"] for s in stages] == [1, 2, 3, 4]

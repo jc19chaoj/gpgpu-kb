@@ -6,22 +6,24 @@
 > 于 `2026-04-25 15:26:48` 增量刷新（DeepSeek provider / Bearer Token / pytest 套件落地），
 > 于 `2026-04-25 16:50` 增量刷新（质量门 `is_processed=2` / `KB_QUALITY_SCORE_THRESHOLD`），
 > 于 `2026-05-02 08:57:04` 增量刷新（Universal Score Axes / 中文 LLM 输出 / Docker 镜像 / 自适应 ingest 回看窗 / 冷启动批处理 / 非论文 rescore 脚本 / RSS 源精简),
-> 于 `2026-05-02 20:12:04` 增量刷新（多轮 Chat 历史 + 单 source 锚定模式 + `kb.processing.pdf` PDF 全文加载（pypdf 默认依赖、`Paper.full_text` 列）+ uvicorn `--timeout-keep-alive 75` keep-alive 修复），
-> 于 `2026-05-02 21:18:53` 增量刷新（SSE 流式聊天 `/api/chat/stream` + 共享 `_build_chat_context` + `stream_llm` 抽象（`_STREAM_PROVIDERS` 字典）+ `_stream_openai_compatible` 公共体 + `_stream_anthropic` text_stream + chat 系统 prompt 改为中文硬编码），
-> 于 `2026-05-02 23:32:00` 增量刷新（新增 vLLM Blog 进 RSS FEEDS（12 个源）+ 新模块 `kb/ingestion/sitemap_blog.py` 覆盖无原生 RSS 的 SPA 站点（首条来源 LMSYS / SGLang Blog）+ `kb/ingestion/run.py` 编排独立 stage `results["sitemap_blogs"]` + 12+ 例单元测试 + orchestrator 测试升级到 4 fetcher，pytest 174/174）。
-> 于 `2026-05-03 09:44:00` 增量刷新（ingestion 冷启动改为 per-`Paper.source_name` 判定：`kb/ingestion/run.py` 新增 `_lookback_for_source(source_name)`，4 个 fetcher 签名统一 `days_back: int | None`；新增 RSS feed 进 `FEEDS` 或 sitemap 源进 `SITEMAP_SOURCES` 后下次 daily 自动 30 天 backfill 该源；测试 174 → 180 pass）。
-> 于 **`2026-05-03 21:41:00`** 增量刷新（**Fast / Expert 双角色 LLM**：`kb/config.py` 新增 `llm_expert_provider` / `llm_expert_model` 两个可选字段；`kb/processing/llm.py` 新增 `_resolve_role(role) -> (provider_name, model_override)`，`call_llm` / `stream_llm` 新增 `role="fast"|"expert"` 参数，所有 `_call_* / _stream_*` 函数统一 `(prompt, *, model: str | None = None)` 签名并在 None 时回退到 `settings.<provider>_model`；`kb/main.py` 的 `/api/chat` + `/api/chat/stream` 显式 `role="expert"`；`summarize_and_score` / `generate_daily_report` 保持默认 fast；新增 6 例角色 overlay 测试，套件 180 → 203 pass**）。
+> 于 `2026-05-02 20:12:04` 增量刷新（多轮 Chat 历史 + 单 source 锚定模式 + `kb.processing.pdf` PDF 全文加载 + uvicorn `--timeout-keep-alive 75` keep-alive 修复），
+> 于 `2026-05-02 21:18:53` 增量刷新（SSE 流式聊天 `/api/chat/stream` + 共享 `_build_chat_context` + `stream_llm` 抽象 + chat 系统 prompt 改为中文硬编码），
+> 于 `2026-05-02 23:32:00` 增量刷新（vLLM Blog + LMSYS / SGLang Blog (sitemap) + 12 例 sitemap_blog 单元测试 + orchestrator 测试升级到 4 fetcher，pytest 174/174）。
+> 于 `2026-05-03 09:44:00` 增量刷新（per-`Paper.source_name` ingest 冷启动；测试 174 → 180 pass）。
+> 于 `2026-05-03 21:41:00` 增量刷新（**Fast / Expert 双角色 LLM**：`call_llm` / `stream_llm` 新增 `role="fast"\|"expert"` 参数；`kb/main.py` 的 `/api/chat` + `/api/chat/stream` 显式 `role="expert"`；`summarize_and_score` / `generate_daily_report` 保持默认 fast；测试套件 180 → 203 pass）。
+> 于 **`2026-05-03 22:34:43`** 增量刷新（**手动触发 daily pipeline 端点（SSE 进度）**：① 新增 `GET /api/daily/status` + `POST /api/daily/stream`，**都挂 `verify_chat_token`**；② `_DailyRunState` 单例 + `threading.Lock` 防并发，第二个 POST → HTTP 409；③ `_run_daily_in_worker` 在 daemon thread 内 `run_daily_pipeline()`，**无 subprocess**；④ `_QueueLogHandler` + `_QueueStdoutWriter` 把 logger / banner print 都泵进 `Queue(maxsize=2000)`；⑤ `_STAGE_PATTERN=r"\[([1-4])/4\]"` 兼容中英文 stage banner；⑥ 事件序列 `started → stage(≤4) → log(N) → done|error`，15s idle 发 `: keepalive\n\n` SSE 注释帧；⑦ 测试新增 `_drain_daily_sse` 辅助 + 6 例用例；⑧ 既有 chat / SSE 流式聊天 / fast-expert 双角色 / per-source 冷启动 / sitemap blog 等行为全部不动）。
 
 ---
 
 ## 一、模块职责
 
-后端承担四件事：
+后端承担五件事：
 
-1. **采集（ingestion）**：从 ArXiv / RSS / GitHub Search 拉取近期内容，按 `Paper.url` 唯一索引去重写入 SQLite；回看窗自动适配上次成功时间。
+1. **采集（ingestion）**：从 ArXiv / RSS（12 个源）/ sitemap_blog（1 个源）/ GitHub Search 拉取近期内容，按 `Paper.url` 唯一索引去重写入 SQLite；回看窗自动适配 per-`source_name` 上次成功时间。
 2. **处理（processing）**：调用 LLM 对每条记录生成 ~3-5 段技术摘要，并按 `source_type` 切换 rubric 打两维 0-10 分（universal axes：`quality_score` / `relevance_score`）；之后用 sentence-transformers 生成嵌入并写入 ChromaDB；**source-anchored chat 触发时按需下载 PDF 抽全文，缓存在 `Paper.full_text`**。
-3. **服务（API）**：FastAPI 暴露浏览 / 详情 / 搜索 / **多轮 + source-anchored RAG 聊天（一次性 + SSE 流式两种端点）** / 日报 / 统计 / 健康检查端点；可选 Bearer Token 守卫 `/api/chat` 与 `/api/chat/stream`。
-4. **报告（reports）**：每天聚合当日已处理论文与博客/项目，产出一份 Markdown 简报存入 `daily_reports`（按 `max(quality, relevance)` 排序，使非论文也能上榜）。
+3. **服务（API）**：FastAPI 暴露浏览 / 详情 / 搜索 / **多轮 + source-anchored RAG 聊天（一次性 + SSE 流式两种端点，使用 expert 角色 LLM）** / 日报 / 统计 / 健康检查端点；**本轮新增**：手动触发 daily pipeline + SSE 实时进度的两个端点（`/api/daily/status` + `/api/daily/stream`）。
+4. **报告（reports）**：每天聚合当日已处理论文与博客/项目，产出一份 Markdown 简报存入 `daily_reports`（按 `max(quality, relevance)` 排序）。
+5. **流水线编排**（本轮新增网页入口）：`run_daily_pipeline()` 既可 `python -m kb.daily` 命令行启动、Docker `--profile cron` 启动，也可通过 `POST /api/daily/stream`（前端 `/reports` 页 Run-Now 按钮）触发——**全部走同一个 in-process 实现**，不开 subprocess。
 
 ---
 
@@ -29,14 +31,14 @@
 
 | 入口 | 作用 |
 | --- | --- |
-| `kb/main.py` (`app = FastAPI(...)`) | API 应用对象；`lifespan` 中初始化日志、`init_db()`、后台预热 EmbeddingStore（`asyncio.create_task`，不阻塞 startup）；`/api/chat` 与 **`/api/chat/stream`（SSE）** 共享 `_build_chat_context` + `_format_history` |
-| `kb/daily.py` (`run_daily_pipeline`) | 完整每日流水线（ingest → process → embed → report）；冷启动检测 + `--lang zh` 切换 |
-| `kb/ingestion/run.py` (`run_ingestion`) | 仅运行采集阶段；`days_back: int \| None`，None 时**每个 fetcher 自己走 per-`source_name` 冷启动**（见 `_lookback_for_source`）；`_compute_days_back()` 退化为 `_lookback_for_source(None)` 薄包装 |
+| `kb/main.py` (`app = FastAPI(...)`) | API 应用对象；`lifespan` 中初始化日志、`init_db()`、后台预热 EmbeddingStore；`/api/chat` 与 **`/api/chat/stream`（SSE）** 共享 `_build_chat_context` + `_format_history`；**本轮新增 `/api/daily/status` + `/api/daily/stream`** 走 `_DailyRunState` 单例 + `_run_daily_in_worker` daemon thread + `_QueueLogHandler` / `_QueueStdoutWriter` 双管道 |
+| `kb/daily.py` (`run_daily_pipeline`) | 完整每日流水线（ingest → process → embed → report）；冷启动检测 + `--lang zh` 切换；**本轮起也是 `/api/daily/stream` 在 daemon thread 内 lazy import 调用的目标** |
+| `kb/ingestion/run.py` (`run_ingestion`) | 仅运行采集阶段；`days_back: int \| None`，None 时**每个 fetcher 自己走 per-`source_name` 冷启动**（见 `_lookback_for_source`） |
 | `kb/processing/llm.py` (`run_processing`) | 仅运行 LLM 处理阶段，`batch_size=None` 表示无上限 |
-| `kb/processing/llm.py` (`call_llm` / **`stream_llm`**) | LLM 调用门面：`call_llm` 返回完整字符串（用于 summary/scoring 与 `/api/chat`）；**`stream_llm` 增量 yield 文本片段（用于 `/api/chat/stream`）；任何 provider 失败均返回空 / 静默结束 generator** |
+| `kb/processing/llm.py` (`call_llm` / **`stream_llm`**) | LLM 调用门面（`role="fast"\|"expert"`）：`call_llm` 返回完整字符串（用于 summary/scoring）；**`stream_llm` 增量 yield 文本片段（用于 `/api/chat/stream`）**；任何 provider 失败均返回空 / 静默结束 generator |
 | `kb/processing/embeddings.py` (`index_unindexed_papers`) | 仅运行向量化阶段，`batch_size=None` 表示无上限 |
 | `kb/processing/pdf.py` (`fetch_full_text`) | 下载 + 抽取 PDF 全文，缓存到 `Paper.full_text`；缺失 / 失败 fallback 到 `summary + abstract`（不污染缓存） |
-| `kb/reports.py` (`generate_daily_report`) | 仅生成日报（默认昨天，upsert） |
+| `kb/reports.py` (`generate_daily_report`) | 仅生成日报（默认昨天，upsert）；用 fast 角色 LLM |
 | `kb/scripts/rescore_non_papers.py` | 运维脚本：回填非论文行 universal scores（支持 `--dry-run` / `--limit` / `--source-type`） |
 | `run_api.sh` | `uvicorn kb.main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 75` |
 | `Dockerfile` | `python:3.12-slim` 多阶段镜像；`ARG INSTALL_EXTRAS=ml,llm-cloud` 控制大小；`HEALTHCHECK` 走 `/api/health`；`CMD ["uvicorn", ..., "--timeout-keep-alive", "75"]` |
@@ -47,12 +49,14 @@
 cd backend
 source .venv/bin/activate
 ./run_api.sh                                       # 开发：带 --reload + keep-alive 75
-python -m kb.daily                                 # 跑一遍完整流水线（语言由 KB_LANGUAGE 决定）
+python -m kb.daily                                 # 跑一遍完整流水线（命令行）
 python -m kb.daily --lang zh                       # 命令行覆盖为中文
 python -m kb.ingestion.run                         # 仅采集
 python -m kb.reports                               # 仅生成昨天的报告
 python -m kb.scripts.rescore_non_papers --dry-run  # 列出需要回填的非论文行
-python -m pytest tests/ -x -q                      # 跑测试 (~115 例)
+python -m pytest tests/ -x -q                      # 跑测试 (~210 例)
+# 网页触发完整流水线：在 /reports 页面点击 "Run pipeline now" 按钮
+# (后端调用：POST /api/daily/stream)
 ```
 
 ---
@@ -63,11 +67,13 @@ python -m pytest tests/ -x -q                      # 跑测试 (~115 例)
 
 | 方法 + 路径 | 函数 | 说明 |
 | --- | --- | --- |
-| `GET  /api/papers` | `list_papers` | 分页列出，按 `source_type` 过滤；`sort_by` 支持 `published_date` / `impact_score` / `originality_score` / `quality_score` / `relevance_score` / `total_score`（默认） / `ingested_date`；`total_score` 对应 `originality + impact + quality + relevance` 之和（paper / 非 paper 两组互斥，求和等价于行总分）。**默认仅返回 `is_processed=1`**，加 `?include_low_quality=true` 同时返回 `0`/`2` |
+| `GET  /api/papers` | `list_papers` | 分页列出，按 `source_type` 过滤；`sort_by` 支持 `published_date` / `impact_score` / `originality_score` / `quality_score` / `relevance_score` / `total_score`（默认） / `ingested_date`。**默认仅返回 `is_processed=1`**，加 `?include_low_quality=true` 同时返回 `0`/`2` |
 | `GET  /api/papers/search` | `search_papers` | `q` 必填；`semantic=true` 走 ChromaDB（仅含 `is_processed=1`），无结果回退 ILIKE（用 `_escape_like` 转义 `%` `_` `\`）。**注意路由顺序：search 必须在 `{paper_id}` 之前** |
 | `GET  /api/papers/{paper_id}` | `get_paper` | 单条详情；**不过滤** `is_processed` |
-| `POST /api/chat` | `chat` | **非流式 RAG / source-anchored 双模式**：默认走向量召回 `top_k`；当 `req.paper_id` 给定时**跳过检索**，调 `fetch_full_text(paper_id)` 把全文（≤60 000 字符）放入 prompt，`sources` 仅含目标 paper（不存在 → 404）。无论哪种模式，`req.history[]` 都通过 `_format_history` 注入 UNTRUSTED 块（最近 12 条 turn，单条 4 000 字符 cap）。**受 `verify_chat_token` 守卫**：若 `KB_CHAT_TOKEN` 已设置，必须带 `Authorization: Bearer <token>`。Prompt + sources 由 `_build_chat_context(req, db)` 生成，**与 `/api/chat/stream` 共用**。|
-| **`POST /api/chat/stream`** | **`chat_stream`** | **SSE 流式版本**：返回 `text/event-stream`，Header `Cache-Control: no-cache` + `X-Accel-Buffering: no`；事件序列固定 `sources`（恰 1 条）→ `token`（≥1 条；若无输出则发占位 `(LLM produced no output)`）→ `done`（终止符）。**先同步跑 `_build_chat_context`** 让 HTTPException（如 paper_id 404）正常走 HTTP 错误而非空流；之后构造 `event_stream()` 生成器调 `stream_llm(prompt)` 增量 yield。**同样受 `verify_chat_token` 守卫**。 |
+| `POST /api/chat` | `chat` | **非流式 RAG / source-anchored 双模式**（**expert 角色 LLM**）。Prompt + sources 由 `_build_chat_context(req, db)` 生成，**与 `/api/chat/stream` 共用**。**受 `verify_chat_token` 守卫** |
+| `POST /api/chat/stream` | `chat_stream` | **SSE 流式版本**（**expert 角色 LLM**）：返回 `text/event-stream`，Header `Cache-Control: no-cache` + `X-Accel-Buffering: no`；事件序列固定 `sources`（恰 1 条）→ `token`（≥1 条；若无输出则发占位 `(LLM produced no output)`）→ `done`（终止符）。**先同步跑 `_build_chat_context`** 让 HTTPException（如 paper_id 404）正常走 HTTP 错误而非空流。**同样受 `verify_chat_token` 守卫** |
+| **`GET /api/daily/status`** | **`daily_status`** | **本轮新增**：返回 `_DailyRunState` 当前快照 `{running, started_at, current_stage}`。前端 `/reports` 页 mount 时调它判断 Run-Now 按钮初始 enabled/disabled——典型场景：他 tab 已经 POST `/api/daily/stream` 在跑，本 tab 刷新后通过 status 探测到 `running=true` 把按钮锁住，避免发出第二个 POST 拿 409。**受 `verify_chat_token` 守卫** |
+| **`POST /api/daily/stream`** | **`daily_stream`** | **本轮新增**：在后端 daemon thread 内 lazy import 调 `kb.daily.run_daily_pipeline()`，并把 logger / stdout / stage banner 编织成 SSE 流推给客户端。事件序列 `started`（恰 1，含 `started_at`）→ `stage`（≤4，含 `index: 1..4` 与 `name: "ingestion"\|"processing"\|"embedding"\|"report"`）→ `log`（N 条，每条含 `line`）→ `done`（payload `{}`）/ `error`（含 `message`），`done` 与 `error` 互斥。15 秒 idle 时发 `: keepalive\n\n` SSE comment 帧防中间反代砍连接。**`_DailyRunState.try_start()` 拿不到锁 → HTTP 409 `DailyConflictError`**，前端 fallback 到 `getDailyStatus()` 探测 in-flight run。Header `Cache-Control: no-cache` + `X-Accel-Buffering: no`。**受 `verify_chat_token` 守卫** |
 | `GET  /api/reports` | `list_reports` | 倒序列出最近 N 份日报 |
 | `GET  /api/reports/{report_id}` | `get_report` | 单份日报（Markdown）|
 | `GET  /api/stats` | `get_stats` | `total_papers` / `processed` / `skipped_low_quality` / `pending` / `by_type` / `top_impact`（5 条，legacy paper-only）/ `top_overall`（5 条，按 `max(quality, relevance)` 跨类型 ranking） |
@@ -79,9 +85,9 @@ Swagger UI：`http://localhost:8000/docs`
 
 - 配置项：`settings.chat_token`（来源 `KB_CHAT_TOKEN`）。
 - 未设置 → 端点开放（无摩擦本地开发）。
-- 已设置 → 需 `Authorization: Bearer <token>`；缺头或前缀不对返回 401 `Missing bearer token`；值不匹配返回 401 `Invalid bearer token`。
-- **比较使用 `hmac.compare_digest`**（防侧信道）；新增类似认证端点请复用同款写法，禁止 `==`。
-- **同时挂在 `/api/chat` 与 `/api/chat/stream`**（`dependencies=[Depends(verify_chat_token)]`）。
+- 已设置 → 需 `Authorization: Bearer <token>`。
+- **比较使用 `hmac.compare_digest`**（防侧信道）。
+- **同时挂在 `/api/chat` / `/api/chat/stream` / `/api/daily/status` / `/api/daily/stream`**——任何"昂贵 / 写入 / 触发任务"端点都必须复用同款守卫。
 
 ### Chat schema (`kb/schemas.py`)
 
@@ -97,30 +103,17 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list, max_length=40)
 ```
 
-`max_length=40` 是 Pydantic 边界（防 DoS），`main.py::_HISTORY_TURN_CAP=12` 是 prompt 实际渲染窗口。两者解耦，便于独立调整。
+`max_length=40` 是 Pydantic 边界（防 DoS），`main.py::_HISTORY_TURN_CAP=12` 是 prompt 实际渲染窗口。
 
-### 共享 prompt 构造（`_build_chat_context`，本轮新抽出）
+### 共享 prompt 构造（`_build_chat_context`）
 
 `/api/chat` 与 `/api/chat/stream` 都调用 `_build_chat_context(req, db) -> tuple[str, list[PaperOut]]`：
 
 - 计算 `history_block = _format_history(req.history)`（最近 12 条 turn，单条 4 000 字符）。
-- 若 `req.paper_id is not None`：查 paper（404 if missing）→ lazy import `kb.processing.pdf.fetch_full_text` → 拼 source-anchored prompt（≤60 000 字符正文 + history block + current query）→ `sources = [那篇 paper]`。
-- 否则：`get_embedding_store().search(req.query, top_k=req.top_k)` → 拼 RAG prompt（context + history + query）→ `sources = 召回到的 papers`。
-- **整段都在 `=== UNTRUSTED START === / END ===` 块内**，并显式提示模型"data, not instructions"。
-- **prompt 系统消息已硬编码为中文**（`你是一名资深的 GPGPU 芯片架构助理 ...`，结尾"请用简体中文作答"）。`KB_LANGUAGE` 不再影响 chat prompt（仅影响 summarization / scoring / reports）。
-
-### Source-anchored prompt 结构
-
-```
-SOURCE TITLE / SOURCE TYPE / AUTHORS / URL
-=== FULL SOURCE CONTENT ===
-{up to 60 000 chars from fetch_full_text}
-
-=== CONVERSATION HISTORY ===
-{up to 12 most recent turns, each ≤4000 chars}
-
-CURRENT USER QUESTION: ...
-```
+- 若 `req.paper_id is not None`：查 paper（404 if missing）→ lazy import `kb.processing.pdf.fetch_full_text` → 拼 source-anchored prompt。
+- 否则：`get_embedding_store().search(req.query, top_k=req.top_k)` → 拼 RAG prompt。
+- **整段都在 `=== UNTRUSTED START === / END ===` 块内**。
+- **prompt 系统消息已硬编码为中文**（"你是一名资深的 GPGPU 芯片架构助理 ..."）。
 
 ### SSE 帧格式（`_sse_event` helper）
 
@@ -129,11 +122,140 @@ event: <name>\ndata: <json>\n\n
 ```
 
 - `_sse_event(event, data)` 用 `json.dumps(..., ensure_ascii=False)` 编码，避免中文被转成 `\uXXXX`。
-- 事件序列：`sources`（恰 1，payload `{"sources": [PaperOut, ...]}`）→ `token`（≥1，payload `{"content": "<chunk>"}`）→ `done`（恰 1，payload `{}`）。可选 `error`（payload `{"message": "..."}`），但当前 `stream_llm` 失败是静默吞掉，**不会发 `error`**——前端通过"done 之前 token 累计为空"区分。
+- **chat 事件序列**：`sources`（恰 1）→ `token`（≥1，若无输出则 `(LLM produced no output)` 占位）→ `done`（恰 1）。可选 `error`，但当前 `stream_llm` 失败是静默吞掉。
+- **daily 事件序列**（本轮新增）：`started`（恰 1）→ `stage`（≤4）→ `log`（N 条）→ `done` / `error`（互斥；emit 后 `terminal_emitted=True` 抑制重复）。15 秒 idle 时发 `: keepalive\n\n` SSE comment 帧（前端 `_parseDailyFrame` 跳过 `:` 开头的行）。
 
 ---
 
-## 四、关键依赖与配置
+## 四、Daily Pipeline 网页触发架构（本轮新增）
+
+整体设计：把 `python -m kb.daily` 的本地命令行执行能力迁到 HTTP，但**不开 subprocess**——直接在 daemon thread 内 lazy import 调 `run_daily_pipeline()`。这样省去进程间序列化 / IPC / 子进程僵尸回收等所有麻烦，同时通过 `Queue` 把"实时日志流"和"业务执行"完全解耦。
+
+### 状态单例：`_DailyRunState`
+
+```python
+class _DailyRunState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running = False
+        self._started_at: datetime | None = None
+        self._current_stage: int | None = None
+        self._queue: Queue | None = None  # bounded maxsize=2000
+
+    def try_start(self) -> Queue | None:    # 原子拿锁 + 创建 queue
+    def set_stage(self, index: int) -> None: # 在 generator 端识别到 stage banner 时调
+    def end(self) -> None:                   # worker finally 调，释放锁
+    def status(self) -> dict[str, object]:   # GET /api/daily/status 用
+```
+
+`Queue(maxsize=2000)` 是 backpressure 隔离层——慢消费者不会让 worker 阻塞，超载时 `put_nowait` 在 `Full` 异常下静默 drop（更倾向少几行日志 vs hang 整个 pipeline）。
+
+### Worker thread：`_run_daily_in_worker(queue)`
+
+```python
+def _run_daily_in_worker(queue: Queue) -> None:
+    handler = _QueueLogHandler(queue)        # 注入到 root logger
+    handler.setFormatter(...)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    stdout_sink = _QueueStdoutWriter(queue)
+    try:
+        with contextlib.redirect_stdout(stdout_sink):
+            from kb.daily import run_daily_pipeline   # lazy import 让 monkeypatch 命中
+            run_daily_pipeline()
+        queue.put_nowait(("__done__", {}))
+    except Exception as exc:
+        queue.put_nowait(("__error__", {"message": str(exc) or exc.__class__.__name__}))
+    finally:
+        root.removeHandler(handler)
+        _daily_state.end()
+        queue.put_nowait(("__terminator__", None))   # 必须发，让 generator break
+```
+
+关键不变量：
+
+- **lazy import**：`from kb.daily import run_daily_pipeline` 在函数体内，让测试 `monkeypatch.setattr(daily_mod, "run_daily_pipeline", _fake_pipeline)` 在 worker 启动后才解析到 patch。
+- **logger handler 双管道**：`_QueueLogHandler` 监听 root logger（`logging.*` 调用），`_QueueStdoutWriter` 通过 `contextlib.redirect_stdout` 监听 `print()`（流水线启动 banner）。两路都被泵进同一个 queue，generator 端不区分来源。
+- **`finally` 必发 `__terminator__`**：哪怕异常 / 已经发了 done / 已经发了 error 都要发，否则 generator 永远悬挂在 `queue.get(timeout=15)` 等不到 sentinel。
+- **daemon thread**：跟随 FastAPI 进程退出；进程 SIGTERM 时 pipeline 强制中断（前端会看到"Connection lost"），不会拖延 graceful shutdown。
+
+### Generator：`event_stream()`（在 `daily_stream` endpoint 内）
+
+```python
+def event_stream():
+    yield _sse_event("started", {"started_at": started_at_raw})
+    last_stage_emitted: int | None = None
+    terminal_emitted = False
+    while True:
+        try:
+            kind, payload = queue.get(timeout=15)
+        except Empty:
+            yield ": keepalive\n\n"   # SSE comment 帧, 前端跳过
+            continue
+        if kind == "__terminator__":
+            if not terminal_emitted:
+                yield _sse_event("done", {})
+            break
+        if kind == "__done__":
+            terminal_emitted = True
+            yield _sse_event("done", payload)
+            continue
+        if kind == "__error__":
+            terminal_emitted = True
+            yield _sse_event("error", payload)
+            continue
+        # kind == "log"
+        line = payload
+        m = _STAGE_PATTERN.search(line)
+        if m:
+            stage_idx = int(m.group(1))
+            if stage_idx != last_stage_emitted:
+                last_stage_emitted = stage_idx
+                _daily_state.set_stage(stage_idx)
+                yield _sse_event("stage", {"index": stage_idx, "name": _STAGE_NAMES[stage_idx]})
+        yield _sse_event("log", {"line": line})
+```
+
+要点：
+
+- **`_STAGE_PATTERN = re.compile(r"\[([1-4])/4\]")`**：从 `kb/daily.py` 的 banner 提取 stage 索引。`kb/daily.py` 不管 `KB_LANGUAGE` 设啥都打 `[N/4]` 前缀（仅 stage 名翻译），所以中英文 banner 都能识别。
+- **stage 去重**：`last_stage_emitted` 跟踪上次发的 index，banner 重复打印不会发重复 stage 帧。
+- **terminal_emitted 守卫**：worker 在 `__done__` / `__error__` 之外还会发 `__terminator__` 兜底；如果已经发过 done 或 error，再收 terminator 时**不重复发 done**——`terminal_emitted=True` 抑制。
+- **15 秒 keepalive**：cpolar / nginx / 各类 LB 默认 idle timeout 30-60 秒，15 秒发一次 SSE comment 帧绝对安全，且 comment 帧前端 `_parseDailyFrame` 显式忽略。
+
+### 并发模型
+
+`_DailyRunState.try_start()` 在 `threading.Lock` 下原子检查 `_running` flag：
+
+- 已 running → 返回 None；endpoint raise `HTTPException(409, "A daily pipeline run is already in progress.")`。
+- 未 running → 置 `_running=True` + `_started_at=now()` + 新 Queue，返回 queue。
+
+第二个并发 POST 因此拿不到锁，前端 `runDailyStream()` 看 HTTP 409 抛 `DailyConflictError`，UI 进入 "another run in progress" 文案 + 按钮永久 disable，等他 tab 完成后用户主动 reload 页面才能再发起。
+
+**没有"reattach to running stream"机制**：SSE 流的所有权属于"发起 POST 的那一条 TCP 连接"，他 tab / 别的客户端在第二个 POST 上拿 409 后**只能等**——这是有意为之的简化（重连流要么需要 SSE Last-Event-ID / 要么需要状态广播，本轮 scope 内不做）。
+
+### 测试配方
+
+`backend/tests/test_api_smoke.py` 新增 6 例：
+
+```python
+def _drain_daily_sse(client) -> tuple[int, str, list[tuple[str, dict]]]:
+    """Mirror _drain_sse but skip ': keepalive' comment frames."""
+
+def _patch_daily(monkeypatch, fake_pipeline):
+    """monkeypatch.setattr(daily_mod, 'run_daily_pipeline', fake_pipeline);
+    worker thread does lazy import inside its body so the patch is hit."""
+
+def _reset_daily_state():
+    """Force-clear _DailyRunState between tests; session-scoped TestClient
+    shares the app instance + singleton across tests."""
+```
+
+测试用例覆盖：① idle 默认；② happy path 4-stage 序列（中英文 banner 都识别）；③ 并发第二个 POST → HTTP 409（用 `threading.Event` 让 fake pipeline 阻塞住才能复现）；④ pipeline raise → `error` 帧而非 `done`；⑤ 两个端点都受 Bearer 守卫（`KB_CHAT_TOKEN` 设置后 401）；⑥ 中文 stage banner `[1/4] 数据采集` / `[2/4] 处理（摘要 + 打分）` 也能被 `_STAGE_PATTERN` 切到 4 个 stage。
+
+---
+
+## 五、关键依赖与配置
 
 `pyproject.toml` 三组可选依赖：
 
@@ -144,15 +266,11 @@ event: <name>\ndata: <json>\n\n
 | `[llm-cloud]` | anthropic · openai（DeepSeek 复用 openai SDK，无需新依赖） | 走云端 LLM |
 | `[dev]` | pytest · pytest-asyncio · httpx · ruff | 测试 / lint |
 
-> CI 中使用 `pip install -e '.[dev]'` + `pytest-cov`；**故意不装 `[ml]`** 以加快流水线，相关测试以 `pytest.mark.skipif` 自动跳过。
-> Docker 镜像通过 `ARG INSTALL_EXTRAS=ml,llm-cloud` 控制；改成 `llm-cloud` 或空串可瘦身镜像（搜索自动降级到关键字）。
-> **`pypdf` 是默认依赖**（仅 ~600 KB 纯 Python），用于 source-anchored chat 的 PDF 抽取。
-
-设置类：`kb/config.py` 的 `Settings(BaseSettings)`，前缀 `KB_`，亦读取 `backend/.env`。新增 / 当前完整字段见 `kb/config.py`，包括 `language`、`llm_provider`、`anthropic/openai/deepseek_*`、`ingest_empty_db_days`、`ingest_gap_min_days`、`ingest_gap_max_days`、`quality_score_threshold`、`chat_query_max_len`、`chat_top_k_max`、`chat_token`、`cors_origins`、`data_dir`、`database_url`、`chroma_dir`、`embedding_model`、`llm_timeout_seconds` 等（详见根 CLAUDE.md "环境变量"表格）。
+设置类：`kb/config.py` 的 `Settings(BaseSettings)`，前缀 `KB_`，亦读取 `backend/.env`。完整字段见 `kb/config.py`（详见根 CLAUDE.md "环境变量"表格）。
 
 ---
 
-## 五、数据模型
+## 六、数据模型
 
 文件：`kb/models.py`（SQLAlchemy DeclarativeBase）
 
@@ -162,7 +280,7 @@ event: <name>\ndata: <json>\n\n
 | --- | --- | --- |
 | `id` | int PK | autoincrement |
 | `title` | str(500) | 必填 |
-| `authors` / `organizations` / `categories` | JSON list | 默认空 list；categories 经 `PaperOut._coerce_categories` 兼容旧 RSS 行的 feedparser dict |
+| `authors` / `organizations` / `categories` | JSON list | 默认空 list |
 | `abstract` | Text | 默认空 |
 | `url` | str(1000) | **唯一索引**，去重依据 |
 | `pdf_url` | str(1000) | source-anchored chat 通过 `_looks_like_pdf_url` 判断是否拉 PDF |
@@ -172,13 +290,12 @@ event: <name>\ndata: <json>\n\n
 | `venue` | str(200) | 默认空 |
 | `citation_count` | int | 预留字段 |
 | `summary` | Text | LLM 输出 |
-| `originality_score` / `impact_score` | float | **legacy 兼容字段**：仅对 `paper` 行从 universal axes 镜像；`impact_score` 索引 |
-| `impact_rationale` | Text | legacy；paper 行从 `score_rationale` 镜像 |
-| `quality_score` | float | universal axis #1（0-10），按 `source_type` 语义切换；索引 |
-| `relevance_score` | float | universal axis #2（0-10），按 `source_type` 语义切换 |
-| `score_rationale` | Text | universal 评分理由（中文模式下为中文） |
-| `full_text` | Text | **PDF 抽取后缓存的完整正文**（≤120 000 字符）；source-anchored chat 第一次成功提取后写入；网络/解析失败保持空串 |
-| `is_processed` | int | **状态机**：`0`=待处理（含 LLM 失败重试）/ `1`=精品收录 / `2`=低分跳过（仅 paper 因质量门触发）；索引 |
+| `originality_score` / `impact_score` | float | **legacy 兼容字段** |
+| `impact_rationale` | Text | legacy |
+| `quality_score` / `relevance_score` | float | universal axes（0-10） |
+| `score_rationale` | Text | universal 评分理由 |
+| `full_text` | Text | **PDF 抽取后缓存的完整正文**（≤120 000 字符） |
+| `is_processed` | int | **状态机**：`0`=待处理 / `1`=精品收录 / `2`=低分跳过；索引 |
 | `chroma_id` | str(100) | 与 ChromaDB 行的关联键 |
 
 ### `daily_reports`
@@ -186,227 +303,129 @@ event: <name>\ndata: <json>\n\n
 | 字段 | 类型 | 备注 |
 | --- | --- | --- |
 | `id` | int PK | – |
-| `date` | DateTime(tz) | **唯一**（每天一条；`reports.py` 走 upsert）|
-| `title` / `content` | str / Text | Markdown；中文模式下标题为 `每日研究简报 — YYYY-MM-DD` |
-| `paper_ids` | JSON list[int] | 引用的 ID（论文 + 博客 + 项目混合） |
+| `date` | DateTime(tz) | **唯一**（每天一条） |
+| `title` / `content` | str / Text | Markdown |
+| `paper_ids` | JSON list[int] | – |
 | `generated_date` | DateTime(tz) | – |
 
 ### 索引与列兼容性（SQLite-friendly）
 
 `kb/database.py` 在 `init_db()` 中：
 
-1. `_BACKCOMPAT_COLUMNS`：`PRAGMA table_info(papers)` 探测后幂等 `ALTER TABLE` 加列：`quality_score` / `relevance_score` / `score_rationale` / `full_text`。
-2. `_BACKCOMPAT_INDEXES`：`CREATE INDEX IF NOT EXISTS` 补加 `ix_papers_url` / `source_type` / `is_processed` / `impact_score` / `quality_score` / `ingested_date`。
-
-这样既兼容旧 `kb.sqlite`，又允许迁移到 Postgres 走 alembic（`_ensure_papers_columns` 仅在 `database_url.startswith("sqlite")` 时执行）。
+1. `_BACKCOMPAT_COLUMNS`：幂等 `ALTER TABLE` 加列：`quality_score` / `relevance_score` / `score_rationale` / `full_text`。
+2. `_BACKCOMPAT_INDEXES`：`CREATE INDEX IF NOT EXISTS`。
 
 ---
 
-## 六、采集与处理细节
+## 七、采集与处理细节
 
 ### `kb/ingestion/`
 
-| 文件 | 职责 | 关键点 |
-| --- | --- | --- |
-| `arxiv.py` | 9 个 cs.* 类目逐一查，按 `submitted_date` 倒排，截至 `cutoff` | 单查询而非 OR，避免高量类目（cs.AI）饿死其它 |
-| `rss.py` | **12 个精选 RSS 源**（截至 2026-05 验证可用，本轮新增 vLLM Blog `https://vllm.ai/blog/rss.xml`） | `feedparser`；`bozo` 仅警告不拒收；`_tag_to_str` 把 feedparser 的 `term/scheme/label` 字典规范化为 `list[str]` 入库 |
-| `sitemap_blog.py` | **本轮新增**：sitemap-driven blog scraper，覆盖没有原生 RSS 的 SPA 站点（当前内置 1 个源：LMSYS / SGLang Blog `https://lmsys.org/sitemap.xml` + `path_prefix="https://lmsys.org/blog/"`） | stdlib `xml.etree.ElementTree` 解析 sitemap → `<lastmod>` 预过滤 → 单 `httpx.Client` 顺序 GET 每篇 → 正则抽 `<meta og:* / twitter:* / article:*>` → 兼容 `April 29, 2026` 等人写日期；网络/解析失败一律 logger.warning + skip 不抛；`_MAX_ARTICLES_PER_SOURCE=60` 防 DoS；`default_categories` 给每条预贴静态标签（如 `("sglang","lmsys")`） |
-| `github_trending.py` | GitHub Search API 按 17 个关键词查 `pushed:>yesterday` | 无 token 时 10 req/min 易 429，建议设 `GITHUB_TOKEN`；带 token 后切到带 polite sleep 的 30 req/min 路径 |
-| `run.py` | 编排 arxiv → rss → sitemap_blog（独立 stage，复用 `save_posts`，写到 `results["sitemap_blogs"]`）→ github_trending；每步独立 try/except；**`_lookback_for_source(source_name)` per-source 冷启动**（`days_back is None` 时每个 fetcher 各自调；`_compute_days_back` 是 `_lookback_for_source(None)` 的薄包装） | 单源失败不影响其它；该 `source_name` 下 `MAX(ingested_date)` 为 NULL → `KB_INGEST_EMPTY_DB_DAYS` 冷启动 backfill；否则 `now - max(...)` clamped 到 `[min, max]`。**新增任意 RSS feed / sitemap 源后，下次 daily 自动 30 天 backfill 那一条 source_name** |
-
-去重统一采用 `Paper.url` 是否已存在。`sitemap_blog` 写入的 `Paper.url` 取页面 `og:url`（不存在时回退 sitemap `<loc>`），所以重定向（如 lmsys.org → www.lmsys.org）不会破坏 dedup 稳定性——同一页跨 run 始终落在同一 canonical URL。
+| 文件 | 职责 |
+| --- | --- |
+| `arxiv.py` | 9 个 cs.* 类目逐一查 |
+| `rss.py` | **12 个精选 RSS 源** |
+| `sitemap_blog.py` | sitemap-driven blog scraper（当前 1 个源：LMSYS / SGLang Blog） |
+| `github_trending.py` | GitHub Search API 按 17 个关键词 |
+| `run.py` | 编排 + per-source 冷启动（`_lookback_for_source(source_name)`） |
 
 ### `kb/processing/`
 
-| 文件 | 职责 | 关键点 |
-| --- | --- | --- |
-| `llm.py` | provider 抽象 + 摘要/打分流水线 + **streaming 平行栈** | `_PROVIDERS = {hermes, anthropic, openai, deepseek}` + **`_STREAM_PROVIDERS = {hermes, anthropic, openai, deepseek}`** 平行；`call_llm` / **`stream_llm`** 公开门面，任何 provider 异常一律返回 `""` / 静默结束 generator 不抛 |
-| `embeddings.py` | ChromaDB + sentence-transformers，懒加载单例 | 没装 ML 依赖时 `available=False`，`search()` 返回空列表，调用方自然降级；`get_embedding_store()` 用 `threading.Lock` 串行化首次构造 |
-| `pdf.py` | PDF 下载 + 抽取，缓存写回 `Paper.full_text` | `httpx.Client.stream` 流式读取，**20 MB 上限 / 30 s 超时 / 120 000 字符截断**；`_extract_text` 容忍单页失败；非 PDF URL → `summary + abstract` fallback；网络/解析失败不污染缓存 |
+| 文件 | 职责 |
+| --- | --- |
+| `llm.py` | provider 抽象（4 种）+ 摘要/打分 + streaming 平行栈 + Fast/Expert 双角色（`_resolve_role`） |
+| `embeddings.py` | ChromaDB + sentence-transformers，懒加载单例 |
+| `pdf.py` | PDF 下载 + 抽取，缓存写回 `Paper.full_text` |
 
 ### Provider 矩阵（`call_llm` / `stream_llm`）
 
 | `KB_LLM_PROVIDER` | `call_llm` 实现 | `stream_llm` 实现 | 依赖 |
 | --- | --- | --- | --- |
-| `hermes`（默认） | `subprocess.run(["hermes", "ask", ...])` | **`_stream_hermes`：调 `_call_hermes` 拿全文 → yield 单 chunk（空字符串则不 yield）**；子进程不能真正流式 | 系统装有 `hermes` CLI；**容器中不可用** |
-| `anthropic` | `anthropic.Anthropic(...).messages.create(...)` | `client.messages.stream(...)` 的 `text_stream` 上 yield | `pip install -e '.[llm-cloud]'` + `ANTHROPIC_API_KEY` |
-| `openai` | `openai.OpenAI(...).chat.completions.create(...)` | **`_stream_openai_compatible(api_key, model)`**：`stream=True` 后逐 `chunk.choices[0].delta.content` yield | `pip install -e '.[llm-cloud]'` + `OPENAI_API_KEY` |
-| `deepseek` | `openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url=KB_DEEPSEEK_BASE_URL).chat.completions.create(...)` | **`_stream_openai_compatible(api_key, model, base_url=...)`**：与 openai 走同一公共体，仅多传 `base_url` | `pip install -e '.[llm-cloud]'` + `DEEPSEEK_API_KEY`（**复用 openai SDK**） |
-
-> 新增其它 OpenAI 兼容 provider（如 Together / Groq / 内部网关）时，只要在 `_PROVIDERS` 与 `_STREAM_PROVIDERS` 字典里各加一个 wrapper 调 `_stream_openai_compatible(api_key, model, base_url)` 即可，**不要重复写 client 构造**。新增 provider 时务必保留 `(prompt, *, model: str \| None = None)` 签名（见下节"Fast / Expert 双角色"）；`model=None` 时继续读 `settings.<provider>_model`，不为 None 时作为 override——否则 expert 角色的模型切换会失效。
+| `hermes`（默认） | `subprocess.run(["hermes", "ask", ...])` | `_stream_hermes`：调 `_call_hermes` → yield 单 chunk | 系统装有 `hermes` CLI |
+| `anthropic` | `anthropic.Anthropic(...).messages.create(...)` | `client.messages.stream(...).text_stream` | `[llm-cloud]` + `ANTHROPIC_API_KEY` |
+| `openai` | `openai.OpenAI(...).chat.completions.create(...)` | `_stream_openai_compatible(api_key, model)` | `[llm-cloud]` + `OPENAI_API_KEY` |
+| `deepseek` | `openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url=...)...` | `_stream_openai_compatible(api_key, model, base_url=...)` | `[llm-cloud]` + `DEEPSEEK_API_KEY` |
 
 ### Fast / Expert 双角色（role overlay）
 
-`call_llm(prompt, role="fast"|"expert")` / `stream_llm(prompt, role="fast"|"expert")` 根据 role 选 provider + model：
-
 | 调用点 | role | 触达路径 |
 | --- | --- | --- |
-| `kb/processing/llm.py::summarize_and_score`（摘要 + 评分） | `fast`（默认） | `_resolve_role("fast") = (settings.llm_provider, None)` |
-| `kb/reports.py::generate_daily_report`（日报） | `fast`（默认） | 同上 |
-| `kb/main.py::chat`（`/api/chat` 非流式） | `expert` | `_resolve_role("expert") = (settings.llm_expert_provider or settings.llm_provider, settings.llm_expert_model)` |
-| `kb/main.py::chat_stream`（`/api/chat/stream` SSE） | `expert` | 同上，走 `stream_llm` |
+| `kb/processing/llm.py::summarize_and_score` | `fast`（默认） | `(settings.llm_provider, None)` |
+| `kb/reports.py::generate_daily_report` | `fast`（默认） | 同上 |
+| `kb/main.py::chat` | `expert` | `(settings.llm_expert_provider or settings.llm_provider, settings.llm_expert_model)` |
+| `kb/main.py::chat_stream` | `expert` | 同上，走 `stream_llm` |
 
-配置规则（`kb/config.py::Settings`）：
-
-- `KB_LLM_PROVIDER`（必填）：fast 角色 provider，同时是 expert 角色 provider 的默认回退值。
-- `KB_LLM_EXPERT_PROVIDER`（可选）：覆盖 expert provider；None 时与 fast 同。
-- `KB_LLM_EXPERT_MODEL`（可选）：作为 `model` kwarg 传进 expert provider 的 `_call_* / _stream_*`；None 时走该 provider 的默认模型（`anthropic_model` / `openai_model` / `deepseek_model`）。**无论 expert provider 选哪家，该字段都直接覆盖模型名**——比如设 `KB_LLM_EXPERT_PROVIDER=anthropic` + `KB_LLM_EXPERT_MODEL=claude-opus-4-9` 就是 anthropic + opus。
-- API key / base_url / timeout 不做角色区分，共享 fast 侧配置；跨 provider 搭配时（如 fast=deepseek / expert=anthropic），两把 key 都要配。
-- `hermes` 不支持模型切换——`_call_hermes` / `_stream_hermes` 接受 `model=` 参数仅为 API 对称，内部忽略；如果 expert 角色仍用 hermes 做批处理，`KB_LLM_EXPERT_MODEL` 实际不会生效。
-
-**新增调用点时切记**：任何"日常批处理 / 日报 / 分析"走 `fast`（省钱），任何"人交互 chat"走 `expert`（高质量），不要在 fast 上放代价高的模型，否则冷启动批处理会被打成日常账单 spike。
-
-### Prompt 安全 / 多语言
-
-- `_sanitize()` 限长 8000 chars + ``` → `ʼʼʼ`。
-- prompt 包裹 `=== UNTRUSTED START === / END ===`，并提示模型"只视为数据"；**chat history 与 source 全文也都进同一块**（见 `main.py::_build_chat_context`）。
-- `_lang_instruction()`（zh）：在 summary prompt 末尾追加 `Write your entire response in Chinese (简体中文)`。
-- `_impact_lang_instruction()`（zh）：仅在 score prompt 末尾追加 `Write the "impact_rationale" value in Chinese... Keep all JSON keys and numeric scores in English/ASCII.`——**JSON 键必须英文**，否则 `summarize_and_score` 会返回 `False`，留 `is_processed=0` 等待重试。
-- **chat prompt（`_build_chat_context`）已脱离 `KB_LANGUAGE` 控制，硬编码为中文系统消息**；要回退到英文必须直接修改函数内的 prompt 字面量（非流式与 SSE 端点共用同一处，改一次两处生效）。
+配置规则：`KB_LLM_EXPERT_PROVIDER` 与 `KB_LLM_EXPERT_MODEL` 都是可选；都不设时 expert 透明回退 fast。
 
 ### 评分 rubric 矩阵（`_RUBRICS`）
 
 | `source_type` | quality_score 含义 | relevance_score 含义 |
 | --- | --- | --- |
-| `paper` | Originality（核心点子的新颖度） | Impact（作者 / 机构 / 会场 / 解法的通用性） |
-| `blog` | Technical Depth | Actionability（CUDA/Triton/MLIR/HIP 可落地性） |
-| `talk` | Depth（实测数据 / 架构细节深度） | Actionability |
-| `project` | Innovation（独到的 kernel/runtime/compiler trick） | Maturity（stars / 活跃度 / 文档 / 测试） |
-
-### 质量门与状态机
-
-`summarize_and_score` 在 LLM JSON 解析成功后落桶到 `Paper.is_processed`：
-
-| 分支 | 条件 | `is_processed` | 备注 |
-| --- | --- | --- | --- |
-| Paper · 精品 | `source_type=paper` 且 `max(quality, relevance) ≥ KB_QUALITY_SCORE_THRESHOLD` | `1` | 同时把 `quality/relevance/score_rationale` 镜像到 `originality/impact/impact_rationale` |
-| Paper · 低分跳过 | `source_type=paper` 且 `max(...)` < threshold | `2` | 不进入 ChromaDB，不出现在默认 list；`Paper.url` 唯一 + `is_processed != 0` 双锁防重摄入 / 重打分 |
-| 非论文 · 收录 | `source_type` ∈ {blog, talk, project} 且 JSON 解析成功 | `1` | **不走质量门**——curated RSS / GitHub 关键词已是入口闸；不镜像到 legacy paper 字段 |
-| 待重试（任意类型） | LLM 返回非 JSON / 抛异常 / 必需键缺失 / 键被翻译成中文 | `0`（保留） | 下次 `run_processing` 自动重试；**禁止写 5.0/5.0 兜底** |
-
-要点：
-
-- 维度选 `max(quality, relevance)`：让"无名实验室但创意新"的 Hidden Gems 也能进精品（呼应 `reports.py` 的 Hidden Gems 章节）。
-- 阈值通过 `settings.quality_score_threshold` 读取，**不要**直接硬编码 7.0。
-- 修改阈值**不会**回溯既存 `is_processed=1` 数据——只对新打分的论文生效。
-- ChromaDB 通过 `index_unindexed_papers` 仅索引 `is_processed=1`，所以语义搜索无需额外过滤；关键字 fallback 路径在 `main.py` 显式过滤。
+| `paper` | Originality | Impact |
+| `blog` | Technical Depth | Actionability |
+| `talk` | Depth | Actionability |
+| `project` | Innovation | Maturity |
 
 ### 冷启动批处理（`kb.daily`）
 
 `run_daily_pipeline` 启动时探测：
 
-- **处理冷启动**：`Paper.is_processed != 0` 全为空 → `run_processing(batch_size=None)`，否则默认 100 条/run。
-- **嵌入冷启动**：`Paper.is_processed == 1 && chroma_id != ""` 全为空 → `index_unindexed_papers(batch_size=None)`，否则 100 条/run。
-
-目的：避免后到的 RSS / GitHub 项目被 ArXiv 队列前缀（一次 ingestion 可能新增几百行）饿死。
+- **处理冷启动**：`Paper.is_processed != 0` 全为空 → `run_processing(batch_size=None)`。
+- **嵌入冷启动**：`Paper.is_processed == 1 && chroma_id != ""` 全为空 → `index_unindexed_papers(batch_size=None)`。
 
 ### Per-Source ingest 冷启动（`kb.ingestion.run`）
 
-与上一节"批处理冷启动"是**两套独立机制，判定维度不同**——这一节说的是"采集回看窗"。
-
-`_lookback_for_source(source_name: str | None) -> int`（`kb/ingestion/run.py`）查 `MAX(Paper.ingested_date)` filtered by `source_name`：
-
-- 该 `source_name` 下没有任何已入库行 → 返回 `settings.ingest_empty_db_days`（默认 30）→ **冷启动 backfill**。
-- 否则按 `now - MAX(...)` 计算 gap，clamp 到 `[ingest_gap_min_days, ingest_gap_max_days]`。
-- `source_name=None` 跳过过滤，返回旧"全局 gap"——`_compute_days_back()` 就是这个。
-
-4 个 fetcher 签名都是 `days_back: int | None`：
-
-| fetcher | None 时调用 | 粒度 |
-| --- | --- | --- |
-| `fetch_recent_papers` | `_lookback_for_source("arxiv")` | aggregate（一次调用作用所有 9 个 cs.* 类目） |
-| `fetch_recent_posts` | `_lookback_for_source(source_name)` per feed in `FEEDS` | 每条 RSS feed 独立 |
-| `fetch_recent_sitemap_posts` | `_lookback_for_source(source.source_name)` per `SitemapSource` | 每条 sitemap 源独立 |
-| `fetch_trending_repos` | `_lookback_for_source("github")` | aggregate（一次调用作用所有 17 个关键词） |
-
-`run_ingestion(days_back=None)` 直接把 None 透传给所有 fetcher，每个 fetcher 自己计算窗口（log 里打 `days_back=per-source (cold-start aware)`）。`run_ingestion(days_back=N)` 显式 int 仍透传作 override（log 打 `days_back=N (explicit override)`），CI / 一次性 backfill 使用。
-
-**用户可见效果**：在 `kb/ingestion/rss.py::FEEDS` 里加一行新 RSS feed `("https://x.com/feed", "X Blog")`，或在 `kb/ingestion/sitemap_blog.py::SITEMAP_SOURCES` 里加一条新 `SitemapSource(source_name="...", ...)`，**下次 daily 跑下去会只对这一条 source_name 做 30 天 backfill**（DB 里没有该 source_name 的行 → 命中冷启动分支），其它成熟源继续走窄窗——不再被某条最近被刷的 feed / arxiv 把窗口拉成 1 天。
-
-**循环 import 规避**：`run.py` 在顶层 `from kb.ingestion.rss import ...` 等，4 个 fetcher 模块如果在顶层反向 `from kb.ingestion.run import _lookback_for_source` 会触发"partial module"错误。所有 4 个 fetcher 都用**函数体内的 lazy import**（仅在真的需要 per-source 计算时才执行），避开了模块加载时序问题。新增 fetcher 时务必沿用同款写法。
-
-### 运维脚本（`kb/scripts/`）
-
-| 脚本 | 作用 |
-| --- | --- |
-| `rescore_non_papers.py` | blog/project/talk 行可能已经 `is_processed=1` 但 `quality_score=0.0`；这个脚本枚举此类行并重新评分。支持 `--dry-run` / `--limit N` / `--source-type {blog,project,talk}` |
-
-### Source-anchored chat 数据流（`/api/chat[/stream]` `paper_id` 模式）
-
-```
-POST /api/chat[/stream] {paper_id, query, history}
-        │
-        ▼
-  _build_chat_context(req, db) (synchronous, in request handler):
-    1. Paper.id 查询 (404 if missing — propagates to HTTP error before SSE)
-    2. fetch_full_text(paper_id):
-         a. paper.full_text 非空 → 直接返回
-         b. _looks_like_pdf_url(pdf_url || url) → _download_pdf (20MB/30s)
-            → _extract_text (pypdf) → 写回 Paper.full_text[:120 000] → 返回
-         c. 否则 → summary + abstract fallback (不写库)
-    3. prompt = template + full_text[:60 000] + _format_history(history)
-        │
-        ▼
-  call_llm(prompt)              → ChatResponse(answer, sources=[that paper])
-  /api/chat/stream:
-  StreamingResponse(event_stream()):
-    yield _sse_event("sources", {sources:[paper]})
-    for chunk in stream_llm(prompt): yield _sse_event("token", {content:chunk})
-    yield _sse_event("done", {})
-```
+详见根 CLAUDE.md 第九条与上一轮变更记录。
 
 ---
 
-## 七、测试与质量
+## 八、测试与质量
 
-测试套件已落地，详见 `backend/tests/README.md`。**~180 用例，<10 秒，无网络**。
+测试套件已落地，详见 `backend/tests/README.md`。**~210 用例，<10 秒，无网络**。
 
 | 测试文件 | 覆盖 |
 | --- | --- |
 | `conftest.py` | 隔离临时 SQLite、autouse `_init_db`、session 级 `client` |
-| `test_api_smoke.py` | 路由注册、404、参数校验、Bearer Token 守卫、质量门、universal sort fields、`top_overall`、LIKE 通配符转义、旧 RSS dict-categories 兼容、chat `paper_id` 模式 prompt 含全文 token + sources 仅含目标 paper / `paper_id` 不存在 → 404 / `history[]` 注入 prompt / role pattern 校验（system 拒绝 422）/ `history` `max_length=40` 上限、**`/api/chat/stream` 5 例（`_drain_sse` 辅助；happy path 事件序列 sources→token→done + sources 仅含目标 paper + token 累计 = 完整输出 + 全文 token 进 prompt；history 注入；paper_id 不存在 → 流开始前 HTTP 404；空输出 → 占位 `(LLM produced no output)`；system role → 流开始前 422）** |
+| `test_api_smoke.py` | 路由注册、404、参数校验、Bearer Token 守卫、质量门、universal sort、`top_overall`、LIKE 通配符转义、旧 RSS dict-categories 兼容、chat `paper_id` / history / role 校验、**`/api/chat/stream` 5 例 SSE**（happy path 事件序列 / history 注入 / 404 抛在流前 / 空输出占位 / system role 422）、**`/api/daily/{status,stream}` 6 例**（idle / happy 4-stage / 409 并发 / exception → error / Bearer 守卫 / 中文 banner 识别） |
 | `test_ingestion_arxiv.py` | 类目去重、cutoff、`save_papers` 幂等 |
-| `test_ingestion_rss.py` | bozo / cutoff / dedup / 多 feed 聚合 / tags 规范化 / **per-feed 冷启动**（mature feed 1d 窗口丢弃 10d 老 entry，新 feed 30d 窗口保留） |
-| `test_ingestion_sitemap_blog.py` | `_parse_iso_datetime` 多格式 / `_parse_loose_datetime` 含 `April 29, 2026` LMSYS 风格 / `_parse_sitemap` 命名空间 + 损坏 XML / `_extract_meta` 双向属性顺序 + entity 解码 / `_build_post` 形状契约 / 端到端 happy path（命中 1 条 + 跳过索引页 + 跳过 off-prefix）/ sitemap 网络失败 → [] / 损坏 sitemap → [] / `<lastmod>` 早于 cutoff 的 URL **跳过 fetch**（流量预算）/ 单页失败不影响其它 / 缺 og:title 跳过 / sitemap 无 lastmod 但 `article:published_time` 早 → 二次 cutoff 跳过 / fallback published_date 至 sitemap lastmod / **per-source 冷启动**（mature `SitemapSource` 1d 窗口跳过 10d 老 URL 不发 GET，fresh `SitemapSource` 30d 窗口保留）。**全程 `_FakeClient` 替换 `httpx.Client`，零真实网络** |
-| `test_ingestion_run.py` | `_compute_days_back` 边界 + tz-naive 兼容、**`_lookback_for_source` 4 例（unknown source 走冷启动 / existing source 走 gap / 多 source 隔离 / `None` 等价 `_compute_days_back`）**、4 个 fetcher 同步 days_back 传播（默认 `None`，显式 int override 仍透传）|
+| `test_ingestion_rss.py` | bozo / cutoff / dedup / per-feed 冷启动 |
+| `test_ingestion_sitemap_blog.py` | sitemap 解析 / og:* meta 抽取 / per-source 冷启动 |
+| `test_ingestion_run.py` | `_compute_days_back` / `_lookback_for_source` 4 例 / 4 fetcher 透传 |
 | `test_ingestion_github.py` | auth 头、403 短路、polite sleep |
-| `test_processing_llm.py` | provider 路由、`_clamp_score`、`_sanitize`、4 个 source_type rubric、质量门分桶、non-paper 永远 `is_processed=1`、paper 镜像到 legacy 字段、中文模式 prompt 注入、JSON 键必须英文、`stream_llm` 5 例（路由到 `_STREAM_PROVIDERS[provider]`；mid-stream 异常被静默吞掉但保留已 yield 的 chunk；anthropic 路由；`_stream_hermes` 单 chunk fallback；`_call_hermes` 返空时 `_stream_hermes` 不 yield 空串）、**Fast/Expert 角色 overlay 6 例（expert 命中 `llm_expert_provider`；`llm_expert_provider=None` 时 expert fallback 到 fast；`llm_expert_model` 作为 `model=` kwarg 传递；fast 角色忽略 `llm_expert_model` 仍传 `model=None`；stream 端镜像 expert 路由与 model override）** |
+| `test_processing_llm.py` | provider 路由 / 4 source_type rubric / 中文 prompt / `stream_llm` 5 例 / **Fast/Expert 角色 overlay 6 例** |
 | `test_processing_embeddings.py` | 单例锁、ML 缺失时优雅降级 |
-| `test_processing_pdf.py` | 缓存命中 → 不下载；首次下载 + extract → 写回；非 PDF URL → abstract+summary fallback **不写库**；缺失 paper id → `""`；下载失败 → fallback **不污染缓存** |
-| `test_reports.py` | happy / upsert / 空数据 / 中文模式标题与章节 / 非论文行参与排序 |
+| `test_processing_pdf.py` | 缓存 / 下载 / 抽取 / fallback |
+| `test_reports.py` | happy / upsert / 空数据 / 中文模式 |
 | `fixtures/` | arxiv / rss / github 静态 JSON 样本 |
 
-> Mocking 约定：`_PROVIDERS` / `_STREAM_PROVIDERS` 字典在导入时即捕获函数引用，**测试必须 `monkeypatch.setitem(llm_mod._PROVIDERS, "...", mock)` / `monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "...", mock)`**，不能 `patch("kb.processing.llm._call_anthropic")`。
-> 对 chat 测试 mock LLM：`monkeypatch.setattr(main_mod, "call_llm", _fake_call_llm)` / `monkeypatch.setattr(main_mod, "stream_llm", _fake_stream_llm)`（main 在导入时把它们拉进自己的命名空间）。
-> 对 SSE 测试解码：用 `client.stream("POST", "/api/chat/stream", json=...)` + `iter_text()` 拼回完整 body，再按 `\n\n` 切帧，按行匹配 `event:` / `data:`（参考 `test_api_smoke.py::_drain_sse` 实现）。
-> 对 PDF 测试 mock 网络：`monkeypatch.setattr(pdf_mod, "_download_pdf", lambda url: b"...")` + `monkeypatch.setattr(pdf_mod, "_extract_text", lambda blob: "...")`。
-
-Lint：`ruff` 已在 `[dev]` extra 中。
+> Mocking 约定：
+> - `_PROVIDERS` / `_STREAM_PROVIDERS` 字典：`monkeypatch.setitem(llm_mod._PROVIDERS, "...", mock)`。
+> - chat LLM mock：`monkeypatch.setattr(main_mod, "call_llm", _fake_call_llm)` / `monkeypatch.setattr(main_mod, "stream_llm", _fake_stream_llm)`，签名要接受 `role` kwarg：`def _fake_call_llm(prompt, role: str = "fast"): ...`。
+> - daily pipeline mock：`monkeypatch.setattr(daily_mod, "run_daily_pipeline", _fake_pipeline)`；worker thread 内 lazy import 才能命中 patch。
+> - daily SSE 解码：`_drain_daily_sse(client)` 跳过 `:` keepalive 注释帧；`_reset_daily_state()` 在每个 daily test 开头清单例。
+> - PDF mock：`monkeypatch.setattr(pdf_mod, "_download_pdf", lambda url: b"...")`。
 
 ---
 
-## 八、CI（`.github/workflows/ci.yml`）
+## 九、CI（`.github/workflows/ci.yml`）
 
 | Job | 内容 |
 | --- | --- |
-| `backend-tests` | Python 3.12 → `pip install -e '.[dev]' && pip install pytest-cov` → `pytest tests/ -x -q --cov=kb --cov-report=term-missing`；`KB_LLM_PROVIDER=hermes`（mock 层屏蔽真实 CLI） |
+| `backend-tests` | Python 3.12 → `pip install -e '.[dev]' && pip install pytest-cov` → `pytest tests/ -x -q --cov=kb --cov-report=term-missing`；`KB_LLM_PROVIDER=hermes` |
 | `frontend-typecheck` | Node 20 → `npm ci` → `tsc --noEmit` + `eslint src/` |
 | `frontend-e2e` | Node 20 → `npm ci` → `playwright install --with-deps chromium` → `npm run build && npm run test:e2e` |
 
-新增/修改后端代码时务必本地 `pytest tests/ -x -q` 通过再推。
-
 ---
 
-## 九、Docker / 部署
+## 十、Docker / 部署
 
 `backend/Dockerfile`：
 
 - 基础镜像 `python:3.12-slim`；装 `build-essential` / `curl` / `ca-certificates`。
-- `ARG INSTALL_EXTRAS=ml,llm-cloud` → `pip install ".[${INSTALL_EXTRAS}]"`；空串走 `pip install .`（最小镜像）。
+- `ARG INSTALL_EXTRAS=ml,llm-cloud` → `pip install ".[${INSTALL_EXTRAS}]"`。
 - `VOLUME ["/app/data"]`，所有 SQLite + ChromaDB 文件持久化到 host bind-mount。
-- `HEALTHCHECK` curl `/api/health`；compose 中 frontend 用 `service_healthy` 等待 backend。
-- **`CMD ["uvicorn", "kb.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]`**——`75 s` 必须 ≥ Next 反代连接池任何 idle 窗口，否则前端会随机 ECONNRESET → "Sorry, I couldn't process that query"。**SSE 流式响应天然依赖长 keep-alive**，对 `/api/chat/stream` 这条修复尤其关键。
-- Dockerfile 注释里详述了 keep-alive 修复的来龙去脉（uvicorn 默认 5 s vs Next fetch agent 连接池）。
+- `HEALTHCHECK` curl `/api/health`。
+- **`CMD ["uvicorn", "kb.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]`**——`75 s` 必须 ≥ Next 反代连接池任何 idle 窗口。**SSE 流式响应（`/api/chat/stream` 与 `/api/daily/stream`）天然依赖长 keep-alive**。
 
 `docker-compose.yml` 内 backend 自动覆盖三个变量：
 
@@ -417,30 +436,29 @@ KB_DATA_DIR: /app/data
 KB_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
 ```
 
-`daily` 服务复用 backend 镜像，靠 `profiles: ["cron"]` 隔离，需要 `docker compose --profile cron run --rm daily` 才会启动。
+`daily` 服务复用 backend 镜像，靠 `profiles: ["cron"]` 隔离。
+
+> **网页 vs cron 触发的区别**：cron `docker compose --profile cron run --rm daily` 启一个**新的容器**跑 `python -m kb.daily` 然后退出，跟主 backend 容器完全隔离；网页 Run-Now 按钮（`POST /api/daily/stream`）在**主 backend 容器**的 daemon thread 内跑——相当于"占用主进程的工作时间和内存"。两种方式数据隔离都靠 SQLite 的写锁；并发跑两次 daily 会有写锁竞争，所以 `_DailyRunState` 内 lock + 409 是必要的。
 
 ---
 
-## 十、常见问题 (FAQ)
+## 十一、常见问题 (FAQ)
 
-- **首次 `/api/chat[/stream]` 慢？** 正常，第一次会加载 SentenceTransformer 模型（5–10 秒）；`lifespan` 已在 `asyncio.create_task` 中后台预热，所以 startup 与 `/api/health` 立即可用。Source-anchored 模式首次 PDF 下载 + 抽取也会增加 5-15 秒，下次走 `Paper.full_text` 缓存。
-- **`hermes` CLI 不存在？** `KB_LLM_PROVIDER=hermes` 时若 PATH 找不到 `hermes`，`call_llm` 返回空串并打 ERROR；`stream_llm` 走 `_stream_hermes` 也只会 yield 0 个 chunk（空字符串短路），SSE 端点会自动发占位 `(LLM produced no output)` token。改为 `anthropic` / `openai` / `deepseek` 即可。**Docker 镜像不带 hermes**——必须改 provider。
-- **DeepSeek / OpenAI streaming 超时？** `_stream_openai_compatible` 已传 `timeout=settings.llm_timeout_seconds`；DeepSeek 长上下文响应可能 >60 秒，必要时调高 `KB_LLM_TIMEOUT_SECONDS`。
-- **GitHub 429？** 必须设置 `GITHUB_TOKEN` 或 `KB_GITHUB_TOKEN`，无 token 限流极严。
-- **新加路由位置敏感**：`/api/papers/search` 必须在 `/api/papers/{paper_id}` 之前；新增以 `/api/papers/<word>` 起头的路由也需排在动态路由之前。
-- **`/api/chat[/stream]` 突然 401？** 检查 `KB_CHAT_TOKEN` 是否在 `.env` 或宿主环境被设置；前端目前未携带该头，开启 token 后需要在 `frontend/src/lib/api.ts` 中追加。
-- **既存非论文行 `quality_score=0.0`？** 这是 universal scoring 之前 ingest 的行，跑一次 `python -m kb.scripts.rescore_non_papers --dry-run` 看清单，确认后去掉 `--dry-run` 即可回填。
-- **修改 `KB_LANGUAGE` 后已有数据没变？** 语言只影响"未来打分 / 未来日报"，已存进 SQLite 的 `summary` / `score_rationale` / `daily_reports.content` 不会自动重译；如需切换可手动 `UPDATE papers SET is_processed=0 WHERE ...` 触发重处理。**注意**：本轮起 `/api/chat[/stream]` 的 prompt 已硬编码为中文，**不再受 `KB_LANGUAGE` 控制**——切换 chat 输出语言需要直接改 `_build_chat_context` 模板。
-- **`run_daily_pipeline` 看到第一次跑了所有论文之后突然变慢？** 这就是处理 / 嵌入冷启动机制——第二次起每次只处理 / 嵌入 100 条；这是预期（与 ingest 回看无关）。
-- **新加 RSS feed 后 daily 只抓到 0 篇？** 不会再发生。Per-source ingest 冷启动会探测到这个 `source_name` 在库里没有任何已入库行，下次 daily 自动给它 30 天 backfill（见 `_lookback_for_source`）。如果你之前手动跑过 `kb.ingestion.run --days-back 1` 已经种了一行就破坏了冷启动条件——清掉那行（`DELETE FROM papers WHERE source_name='...' AND ...`）让 source 重新进入冷启动状态，或显式 `python -m kb.ingestion.run --days-back 30` 兜底（注意：这是个 Python 模块，没有 `--days-back` CLI 参数，需手动改 `if __name__ == "__main__":` 调用或写一行临时脚本 `python -c "from kb.ingestion.run import run_ingestion; run_ingestion(days_back=30)"`）。
-- **聊天页随机 "Sorry, I couldn't process that query"？** 通常是 uvicorn keep-alive 与 Next 反代连接池的 ECONNRESET 竞态；已在 `Dockerfile` 与 `run_api.sh` 加 `--timeout-keep-alive 75` 修复。如果仍发生，检查中间是否还有别的反代（cpolar / nginx）也需同步调高 idle timeout，并确保未对 `text/event-stream` 做缓冲（响应头 `X-Accel-Buffering: no` 已加，但部分代理需要全局开关）。
-- **`/api/chat/stream` 返回 200 但前端没 token？** 排查链：① 查 `Network` 面板的 EventStream 视图看是否真有 `event: token` 帧到达；② 中间反代是否对 `text/event-stream` 做了 buffering（nginx 默认对 chunked response 缓冲）；③ provider 是否真的在 stream（hermes 一次性返回是预期的）；④ keep-alive 是否被 30 s 之类的极短 idle timeout 砍掉。
-- **source-anchored chat 抽出的全文是乱码？** 多半是 URL 指向 HTML 页面而非 PDF 但被 `_looks_like_pdf_url` 误判；扩白名单时务必 `.endswith(".pdf")` 或显式 substring，否则 pypdf 解析 HTML 会输出乱码并被缓存。需要时手动 `UPDATE papers SET full_text='' WHERE id=...` 清缓存。
-- **PDF 太大 / 网络太慢？** `_MAX_PDF_BYTES=20 MB`、`_DOWNLOAD_TIMEOUT_S=30 s`；任何超量都返回 `None` 并 fallback 到 abstract+summary，**不会 OOM 或挂住请求**。
+- **首次 `/api/chat[/stream]` 慢？** 正常，第一次会加载 SentenceTransformer 模型。
+- **`hermes` CLI 不存在？** `KB_LLM_PROVIDER=hermes` 时若 PATH 找不到 `hermes`，`call_llm` 返回空串。改为 `anthropic` / `openai` / `deepseek` 即可。
+- **DeepSeek / OpenAI streaming 超时？** 调高 `KB_LLM_TIMEOUT_SECONDS`。
+- **新加路由位置敏感**：`/api/papers/search` 必须在 `/api/papers/{paper_id}` 之前。
+- **`/api/chat[/stream]` / `/api/daily/*` 突然 401？** 检查 `KB_CHAT_TOKEN`。
+- **`POST /api/daily/stream` 返回 409？**（本轮新增）有另一个 in-flight run；前端 `getDailyStatus()` 探测 `running=true` 时按钮 disabled。如果 `_DailyRunState._running=true` 但实际 worker thread 已死（罕见，进程异常崩了），重启 backend 进程清状态。
+- **`POST /api/daily/stream` 流出来的 stage 没切？**（本轮新增）检查 `kb/daily.py` 的 banner 是不是还按 `[N/4]` 格式 print；`_STAGE_PATTERN = r"\[([1-4])/4\]"` 是和 banner 格式硬约定。
+- **`/api/daily/stream` log 帧很多但缺业务关键日志？**（本轮新增）`_QueueLogHandler` 监听 root logger，但 ingestion / processing 子模块的 logger 必须 propagate=True（默认是）才会冒泡到 root。如果在某个子模块改了 `logger.propagate = False` 会导致那段日志看不到。
+- **网页 Run-Now 跑到一半浏览器关了，pipeline 怎么样？**（本轮新增）daemon thread 不受 SSE 客户端断开影响，pipeline 继续在 backend 跑完 → 写库 → 释放 `_DailyRunState` 锁。下次 `/reports` 页面 mount 时 `getDailyStatus()` 会显示 idle，新数据已落库。**真正会中断 pipeline 的只有 backend 进程退出**。
+- **聊天页随机 "Sorry, I couldn't process that query"？** 检查 `--timeout-keep-alive 75` 是否到位；中间反代是否对 `text/event-stream` 做了 buffering。
+- **source-anchored chat 抽出的全文是乱码？** 多半是 URL 被 `_looks_like_pdf_url` 误判为 PDF；扩白名单时务必 `.endswith(".pdf")` 或显式 substring。
 
 ---
 
-## 十一、相关文件清单（精选）
+## 十二、相关文件清单（精选）
 
 ```
 backend/
@@ -449,48 +467,50 @@ backend/
 ├─ .dockerignore           # 排除 data/ / tests/ / __pycache__ / .env
 ├─ run_api.sh              # uvicorn ... --reload --timeout-keep-alive 75
 ├─ tests/
-│  ├─ README.md            # 测试套件说明（~115 用例）
+│  ├─ README.md            # 测试套件说明 (~210 用例)
 │  ├─ conftest.py
-│  ├─ test_api_smoke.py    # 含 Bearer Token / 质量门 / universal sort / chat paper_id+history / SSE 5 例
+│  ├─ test_api_smoke.py    # 含 Bearer Token / 质量门 / universal sort / chat paper_id+history / SSE 5 例 / daily-stream 6 例（本轮新增）
 │  ├─ test_ingestion_*.py
-│  ├─ test_processing_llm.py # 含 4-rubric / 中文模式 / JSON 失败重试 / stream_llm 5 例
+│  ├─ test_processing_llm.py
 │  ├─ test_processing_embeddings.py
-│  ├─ test_processing_pdf.py  # PDF 缓存 / 下载 / fallback
+│  ├─ test_processing_pdf.py
 │  ├─ test_reports.py
 │  └─ fixtures/
 └─ kb/
-   ├─ main.py              # FastAPI 应用 / 路由 / verify_chat_token / _build_chat_context / chat & chat_stream / _sse_event / _format_history
-   ├─ config.py            # Pydantic Settings
-   ├─ database.py          # engine / SessionLocal / init_db / 兼容列(含 full_text)+索引
+   ├─ main.py              # FastAPI 应用 / 路由 / verify_chat_token / _build_chat_context / chat & chat_stream / daily_status & daily_stream（本轮新增） / _DailyRunState / _QueueLogHandler / _QueueStdoutWriter / _STAGE_PATTERN
+   ├─ config.py            # Pydantic Settings（含 llm_expert_provider/model）
+   ├─ database.py          # engine / SessionLocal / init_db / 兼容列+索引
    ├─ models.py            # Paper（含 universal axes + full_text）/ DailyReport
-   ├─ schemas.py           # PaperOut / ChatMessage / ChatRequest（paper_id + history）/ ChatResponse
-   ├─ daily.py             # 全流水线编排（冷启动检测 + --lang）
-   ├─ reports.py           # 日报生成（按 max(quality, relevance) 排序 / 中文模式）
+   ├─ schemas.py           # PaperOut / ChatMessage / ChatRequest / ChatResponse
+   ├─ daily.py             # 全流水线编排（冷启动检测 + --lang）；既是 CLI 入口，也是 /api/daily/stream 在 worker thread 内 lazy import 调用的目标
+   ├─ reports.py           # 日报生成（fast 角色）
    ├─ ingestion/
    │  ├─ arxiv.py
-   │  ├─ rss.py            # 11 源 + tag 规范化
+   │  ├─ rss.py            # 12 源
+   │  ├─ sitemap_blog.py
    │  ├─ github_trending.py
-   │  └─ run.py            # _lookback_for_source per-source 冷启动 + run_ingestion 透传 None / int
+   │  └─ run.py            # _lookback_for_source per-source 冷启动
    ├─ processing/
-   │  ├─ llm.py            # provider 抽象（4 种）+ 4 rubric + 中英双语 + stream_llm + _stream_openai_compatible 公共体
-   │  ├─ embeddings.py     # ChromaDB + sentence-transformers
-   │  └─ pdf.py            # fetch_full_text / _download_pdf / _extract_text / abstract fallback
+   │  ├─ llm.py            # provider 抽象（4 种）+ Fast/Expert 双角色 + stream_llm
+   │  ├─ embeddings.py
+   │  └─ pdf.py
    └─ scripts/
-      └─ rescore_non_papers.py  # 一次性回填非论文 universal scores
+      └─ rescore_non_papers.py
 ```
 
 ---
 
-## 十二、变更记录 (Changelog)
+## 十三、变更记录 (Changelog)
 
 | 时间 | 操作 | 说明 |
 | --- | --- | --- |
 | 2026-04-25 09:59:45 | 初始化 | 自动生成 backend 模块 `CLAUDE.md` |
-| 2026-04-25 15:26:48 | 增量刷新 | 新增 `deepseek` provider 文档；补充 `/api/chat` 的 `verify_chat_token` Bearer 守卫细节与 `hmac.compare_digest` 约定；新增 `KB_CHAT_TOKEN` / `KB_DEEPSEEK_*` / `KB_CHAT_QUERY_MAX_LEN` / `KB_CHAT_TOP_K_MAX` 配置；同步 `backend/tests/README.md`；新增"CI"章节 |
-| 2026-04-25 16:50 | 质量门 | 新增 `KB_QUALITY_SCORE_THRESHOLD`（默认 7.0），`summarize_and_score` 落桶 `is_processed=1`/`2`/`0`；阈值用 `max(originality, impact)` 比较；`/api/papers` 与 `/api/papers/search` 默认仅返 `is_processed=1`；`/api/stats` 拆三档；新增 8 个测试覆盖分桶逻辑 |
-| 2026-05-02 08:57:04 | 增量刷新 | ① Universal Score Axes（4 rubrics + paper legacy 镜像 + universal sort + top_overall）② 中文 LLM 输出 `KB_LANGUAGE` ③ Docker 镜像 + compose ④ 自适应 ingest 回看窗 ⑤ 冷启动批处理 ⑥ 运维脚本 `rescore_non_papers.py` ⑦ RSS 源精简到 11 个 ⑧ schemas `categories` field_validator |
-| 2026-05-02 20:12:04 | 增量刷新 | ① `/api/chat` 多轮 + source-anchored 双模式：`schemas.ChatMessage` (`role` ∈ {user, assistant})；`ChatRequest.paper_id: int \| None` + `history: list[ChatMessage]`（`max_length=40`）；`main.py::_format_history`（`_HISTORY_TURN_CAP=12`，单条 4 000 字符 cap）；`paper_id` 模式跳过 RAG，调 `fetch_full_text` 拼 prompt（≤60 000 字符），`sources` 仅返该 paper，缺失 → 404。② `kb/processing/pdf.py`（新）：`fetch_full_text(paper_id)` — `httpx.Client.stream` 流式下载（20 MB / 30 s 上限）→ `pypdf.PdfReader` 抽取 → `[:120 000]` 截断写回 `Paper.full_text`；非 PDF URL → `summary + abstract` fallback **且不写库**；`Paper.full_text` 列加入 `_BACKCOMPAT_COLUMNS`；`pypdf>=5.0` 提为默认依赖。③ uvicorn keep-alive：`Dockerfile.CMD` 与 `run_api.sh` 都加 `--timeout-keep-alive 75`，修复 Next 反代 ECONNRESET 竞态。④ 测试：新增 `tests/test_processing_pdf.py`（5 例），`test_api_smoke.py` 加 5 例 chat-mode；套件 ~95 → ~105。 |
-| 2026-05-02 21:18:53 | 增量刷新 | ① **`/api/chat/stream` SSE 端点（新）**（`kb/main.py`）：返回 `text/event-stream`，事件序列固定 `sources → token... → done`，可选 `error`；token 流空时发占位 `(LLM produced no output)`；header `Cache-Control: no-cache` + `X-Accel-Buffering: no`；**与 `/api/chat` 共享 `verify_chat_token` 守卫与新抽出的 `_build_chat_context(req, db) -> (prompt, sources)`**——HTTPException（如 paper_id 404）必须在 `event_stream()` 之外抛出，让客户端见到正常 HTTP 错误而非空 SSE。新增 `_sse_event(event, data)` helper（`json.dumps(..., ensure_ascii=False)` 保中文紧凑）。② **`stream_llm` 抽象（新）**（`kb/processing/llm.py`）：与 `call_llm` 平行的公开 API；`_STREAM_PROVIDERS = {hermes, anthropic, openai, deepseek}`；任何 provider 失败静默 `return`（generator 结束，从不 raise，对齐 `call_llm` 的空字符串契约）。`_stream_anthropic` 走 `client.messages.stream(...).text_stream`；新抽出 `_stream_openai_compatible(api_key, model, base_url=None)` 公共体被 `_stream_openai` 与 `_stream_deepseek` 复用（`stream=True` + `chunk.choices[0].delta.content`）；`_stream_hermes` 因子进程不能真正流式，实现为"调 `_call_hermes` 拿全文 → yield 单 chunk（空字符串则不 yield）"。③ **Chat 系统 prompt 改为中文硬编码**（`_build_chat_context`）：从英文 "You are an expert GPGPU chip architect ..." 改成 "你是一名资深的 GPGPU 芯片架构助理 ..."，结尾"请用简体中文作答"。**`KB_LANGUAGE` 不再影响 chat prompt（仅影响 summarization / scoring / reports）**；要回退英文需直接改模板。④ **`backend/Dockerfile` / `backend/run_api.sh`** 内容相对上轮无新 delta（`--timeout-keep-alive 75` 已在位），但本轮 SSE 长连接对其依赖性更强，Dockerfile 注释新增 ECONNRESET 竞态背景说明（uvicorn 5 s 默认 vs Next fetch agent 连接池）。⑤ **测试**：`test_api_smoke.py` 加 5 例 SSE（`_drain_sse` 辅助 + happy path 事件序列校验 + history 注入 + 404 在流开始前抛 + 空输出占位 + system role 422）；`test_processing_llm.py` 加 5 例 streaming（路由 / 异常静默吞掉但保留已 yield chunk / anthropic 路由 / hermes fallback / hermes 空时不 yield）。套件 ~105 → ~115。所有 delta 已通过直接读取 `kb/main.py` / `kb/processing/llm.py` / `tests/test_api_smoke.py` / `tests/test_processing_llm.py` / `Dockerfile` / `run_api.sh` 源码核对。 |
-| 2026-05-02 23:32:00 | 增量刷新 | 新增博客来源（vLLM Blog 进 RSS FEEDS / LMSYS · SGLang Blog 走 sitemap-driven scraper）+ 新模块 `kb/ingestion/sitemap_blog.py`（`SitemapSource` dataclass + sitemap.xml 解析 + per-page og:* meta 抽取 + 60 篇/源 上限）+ `kb/ingestion/run.py` 编排独立 stage `results["sitemap_blogs"]` + 30 例左右 sitemap_blog 单元测试 + orchestrator 测试升级到 4 fetcher。套件 ~115 → 174 pass。 |
-| 2026-05-03 09:44:00 | 增量刷新 | **Per-`source_name` ingest 冷启动**。① **`kb/ingestion/run.py`**：新增 `_lookback_for_source(source_name: str \| None)`（带可选 `WHERE Paper.source_name = :name` 过滤），与 `_compute_days_back` 共用 clamp 逻辑；该 source_name 下 MAX(ingested_date) 为 NULL → `settings.ingest_empty_db_days`（30）走冷启动。`_compute_days_back()` 退化为 `_lookback_for_source(None)` 薄包装。`run_ingestion(days_back: int \| None)` 不再在顶部统一算一次——直接透传 None / int 给 4 个 fetcher，每个自己决定窗口；日志区分 `per-source (cold-start aware)` 与 `explicit override`。② **fetcher 签名统一为 `days_back: int \| None`**：`fetch_recent_papers` 调 `_lookback_for_source("arxiv")`、`fetch_trending_repos` 调 `_lookback_for_source("github")`（aggregate `source_name`，行为与今天一致）；`fetch_recent_posts` 在 `for feed_url, source_name in FEEDS` 循环里 per-feed 调用（每条 feed 独立打 `[rss] X: lookback=Yd`）；`fetch_recent_sitemap_posts` 在 `for source in SITEMAP_SOURCES` 循环里 per-`SitemapSource` 调用。**4 个 fetcher 都用函数体内的 lazy import 取 `_lookback_for_source`** 避开 run.py ↔ 4 个 fetcher 模块的双向 top-level import 顺序问题。③ **效果**：在 `FEEDS` 加新 feed 或 `SITEMAP_SOURCES` 加新源后，下次 daily 自动只对那条新 source_name 做 30 天 backfill。④ **测试**：`test_ingestion_run.py` `_seed_paper` 加 `source_name` 形参；新增 4 例 `_lookback_for_source` 单元（unknown source 走冷启动 / existing source 走 gap / 多 source 隔离 / `None` 等价 `_compute_days_back`）；`_spy_run_ingestion` 改捕 `int \| None`；`test_run_ingestion_propagates_cold_start_window_to_all_sources` → `test_run_ingestion_default_propagates_none_to_all_sources`（断言 4 fetcher 都收 None）；override 测试不变。`test_ingestion_rss.py` 加 `test_per_feed_cold_start_when_days_back_is_none`（mature feed 1d 窗口丢弃 10d 老 entry / fresh feed 30d 窗口保留）。`test_ingestion_sitemap_blog.py` 加 `test_per_source_cold_start_when_days_back_is_none`（mature `SitemapSource` per-source pre-filter 阻止 GET / fresh `SitemapSource` 保留）。⑤ **测试套件 174 → 180 pass**（`pytest tests/ -q` 离线 6.6s）。⑥ **`daily.py::_is_cold_start` / `_is_embedding_cold_start`** 不动（处理 / 嵌入批冷启动是不同维度）；`KB_INGEST_*` config 沿用；API / 前端 / DB / migration 不动。⑦ **CLAUDE.md** 同步：第三章 fetcher 表更新；第六章新增"Per-Source ingest 冷启动"段落详述 4 fetcher 粒度矩阵 + lazy import 规避循环；测试表加新覆盖；变更记录新增本条目。所有 delta 已通过直接读取 `kb/ingestion/run.py` / `kb/ingestion/rss.py` / `kb/ingestion/sitemap_blog.py` / `kb/ingestion/arxiv.py` / `kb/ingestion/github_trending.py` / `tests/test_ingestion_run.py` / `tests/test_ingestion_rss.py` / `tests/test_ingestion_sitemap_blog.py` 源码核对。 |
-| **2026-05-03 21:41:00** | **增量刷新** | **Fast / Expert 双角色 LLM**。① **`kb/config.py`**：`Settings` 追加 `llm_expert_provider: str \| None = None` 与 `llm_expert_model: str \| None = None`；都不设则 expert 角色透明回退到 fast，行为与今天完全一致。② **`kb/processing/llm.py`**：新增 `_resolve_role(role: str) -> tuple[str, str \| None]` — `role="expert"` 返回 `(llm_expert_provider or llm_provider, llm_expert_model)`，其它（fast / 任意值）返回 `(llm_provider, None)`。所有 `_call_* / _stream_*` 统一新增 `*, model: str \| None = None` kwarg，`model=None` 时沿用 `settings.<provider>_model`，不为 None 时作为 override（`_stream_openai_compatible` 本来就要求 model 是必填位置参数，由 `_stream_openai` / `_stream_deepseek` 各自 `model or settings.<provider>_model` 解析后传入；`_call_hermes` / `_stream_hermes` 接受但忽略该参数，hermes CLI 无 --model flag）。`call_llm(prompt, role="fast")` / `stream_llm(prompt, role="fast")` 先解析角色再调 `_PROVIDERS[provider_name](prompt, model=model_override)`；unknown-provider 回退 hermes、exception 吞咽的行为不变。`_call_llm = call_llm` 向后兼容别名保留（继承默认 fast 角色）。③ **`kb/main.py`**：`chat()` 改 `call_llm(prompt, role="expert")`，`chat_stream::event_stream` 改 `stream_llm(prompt, role="expert")`；`_build_chat_context` / `_sse_event` / Bearer 守卫 / SSE 头 / 事件序列契约全部不动。④ **`kb/reports.py::generate_daily_report` 与 `kb/processing/llm.py::summarize_and_score`**：两处 `call_llm(prompt)` 均保持默认 fast 角色（省钱路径）。⑤ **测试**：`test_processing_llm.py` 既有 provider-dispatch 断言由 `mock.assert_called_once_with("test prompt")` 升级为 `..._with("test prompt", model=None)`；streaming mock 签名 `def _mock_stream(prompt, *, model=None):`；`_stream_hermes` 的 `_call_hermes` 打桩 lambda 也补 `*, model=None`。新增 6 例角色 overlay：①expert 路由到 `llm_expert_provider` 而非 `llm_provider`、②`llm_expert_provider=None` 时 expert fallback 到 fast、③`llm_expert_model` 作为 `model=` kwarg 传递给 provider、④fast 角色忽略 `llm_expert_model` 仍传 `model=None`、⑤stream 端镜像 expert 路由、⑥stream 端镜像 expert model override。`test_api_smoke.py` 中 5 处 `_fake_call_llm` / `_fake_stream_llm` mock 签名升级到 `(prompt, role: str = "fast", ...)` 以接受新 kwarg。⑥ **套件 180 → 203 pass**（`pytest tests/ -x -q` 实测 ~24 s）。⑦ **`.env.docker.example`**：新增 expert 角色配置段并给出同 provider 换模型 + 跨 provider 两种示例。⑧ **CLAUDE.md** 同步：Provider 矩阵后新增"Fast / Expert 双角色（role overlay）"章节（含调用点表 + 配置规则 + hermes 不支持模型切换提示）；测试表加 6 例描述；变更记录新增本条目。⑨ **不影响**：前端 `/api/chat` / `/api/chat/stream` 契约、DB schema、migration、Docker 构建、hermes / anthropic / openai / deepseek 已有 provider 的外部行为全部不动。所有 delta 已通过直接读取 `kb/config.py` / `kb/processing/llm.py` / `kb/main.py` / `tests/test_processing_llm.py` / `tests/test_api_smoke.py` / `.env.docker.example` 源码核对。 |
+| 2026-04-25 15:26:48 | 增量刷新 | 新增 `deepseek` provider；补充 `verify_chat_token` Bearer 守卫细节；新增 `KB_CHAT_TOKEN` / `KB_DEEPSEEK_*`；新增"CI"章节 |
+| 2026-04-25 16:50 | 质量门 | 新增 `KB_QUALITY_SCORE_THRESHOLD`；is_processed 落桶 0/1/2 |
+| 2026-05-02 08:57:04 | 增量刷新 | Universal Score Axes / 中文 LLM 输出 / Docker 镜像 / 自适应 ingest 回看窗 / 冷启动批处理 / 运维脚本 / RSS 源精简 |
+| 2026-05-02 20:12:04 | 增量刷新 | 多轮 + source-anchored chat / `kb/processing/pdf.py` / `Paper.full_text` / pypdf 默认依赖 / `--timeout-keep-alive 75` |
+| 2026-05-02 21:18:53 | 增量刷新 | `/api/chat/stream` SSE 端点 / `_build_chat_context` 共享 / `stream_llm` 抽象 / `_STREAM_PROVIDERS` 字典 / `_stream_openai_compatible` 公共体 / chat 系统 prompt 改为中文硬编码 |
+| 2026-05-02 23:32:00 | 增量刷新 | vLLM Blog + LMSYS / SGLang Blog (sitemap) / `kb/ingestion/sitemap_blog.py` / 测试 ~115 → 174 pass |
+| 2026-05-03 09:44:00 | 增量刷新 | per-`source_name` ingest 冷启动 / `_lookback_for_source` / 测试 174 → 180 pass |
+| 2026-05-03 21:41:00 | 增量刷新 | Fast / Expert 双角色 LLM；`call_llm` / `stream_llm` 新增 `role` 参数；`KB_LLM_EXPERT_PROVIDER` / `KB_LLM_EXPERT_MODEL`；`/api/chat[/stream]` 显式 expert；测试 180 → 203 pass |
+| **2026-05-03 22:34:43** | **增量刷新** | **手动触发 daily pipeline + SSE 进度（新）**。① **新端点（`backend/kb/main.py`）**：`GET /api/daily/status`（返回 `_DailyRunState.status()` 快照 `{running, started_at, current_stage}`）+ `POST /api/daily/stream`（SSE 流，事件序列 `started → stage(≤4) → log(N) → done\|error`，15s idle 发 `: keepalive\n\n` SSE comment 帧；header `X-Accel-Buffering: no` + `Cache-Control: no-cache`；并发第二个 POST → HTTP 409）。**两端点都挂 `dependencies=[Depends(verify_chat_token)]`**——任何"昂贵 / 写入 / 触发任务"端点都必须复用同款 Bearer 守卫。② **执行架构**：`_DailyRunState` 单例（`threading.Lock` + `_running` flag + `Queue(maxsize=2000)`），`try_start()` 原子拿锁防并发；`_run_daily_in_worker(queue)` 在 daemon thread 内 `from kb.daily import run_daily_pipeline; run_daily_pipeline()`（**lazy import** 让测试 `monkeypatch.setattr(daily_mod, "run_daily_pipeline", ...)` 在 worker 启动后才解析到 patch）。**无 subprocess**——daemon thread 直接占用主 backend 进程的工作时间，等价于"`python -m kb.daily` 在前台跑"。`_QueueLogHandler` 注入 root logger 把 `logging.*` 行泵进 queue；`_QueueStdoutWriter` 经 `contextlib.redirect_stdout` 把 banner `print()` 也泵进 queue（`kb/daily.py` 的 `[N/4] <stage>` 启动 banner 是 print 而非 log）。`finally` 里**必发 `("__terminator__", None)` sentinel** 让 generator break——否则 generator 永远悬挂在 `queue.get(timeout=15)` 等不到 sentinel。③ **Stage 检测**：`_STAGE_PATTERN = re.compile(r"\[([1-4])/4\]")` + `_STAGE_NAMES = {1:"ingestion",2:"processing",3:"embedding",4:"report"}`。`kb/daily.py` 不管 `KB_LANGUAGE` 设啥都打 `[N/4]` 前缀（仅 stage 名翻译，banner 格式是固定契约），所以中英文 banner 都能识别——测试 `test_daily_stage_pattern_matches_chinese_banner` 直接断言 `[1/4] 数据采集` / `[2/4] 处理（摘要 + 打分）` / `[3/4] 向量化` / `[4/4] 每日简报` 全 4 个都被切到对应 stage 帧。④ **Generator 流程**：`yield _sse_event("started", {started_at})` → 循环 `queue.get(timeout=15)`：① `__terminator__` → `terminal_emitted=False` 时 emit `done`，break；② `__done__` / `__error__` → emit + `terminal_emitted=True` 抑制重复；③ `Empty` → `yield ": keepalive\n\n"`（前端 `_parseDailyFrame` 显式跳过 `:` 开头的注释帧）；④ `log` → 用 `_STAGE_PATTERN.search(line)` 切 stage（去重靠 `last_stage_emitted`），然后 emit `log`。⑤ **测试**（`backend/tests/test_api_smoke.py`）：新增 `_drain_daily_sse(client)` 辅助（与 `_drain_sse` 镜像但显式跳过 `:` keepalive 帧）+ `_patch_daily(monkeypatch, fake_pipeline)` 辅助（`monkeypatch.setattr(daily_mod, "run_daily_pipeline", ...)`，worker thread 内 lazy import 命中 patch）+ `_reset_daily_state()` 辅助（每个 daily test 开头强制清单例 `_DailyRunState` 状态，因为 session-scoped TestClient 跨 test 共享 app 实例）。6 例：`test_daily_status_idle_by_default`（GET `/api/daily/status` → `{running:false, started_at:null, current_stage:null}`）/ `test_daily_stream_emits_started_stages_and_done`（fake pipeline print 4 个英文 stage banner，断言 events 序列 `started → 4×stage（index 1..4）→ done`，且 `log` 帧含 banner 行）/ `test_daily_stream_concurrent_returns_409`（用 `threading.Event` 让 fake pipeline 阻塞 → background thread drain 第一个流 → 主 thread 检查 `getDailyStatus().running=true` + 第二个 POST → HTTP 409 + `release.set()` 让第一个流 done）/ `test_daily_stream_pipeline_exception_emits_error`（fake pipeline `raise RuntimeError("boom")` → events 含 `error` 不含 `done`，`message` 含 "boom"）/ `test_daily_endpoints_require_token_when_set`（`KB_CHAT_TOKEN` 设置后两端点都 401，正确 token 不 401）/ `test_daily_stage_pattern_matches_chinese_banner`（中文 banner 也被切 4 个 stage）。⑥ **不影响**：`/api/chat` / `/api/chat/stream` 多轮 / source-anchored / fast-expert 双角色 / SSE 流式 chat / per-source ingest 冷启动 / sitemap blog / DB schema / migration / Docker / 已有 provider 行为全部不动。`run_daily_pipeline()` 函数本身**没有改动**——它既是 CLI（`python -m kb.daily`）的入口、也是 cron 容器（`docker compose --profile cron run --rm daily`）的入口、本轮起还是 `/api/daily/stream` 的 worker thread lazy import 目标，**三种入口共用同一份代码与 SQLite 写锁**。所有 delta 已通过直接读取 `backend/kb/main.py` / `backend/tests/test_api_smoke.py` 源码核对。 |

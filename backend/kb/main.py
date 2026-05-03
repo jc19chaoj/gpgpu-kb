@@ -1,10 +1,15 @@
 # kb/main.py
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
 import os
+import re
+import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from queue import Empty, Full, Queue
 
 from fastapi import FastAPI, Depends, Header, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -455,6 +460,246 @@ def get_stats(db: Session = Depends(get_db)):
             for p in top_overall
         ],
     }
+
+
+# ─── Daily Pipeline (manual trigger + SSE progress) ───────────────
+#
+# Runs `kb.daily.run_daily_pipeline()` *in-process* on a background thread
+# (no subprocess) and streams progress as SSE so the /reports page can show
+# stage transitions + live logs. A global lock allows only one concurrent
+# run — the second POST gets HTTP 409. `GET /api/daily/status` lets the UI
+# render the right initial state on page load (e.g. button disabled if a
+# run is already in flight from a previous tab/refresh).
+
+# Stage detection: the pipeline prints "[N/4] <name>" headers via print()
+# (see kb/daily.py). Match the index regardless of language so both en and
+# zh pipelines emit the same structured events.
+_STAGE_PATTERN = re.compile(r"\[([1-4])/4\]")
+_STAGE_NAMES: dict[int, str] = {
+    1: "ingestion",
+    2: "processing",
+    3: "embedding",
+    4: "report",
+}
+
+
+class _DailyRunState:
+    """Singleton tracking the active daily pipeline run.
+
+    All mutations happen under `_lock`. The Queue itself is thread-safe,
+    so the SSE generator can drain it without holding the lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running = False
+        self._started_at: datetime | None = None
+        self._current_stage: int | None = None
+        self._queue: Queue | None = None
+
+    def try_start(self) -> Queue | None:
+        """Atomically claim the run slot. Returns the worker's event queue,
+        or None if another run is already in flight."""
+        with self._lock:
+            if self._running:
+                return None
+            self._running = True
+            self._started_at = datetime.now(timezone.utc)
+            self._current_stage = None
+            # Bounded queue so a slow SSE consumer can't push the worker
+            # thread into unbounded memory growth.
+            self._queue = Queue(maxsize=2000)
+            return self._queue
+
+    def set_stage(self, index: int) -> None:
+        with self._lock:
+            self._current_stage = index
+
+    def end(self) -> None:
+        with self._lock:
+            self._running = False
+
+    def status(self) -> dict[str, object]:
+        with self._lock:
+            if not self._running:
+                return {"running": False, "started_at": None, "current_stage": None}
+            return {
+                "running": True,
+                "started_at": self._started_at.isoformat() if self._started_at else None,
+                "current_stage": _STAGE_NAMES.get(self._current_stage) if self._current_stage else None,
+            }
+
+
+_daily_state = _DailyRunState()
+
+
+class _QueueLogHandler(logging.Handler):
+    """Mirror logger output into the worker's event queue. Bounded queue
+    means we drop overflow rather than block the worker thread."""
+
+    def __init__(self, queue: Queue) -> None:
+        super().__init__()
+        self._queue = queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+        except Exception:
+            return
+        try:
+            self._queue.put_nowait(("log", line))
+        except Full:
+            pass
+
+
+class _QueueStdoutWriter:
+    """File-like sink that flushes complete lines to the queue. Used with
+    contextlib.redirect_stdout to capture the pipeline's banner prints."""
+
+    def __init__(self, queue: Queue) -> None:
+        self._queue = queue
+        self._buffer = ""
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, _, self._buffer = self._buffer.partition("\n")
+            if line.strip():
+                try:
+                    self._queue.put_nowait(("log", line))
+                except Full:
+                    pass
+        return len(s)
+
+    def flush(self) -> None:
+        # Don't drain the partial line: pipeline statements always end
+        # with "\n", so a trailing partial means the current write is mid
+        # multi-line block — splitting now would chop a header in two.
+        pass
+
+
+def _run_daily_in_worker(queue: Queue) -> None:
+    """Run the daily pipeline; emit logs to `queue`. Daemon thread.
+
+    Always pushes the `__terminator__` sentinel in `finally` so the SSE
+    generator's read loop can break even if intermediate puts were dropped
+    due to a full queue.
+    """
+    handler = _QueueLogHandler(queue)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+
+    stdout_sink = _QueueStdoutWriter(queue)
+    try:
+        with contextlib.redirect_stdout(stdout_sink):
+            from kb.daily import run_daily_pipeline
+
+            run_daily_pipeline()
+        try:
+            queue.put_nowait(("__done__", {}))
+        except Full:
+            pass
+    except Exception as exc:
+        logger.exception("Daily pipeline failed")
+        try:
+            queue.put_nowait(("__error__", {"message": str(exc) or exc.__class__.__name__}))
+        except Full:
+            pass
+    finally:
+        root.removeHandler(handler)
+        _daily_state.end()
+        try:
+            queue.put_nowait(("__terminator__", None))
+        except Full:
+            pass
+
+
+@app.get("/api/daily/status", dependencies=[Depends(verify_chat_token)])
+def daily_status() -> dict[str, object]:
+    """Cheap query so /reports can render the right initial button state
+    (disabled + "running since X" if a previous tab kicked off a run)."""
+    return _daily_state.status()
+
+
+@app.post("/api/daily/stream", dependencies=[Depends(verify_chat_token)])
+def daily_stream():
+    """Kick off `kb.daily.run_daily_pipeline()` in a background thread and
+    stream progress as SSE.
+
+    Events:
+      - `started` (1)  : {started_at}
+      - `stage`   (≤4) : {index, name}
+      - `log`     (n)  : {line}
+      - `done`    (1)  : {} terminal
+      - `error`   (≤1) : {message} terminal (mutually exclusive with done)
+
+    HTTP 409 if another run is already in flight — the UI should fall back
+    to the status endpoint to render "running since X" instead.
+    """
+    queue = _daily_state.try_start()
+    if queue is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A daily pipeline run is already in progress.",
+        )
+
+    started_at_raw = _daily_state.status()["started_at"]
+    threading.Thread(target=_run_daily_in_worker, args=(queue,), daemon=True).start()
+
+    def event_stream():
+        yield _sse_event("started", {"started_at": started_at_raw})
+        last_stage_emitted: int | None = None
+        terminal_emitted = False
+        while True:
+            try:
+                kind, payload = queue.get(timeout=15)
+            except Empty:
+                # SSE comment frame: keeps middlebox idle timers happy
+                # without being decoded as a real event by the client.
+                yield ": keepalive\n\n"
+                continue
+
+            if kind == "__terminator__":
+                if not terminal_emitted:
+                    yield _sse_event("done", {})
+                break
+            if kind == "__done__":
+                terminal_emitted = True
+                yield _sse_event("done", payload if isinstance(payload, dict) else {})
+                continue
+            if kind == "__error__":
+                terminal_emitted = True
+                yield _sse_event(
+                    "error",
+                    payload if isinstance(payload, dict) else {"message": "unknown error"},
+                )
+                continue
+
+            # kind == "log"
+            line = payload if isinstance(payload, str) else str(payload)
+            m = _STAGE_PATTERN.search(line)
+            if m:
+                stage_idx = int(m.group(1))
+                if stage_idx != last_stage_emitted:
+                    last_stage_emitted = stage_idx
+                    _daily_state.set_stage(stage_idx)
+                    yield _sse_event(
+                        "stage",
+                        {"index": stage_idx, "name": _STAGE_NAMES[stage_idx]},
+                    )
+            yield _sse_event("log", {"line": line})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/health")
