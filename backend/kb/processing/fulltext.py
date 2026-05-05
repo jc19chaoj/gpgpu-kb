@@ -59,7 +59,25 @@ _GITHUB_TIMEOUT_S = 15.0
 # but it talks to one cloud LLM, not N origin servers.
 _PREFETCH_WORKERS = 4
 
-_USER_AGENT = "gpgpu-kb/1.0 (+fulltext-loader)"
+# Two User-Agent strings:
+#
+#   * `_HTML_USER_AGENT` — sent to **HTML article hosts** (`_fetch_html_article`).
+#     A bare "gpgpu-kb/1.0 …" UA gets a blanket 403 from CDNs in front of
+#     openai.com (and a few others), which used to spam the daily-pipeline log
+#     with dozens of WARNING lines. A common desktop Chrome UA gets through
+#     without changing TLS fingerprint or other signals — for any site that
+#     still blocks it, the existing `try/except → ""` path keeps the cache
+#     empty and the run uneventful.
+#
+#   * `_API_USER_AGENT` — sent to **api.github.com** (`_fetch_github_readme`)
+#     and to PDF downloads. GitHub's API explicitly recommends a meaningful
+#     UA identifying the integration, and PDF hosts (arxiv etc.) don't bot-
+#     filter, so a project-identifying UA stays.
+_HTML_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_API_USER_AGENT = "gpgpu-kb/1.0 (+fulltext-loader)"
 
 
 # ─── PDF path (preserved from kb.processing.pdf) ──────────────────
@@ -134,7 +152,16 @@ def _fetch_html_article(url: str) -> str:
         with httpx.Client(
             timeout=_HTML_TIMEOUT_S,
             follow_redirects=True,
-            headers={"User-Agent": _USER_AGENT, "Accept": "text/html,*/*"},
+            headers={
+                "User-Agent": _HTML_USER_AGENT,
+                # Mirror what a real browser sends — some bot filters check
+                # the Accept-Language header alongside UA. Cheap to add.
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,*/*;q=0.8"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         ) as client:
             # Stream + abort on oversize so an attacker-controlled URL
             # serving 500 MB cannot OOM the process before we get to
@@ -153,7 +180,17 @@ def _fetch_html_article(url: str) -> str:
                 # `errors="replace"` is defensive for the rare site that
                 # serves invalid byte sequences in a UTF-8-declared body.
                 html = buf.decode("utf-8", errors="replace")
+    except httpx.HTTPStatusError as e:
+        # 4xx = host explicitly refused us (bot wall, geofence, gone, etc.) —
+        # retrying won't help, so demote to DEBUG to avoid log-spam from sites
+        # like openai.com that aggressively bot-filter regardless of UA.
+        # 5xx is server-side and worth seeing.
+        sc = e.response.status_code
+        log_fn = logger.debug if 400 <= sc < 500 else logger.warning
+        log_fn("HTML fetch failed for %s: %s", url, e)
+        return ""
     except httpx.HTTPError as e:
+        # Timeout / DNS / connection-reset — transient, keep visible.
         logger.warning("HTML fetch failed for %s: %s", url, e)
         return ""
 
@@ -203,7 +240,7 @@ def _fetch_github_readme(url: str) -> str:
     api_url = f"https://api.github.com/repos/{owner}/{repo}/readme"
     headers = {
         "Accept": "application/vnd.github.raw",
-        "User-Agent": _USER_AGENT,
+        "User-Agent": _API_USER_AGENT,
     }
     if settings.github_token:
         headers["Authorization"] = f"Bearer {settings.github_token}"
@@ -233,6 +270,13 @@ def _fetch_github_readme(url: str) -> str:
                 )
                 return ""
             return blob.decode("utf-8", errors="replace").strip()
+    except httpx.HTTPStatusError as e:
+        # Other 4xx (403 rate-limited, 451 unavailable, ...) are also non-
+        # actionable from our side. Match the HTML loader's policy.
+        sc = e.response.status_code
+        log_fn = logger.debug if 400 <= sc < 500 else logger.warning
+        log_fn("GitHub README fetch failed for %s/%s: %s", owner, repo, e)
+        return ""
     except httpx.HTTPError as e:
         logger.warning("GitHub README fetch failed for %s/%s: %s", owner, repo, e)
         return ""

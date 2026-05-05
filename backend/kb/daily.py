@@ -72,6 +72,18 @@ def run_daily_pipeline() -> None:
 
     print(_t("\n[1/4] INGESTION", "\n[1/4] 数据采集"))
     results = run_ingestion()
+    # `run_ingestion` returns a flat dict mixing per-source ingest counts
+    # (arxiv / blogs / sitemap_blogs / github → "new items added to DB")
+    # with side-effect counters from the tail steps (e.g.
+    # ``fulltext_prefetched`` → "rows whose full_text cache was populated
+    # this run", which retroactively backfills HISTORIC blog/project rows
+    # and is NOT a new-item count). Naively summing all values double-
+    # counts those side-effect totals into the headline "new items"
+    # number — the symptom is e.g. "新增条目：32 / 处理完成：2" where
+    # 30 of the "new" items are actually existing rows that just got
+    # their full_text filled in. Track the two cohorts separately.
+    _INGEST_SOURCE_KEYS: tuple[str, ...] = ("arxiv", "blogs", "sitemap_blogs", "github")
+    new_items_total = sum(results.get(k, 0) for k in _INGEST_SOURCE_KEYS)
 
     print(_t("\n[2/4] PROCESSING (Summarization + Scoring)",
              "\n[2/4] 处理（摘要 + 打分）"))
@@ -104,12 +116,20 @@ def run_daily_pipeline() -> None:
     print(_t("\n[4/4] DAILY REPORT", "\n[4/4] 每日简报"))
     generate_daily_report()
 
+    fulltext_prefetched = results.get("fulltext_prefetched", 0)
+
     print("\n" + "=" * 60)
     print(_t("  Pipeline complete!", "  流水线完成！"))
-    print(_t(f"  New items: {sum(results.values())}",
-             f"  新增条目：{sum(results.values())}"))
+    print(_t(f"  New items: {new_items_total}",
+             f"  新增条目：{new_items_total}"))
     print(_t(f"  Processed: {processed}", f"  处理完成：{processed}"))
     print(_t(f"  Indexed: {indexed}", f"  向量化完成：{indexed}"))
+    # Side-effect counter for transparency. Hidden when zero so a normal
+    # incremental run isn't visually noisier — only shown after a backfill
+    # or a freshly-added source where it carries useful signal.
+    if fulltext_prefetched:
+        print(_t(f"  Full-text backfilled: {fulltext_prefetched}",
+                 f"  全文回填：{fulltext_prefetched}"))
     print("=" * 60)
 
 
@@ -132,6 +152,12 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs every request at INFO ("HTTP Request: GET ... 200 OK"), which
+    # buries our own pipeline logs and surfaces non-actionable 4xx noise from
+    # bot-walled hosts (openai.com returns 403 to every fulltext prefetch).
+    # Our code already gracefully degrades, so the HTTP layer only needs WARNING+.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     if settings.language != "en":
         logger.info("Language set to %s", settings.language)

@@ -57,6 +57,14 @@ async def lifespan(app: FastAPI):
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs every request at INFO level ("HTTP Request: GET ... 200 OK"),
+    # which buries our own logs under hundreds of lines per pipeline run — and
+    # surfaces non-actionable 4xx noise from bot-walled hosts (e.g. openai.com
+    # returns 403 to every fulltext prefetch regardless of UA). Our code already
+    # converts 4xx to a graceful "" + abstract fallback, so we only care about
+    # WARNING+ from the HTTP layer.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     os.makedirs(settings.data_dir, exist_ok=True)
     init_db()
     # Pre-warm in the background so uvicorn can bind and /api/health responds immediately.

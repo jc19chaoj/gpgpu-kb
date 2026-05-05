@@ -242,6 +242,38 @@ class TestScrapeTrending:
 
         assert out[0].description == "PKO & friends"
 
+    def test_skips_sponsor_link_before_heading(self):
+        """Regression guard: an article whose Sponsor button (
+        ``<a href="/sponsors/<owner>">``) appears before the title link
+        must NOT be saved as ``(owner='sponsors', repo='<owner>')``. That
+        would feed bogus rows to the README fetcher and 404-spam the log.
+        """
+        block = """
+        <article class="Box-row">
+          <a class="btn-sm" href="/sponsors/iamgio">Sponsor</a>
+          <h2 class="h3 lh-condensed">
+            <a href="/iamgio/quarkdown" class="Link">
+              <span class="text-normal">iamgio /</span>
+              quarkdown
+            </a>
+          </h2>
+          <p class="col-9 color-fg-muted">A markdown-ish doc engine</p>
+          <span itemprop="programmingLanguage">Kotlin</span>
+        </article>
+        """
+        html = f"<html><body><main>{block}</main></body></html>"
+        client = MagicMock()
+        client.get.return_value = _mock_response(200, html)
+
+        out = _scrape_trending(client, "daily")
+
+        # Exactly one repo, and it must be the real one — never the
+        # sponsor pseudo-path.
+        assert len(out) == 1
+        assert (out[0].owner, out[0].repo) == ("iamgio", "quarkdown")
+        # And the bogus sponsors-prefixed key must be absent.
+        assert all(r.owner.lower() != "sponsors" for r in out)
+
 
 # ---------------------------------------------------------------------------
 # fetch_trending_repos

@@ -1,17 +1,18 @@
 {
-  "schema_version": "1.3",
-  "generated_at": "2026-05-03T22:34:43Z",
+  "schema_version": "1.4",
+  "generated_at": "2026-05-06T00:04:43Z",
   "generator": "init-architect (adaptive)",
   "project": {
     "name": "gpgpu-kb",
-    "summary": "Self-updating GPGPU chip-architecture research knowledge base. Daily ingest of ArXiv / curated RSS (12) / sitemap-driven blog scraper / GitHub trending; per-source-type LLM scoring on universal axes (quality, relevance); ChromaDB-backed semantic search and multi-turn / source-anchored RAG chat with on-demand arxiv PDF full-text loading and SSE streaming token output via Fast/Expert dual-role LLM (call_llm/stream_llm with role parameter); manual web-trigger of the daily pipeline with SSE-streamed progress (POST /api/daily/stream); bilingual (en/zh) Markdown daily reports; per-source-name ingest cold-start; Dockerized deployment with optional cron pipeline; themed i18n frontend shell (Cream Linen / Walnut Hearth oklch dual-theme + en/zh i18n via LocaleProvider/ThemeProvider with FOUC-prevention inline script).",
+    "summary": "Self-updating GPGPU chip-architecture research knowledge base. Daily ingest of ArXiv / curated RSS (12) / sitemap-driven blog scraper / GitHub trending; per-source-type LLM scoring on universal axes (quality, relevance) using full-text body when available (PDF / HTML via trafilatura / GitHub README via REST API; cap 30K chars in scoring prompt, 200K chars in cache); ChromaDB-backed semantic search and multi-turn / source-anchored RAG chat with on-demand full-text loading and SSE streaming token output via Fast/Expert dual-role LLM (call_llm/stream_llm with role parameter); chat prompt source-text cap raised to 200K to match the cache cap; manual web-trigger of the daily pipeline with SSE-streamed progress (POST /api/daily/stream); ingestion tail step prefetches non-paper full_text in 4-worker concurrency; bilingual (en/zh) Markdown daily reports; per-source-name ingest cold-start; Dockerized deployment with optional cron pipeline; aggregate `[all]` extras + Docker default INSTALL_EXTRAS=all; themed i18n frontend shell (Cream Linen / Walnut Hearth oklch dual-theme + en/zh i18n via LocaleProvider/ThemeProvider with FOUC-prevention inline script).",
     "type": "monorepo (backend + frontend)",
     "primary_languages": ["Python 3.12", "TypeScript 5"],
     "stack": [
       "FastAPI", "SQLAlchemy 2", "Pydantic 2",
-      "ChromaDB", "sentence-transformers", "pypdf",
+      "ChromaDB", "sentence-transformers", "pypdf", "trafilatura (optional)",
       "Server-Sent Events (text/event-stream)",
       "Threading + bounded Queue (in-process daily pipeline runner)",
+      "ThreadPoolExecutor (4 workers for fulltext prefetch / backfill)",
       "Next.js 16 (App Router, standalone)", "React 19",
       "Tailwind v4 (oklch @theme inline + dual themes)",
       "shadcn/ui (Tabs / Dialog / Skeleton)",
@@ -31,31 +32,33 @@
         "backend/kb/daily.py",
         "backend/kb/ingestion/run.py",
         "backend/kb/processing/llm.py",
-        "backend/kb/processing/pdf.py",
+        "backend/kb/processing/fulltext.py",
         "backend/kb/scripts/rescore_non_papers.py",
+        "backend/kb/scripts/backfill_full_text.py",
         "backend/run_api.sh",
         "backend/Dockerfile"
       ],
       "api_routes": [
-        "GET /api/papers (sort_by adds quality_score|relevance_score|total_score; default total_score; include_low_quality flag)",
+        "GET /api/papers (sort_by adds quality_score|relevance_score|total_score; default total_score; include_low_quality flag; source_name CSV multi-filter)",
+        "GET /api/sources (browse-page tag filter source; group by (source_name, source_type) where is_processed=1, count desc)",
         "GET /api/papers/search (semantic with keyword fallback; LIKE wildcards escaped)",
         "GET /api/papers/{paper_id}",
-        "POST /api/chat (Bearer guard via verify_chat_token; supports paper_id (source-anchored) + history[]; uses expert role LLM; shares _build_chat_context with /api/chat/stream)",
+        "POST /api/chat (Bearer guard via verify_chat_token; supports paper_id (source-anchored) + history[]; uses expert role LLM; shares _build_chat_context with /api/chat/stream; _SOURCE_TEXT_PROMPT_CAP=200_000)",
         "POST /api/chat/stream (Bearer guard; SSE text/event-stream; events: sources -> token... -> done [+ optional error]; uses expert role LLM)",
-        "GET /api/daily/status (NEW 2026-05-03 22:34:43; Bearer guard; returns _DailyRunState snapshot {running, started_at, current_stage} for cross-tab in-flight detection)",
-        "POST /api/daily/stream (NEW 2026-05-03 22:34:43; Bearer guard; SSE text/event-stream; events: started -> stage(<=4) -> log(N) -> done|error; 15s idle keepalive ': keepalive' SSE comment frame; HTTP 409 if another run is in-flight; runs run_daily_pipeline() in a daemon thread without subprocess via _DailyRunState singleton + threading.Lock + bounded Queue(maxsize=2000); _STAGE_PATTERN=r'\\[([1-4])/4\\]' matches both English and Chinese banners)",
+        "GET /api/daily/status (Bearer guard; returns _DailyRunState snapshot {running, started_at, current_stage} for cross-tab in-flight detection)",
+        "POST /api/daily/stream (Bearer guard; SSE text/event-stream; events: started -> stage(<=4) -> log(N) -> done|error; 15s idle keepalive ': keepalive' SSE comment frame; HTTP 409 if another run is in-flight; runs run_daily_pipeline() in a daemon thread without subprocess via _DailyRunState singleton + threading.Lock + bounded Queue(maxsize=2000); _STAGE_PATTERN=r'\\[([1-4])/4\\]' matches both English and Chinese banners)",
         "GET /api/reports",
         "GET /api/reports/{report_id}",
         "GET /api/stats (adds top_overall: cross-source-type top-5 by max(quality, relevance))",
         "GET /api/health"
       ],
       "data_models": [
-        "Paper (papers): includes universal score axes quality_score / relevance_score / score_rationale alongside legacy originality_score / impact_score / impact_rationale; full_text TEXT column lazily populated by source-anchored chat (PDF extraction)",
+        "Paper (papers): includes universal score axes quality_score / relevance_score / score_rationale alongside legacy originality_score / impact_score / impact_rationale; full_text TEXT column lazily populated by source-anchored chat AND proactively by ingestion tail prefetch_pending_full_text() (PDF / HTML / GitHub README extraction; cap 200_000 chars)",
         "DailyReport (daily_reports)"
       ],
-      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env). Fields: language, ingest_empty_db_days, ingest_gap_min_days, ingest_gap_max_days, deepseek_*, chat_token, quality_score_threshold, data_dir, llm_timeout_seconds, llm_provider, llm_expert_provider, llm_expert_model, anthropic_model, openai_model, deepseek_model, etc.",
-      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, dev). Default deps include pypdf>=5.0. Docker controls extras via ARG INSTALL_EXTRAS=ml,llm-cloud (default).",
-      "tests": "backend/tests/ (~210 tests; this run added 6 daily-pipeline SSE cases via _drain_daily_sse helper + _patch_daily + _reset_daily_state in test_api_smoke.py: idle status / happy 4-stage flow / 409 concurrency / exception -> error frame / Bearer token guard on both /api/daily/status and /api/daily/stream / Chinese stage banner '[N/4] 数据采集' detected by _STAGE_PATTERN)",
+      "config": "backend/kb/config.py (Pydantic Settings, KB_* env, .env). Fields: language, ingest_empty_db_days, ingest_gap_min_days, ingest_gap_max_days, deepseek_*, chat_token, quality_score_threshold, data_dir, llm_timeout_seconds, llm_provider, llm_expert_provider, llm_expert_model, anthropic_model, openai_model, deepseek_model, github_token, etc.",
+      "dependencies": "backend/pyproject.toml (extras: ml, llm-cloud, fulltext (trafilatura>=1.12.0), all (aggregate of ml+llm-cloud+fulltext), dev). Default deps include pypdf>=5.0. Docker controls extras via ARG INSTALL_EXTRAS=all (default; aggregate). Pre-download SentenceTransformer triggered when extras matches 'ml' OR 'all' (regex grep -qE ',(ml|all),').",
+      "tests": "backend/tests/ (~242 tests; renamed test_processing_pdf.py -> test_processing_fulltext.py with 17 cases covering PDF preserved + HTML happy/oversize stream abort + GitHub happy/404/non-github URL/.git suffix stripping + prefetch row selection + idempotence; test_ingestion_run.py adds patch.object(fulltext_mod, 'prefetch_pending_full_text', return_value=0) so the spy doesn't trigger real network)",
       "llm_providers": ["hermes (local CLI; not available in Docker; cannot truly stream)", "anthropic (messages.stream / text_stream for SSE)", "openai (stream=True via _stream_openai_compatible)", "deepseek (reuses openai SDK + base_url via _stream_openai_compatible)"],
       "llm_role_overlay": {
         "public_api": "call_llm(prompt, role='fast'|'expert') -> str; stream_llm(prompt, role='fast'|'expert') -> Iterator[str]; both default to role='fast' for back-compat with non-role callers.",
@@ -66,6 +69,22 @@
         },
         "provider_signature": "All _call_* / _stream_* providers accept (prompt, *, model: str | None = None). model=None falls back to settings.<provider>_model; non-None overrides. Hermes accepts but ignores model (CLI has no --model flag).",
         "transparency": "If KB_LLM_EXPERT_PROVIDER and KB_LLM_EXPERT_MODEL are both unset, expert role transparently delegates to fast role — zero behavioral change vs pre-2026-05-03 21:41:00 deployments."
+      },
+      "fulltext_module_2026_05_05": {
+        "file": "backend/kb/processing/fulltext.py (renamed from pdf.py)",
+        "loaders": {
+          "pdf": "_download_pdf via httpx.Client.stream + early abort at _MAX_PDF_BYTES=20MB; pypdf PdfReader for text extraction. Triggered when _looks_like_pdf_url(paper.pdf_url or paper.url).",
+          "html": "_fetch_html_article via httpx.Client.stream + early abort at _MAX_HTML_BYTES=8MB; trafilatura.extract for boilerplate-stripped article body. Requires [fulltext] extras; without it logger.error + return ''.",
+          "github": "_fetch_github_readme via REST api.github.com/repos/{owner}/{repo}/readme + Accept: application/vnd.github.raw; auto-strips trailing '.git' clone-URL suffix; _MAX_README_BYTES=4MB oversize -> return '' (NOT byte-truncate); _GITHUB_REPO_RE matches github.com/owner/repo; settings.github_token forwarded if set."
+        },
+        "dispatcher": "_extract_for_paper(paper) cascades: PDF first, then GitHub if source_type=PROJECT and 'github.com/' in url, else HTML, else ''. fetch_full_text(paper_id) is the public API used by /api/chat[/stream]; honors cache via paper.full_text non-empty short-circuit; persists on success; abstract_fallback (summary + abstract) on transient failure WITHOUT writing.",
+        "cache": "Paper.full_text TEXT column. _MAX_EXTRACTED_CHARS=200_000 char cap (raised from 120K to match the new chat prompt cap _SOURCE_TEXT_PROMPT_CAP=200K).",
+        "prefetch_tail": "prefetch_pending_full_text(batch_size=None) called as tail of run_ingestion(); 4-worker ThreadPoolExecutor (_PREFETCH_WORKERS=4); filters source_type IN (BLOG, PROJECT, TALK) AND full_text='' (idempotent); wrapped in try/except in kb/ingestion/run.py so a failure cannot poison ingest counts; results['fulltext_prefetched']=N reported in the dict.",
+        "ensure_cached_helper": "_ensure_cached(paper_id) -> bool — single SessionLocal worker thunk used by prefetch (and backfill_full_text.py); skips already-cached rows, runs _extract_for_paper, persists on success, returns True if cache populated. Conservative concurrency vs the 8-worker processing stage because we hit N origin servers vs one cloud LLM.",
+        "scoring_uses_fulltext": "kb/processing/llm.py::summarize_and_score uses paper.full_text or paper.abstract; _SCORING_BODY_CAP=30_000 char cap (token budget; rubric + system msg leaves ~7K tokens for body); prompt field renamed Abstract: -> Content:.",
+        "chat_prompt_cap_raised": "kb/main.py::_SOURCE_TEXT_PROMPT_CAP raised 60K -> 200_000 to match _MAX_EXTRACTED_CHARS so a fully-cached article is not double-truncated; convention: _SOURCE_TEXT_PROMPT_CAP <= _MAX_EXTRACTED_CHARS.",
+        "extras_aggregate": "[fulltext] = ['trafilatura>=1.12.0']; [all] = ['gpgpu-kb[ml]', 'gpgpu-kb[llm-cloud]', 'gpgpu-kb[fulltext]'] (self-referential aggregate; pip>=23 / setuptools support). Docker default ARG INSTALL_EXTRAS=all (was 'ml,llm-cloud').",
+        "operational_scripts": ["kb/scripts/backfill_full_text.py — one-shot backfill for legacy non-paper rows; --dry-run / --limit / --source-type; 4-worker concurrency; reuses _ensure_cached; targets is_processed IN (1,2) AND full_text=''; does NOT re-score (cheaper HTTP fetch decoupled from LLM tokens; pair with rescore_non_papers --include-already-scored as a second step).", "kb/scripts/rescore_non_papers.py — adds --include-already-scored flag dropping the quality_score==0.0 filter so operators can re-evaluate after backfill."]
       },
       "daily_pipeline_web_trigger_2026_05_03_22_34": {
         "purpose": "Replicate `python -m kb.daily` execution via HTTP without spawning a subprocess; let frontend /reports page Run-Now button fire it and stream live progress.",
@@ -85,7 +104,7 @@
       "auth": {
         "chat_endpoint": "Optional Bearer token via KB_CHAT_TOKEN; compared via hmac.compare_digest in verify_chat_token (Depends).",
         "stream_endpoint_same_guard": "/api/chat/stream uses dependencies=[Depends(verify_chat_token)]; identical to /api/chat.",
-        "daily_endpoints_same_guard_2026_05_03_22_34": "/api/daily/status AND /api/daily/stream both use dependencies=[Depends(verify_chat_token)]; reuse the same Bearer token guard. Any new 'expensive / writing / job-triggering' endpoint MUST reuse this dependency — convention going forward."
+        "daily_endpoints_same_guard": "/api/daily/status AND /api/daily/stream both use dependencies=[Depends(verify_chat_token)]; reuse the same Bearer token guard. Any new 'expensive / writing / job-triggering' endpoint MUST reuse this dependency — convention going forward."
       },
       "scoring": {
         "axes": ["quality_score", "relevance_score"],
@@ -96,14 +115,16 @@
           "project": ["Innovation", "Maturity"]
         },
         "quality_gate": "max(quality, relevance) >= KB_QUALITY_SCORE_THRESHOLD (default 7.0). Applied ONLY to source_type=paper.",
-        "paper_legacy_mirror": "For papers, summarize_and_score copies quality->originality_score, relevance->impact_score, score_rationale->impact_rationale."
+        "paper_legacy_mirror": "For papers, summarize_and_score copies quality->originality_score, relevance->impact_score, score_rationale->impact_rationale.",
+        "body_for_scoring": "summarize_and_score now uses paper.full_text or paper.abstract (cap _SCORING_BODY_CAP=30_000 chars) — meaningful improvement on blog / project rubric quality vs the legacy 200-char og:description / GitHub trending blurb."
       },
       "ingestion": {
         "rss_feeds_count": 12,
         "sitemap_sources_count": 1,
         "active_feeds_examples": ["semiengineering.com", "chipsandcheese.com", "semianalysis.substack.com", "openai.com/news", "blog.google", "huggingface.co/blog", "developer.nvidia.com/blog", "research.nvidia.com", "vllm.ai", "lilianweng.github.io", "karpathy.github.io", "interconnects.ai"],
         "active_sitemap_sources": ["lmsys.org / SGLang Blog (sitemap-driven via kb/ingestion/sitemap_blog.py)"],
-        "per_source_cold_start": "_lookback_for_source(source_name) per fetcher: empty source_name -> KB_INGEST_EMPTY_DB_DAYS (default 30); existing -> now - max(ingested_date) clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS]. 4 fetchers (arxiv / rss / sitemap_blog / github) all support days_back: int | None signature."
+        "per_source_cold_start": "_lookback_for_source(source_name) per fetcher: empty source_name -> KB_INGEST_EMPTY_DB_DAYS (default 30); existing -> now - max(ingested_date) clamped to [KB_INGEST_GAP_MIN_DAYS, KB_INGEST_GAP_MAX_DAYS]. 4 fetchers (arxiv / rss / sitemap_blog / github) all support days_back: int | None signature.",
+        "tail_step_prefetch": "run_ingestion() ends with try/except wrapping `prefetch_pending_full_text()` from kb.processing.fulltext; populates results['fulltext_prefetched']; failure does NOT poison the ingest counts above. Idempotent — already-cached rows are skipped on every subsequent call."
       },
       "cold_start_handling": "kb.daily detects whether any paper has is_processed != 0 (processing) and whether any is_processed=1 row has chroma_id != '' (embedding). If neither, run_processing / index_unindexed_papers run with batch_size=None to drain the entire backlog. Steady-state runs cap at 100/run.",
       "chinese_mode": {
@@ -114,9 +135,10 @@
         "frontend_locale_independent": "Frontend UI language (en/zh) is controlled separately via gpgpu-kb.locale.v1 in browser localStorage — independent of backend KB_LANGUAGE. Chat outputs are always Chinese; Browse / Reports / Stats UI strings follow the user's localStorage choice."
       },
       "docker": {
-        "dockerfile": "backend/Dockerfile (python:3.12-slim, ARG INSTALL_EXTRAS=ml,llm-cloud, VOLUME /app/data, HEALTHCHECK /api/health, CMD uvicorn ... --timeout-keep-alive 75)",
+        "dockerfile": "backend/Dockerfile (python:3.12-slim, ARG INSTALL_EXTRAS=all default (aggregate ml+llm-cloud+fulltext), VOLUME /app/data, HEALTHCHECK /api/health, CMD uvicorn ... --timeout-keep-alive 75)",
         "dockerignore": "backend/.dockerignore",
         "compose_overrides": ["KB_DATABASE_URL=sqlite:////app/data/kb.sqlite", "KB_CHROMA_DIR=/app/data/chroma", "KB_DATA_DIR=/app/data", "KB_CORS_ORIGINS=[\"http://localhost:3000\",\"http://127.0.0.1:3000\"]"],
+        "build_args_default": "INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-all} — falls back to aggregate even when .env is missing. ST model is pre-downloaded when grep -qE ',(ml|all),' matches.",
         "daily_profile": "docker compose --profile cron run --rm daily (one-shot pipeline reusing backend image; isolated container vs the in-process /api/daily/stream daemon thread)"
       },
       "important_paths": [
@@ -134,8 +156,9 @@
         "backend/kb/ingestion/run.py",
         "backend/kb/processing/llm.py",
         "backend/kb/processing/embeddings.py",
-        "backend/kb/processing/pdf.py",
+        "backend/kb/processing/fulltext.py",
         "backend/kb/scripts/rescore_non_papers.py",
+        "backend/kb/scripts/backfill_full_text.py",
         "backend/Dockerfile",
         "backend/run_api.sh",
         "backend/.dockerignore",
@@ -144,7 +167,7 @@
         "backend/tests/conftest.py",
         "backend/tests/test_api_smoke.py",
         "backend/tests/test_processing_llm.py",
-        "backend/tests/test_processing_pdf.py",
+        "backend/tests/test_processing_fulltext.py",
         "backend/tests/test_reports.py",
         "backend/tests/test_ingestion_rss.py",
         "backend/tests/test_ingestion_sitemap_blog.py",
@@ -152,18 +175,28 @@
       ],
       "claude_md": "backend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 2,
+        "scanned_files": 6,
         "high_confidence": true,
+        "files_read_this_run": [
+          "backend/pyproject.toml",
+          "backend/Dockerfile",
+          "backend/kb/processing/fulltext.py",
+          "backend/kb/scripts/backfill_full_text.py",
+          "backend/kb/ingestion/run.py",
+          "backend/kb/main.py (head, lines 1-80)"
+        ],
+        "verification_summary": "All 2026-05-05 23:15:12 changelog claims verified by direct read: (a) fulltext.py exists with 3 loaders + _ensure_cached + prefetch_pending_full_text + 200K cap + 4-worker pool; (b) backfill_full_text.py exists with --dry-run/--limit/--source-type + _ensure_cached reuse + _BACKFILL_WORKERS=4 + is_processed.in_([1,2]) filter; (c) Dockerfile has ARG INSTALL_EXTRAS=all default + grep -qE ',(ml|all),' ST predownload condition + --timeout-keep-alive 75 CMD; (d) pyproject.toml has [fulltext] = ['trafilatura>=1.12.0'] + aggregate [all] = ['gpgpu-kb[ml]', 'gpgpu-kb[llm-cloud]', 'gpgpu-kb[fulltext]']; (e) run_ingestion() ends with try/except calling prefetch_pending_full_text() and storing result in results['fulltext_prefetched']; (f) main.py top imports include asyncio, contextlib, hmac, re, threading, deque all present.",
         "gaps": [
-          "未读取 backend/kb/ingestion/arxiv.py 与 github_trending.py 源代码本轮（沿用前一刷新结论）",
-          "未读取 backend/kb/processing/embeddings.py 源代码本轮（沿用前一刷新结论）",
-          "未读取 backend/kb/processing/pdf.py 源代码本轮（沿用上一刷新结论）",
-          "未读取 backend/tests/conftest.py 内部细节",
-          "未读取 backend/kb/scripts/rescore_non_papers.py 源代码本轮",
-          "未读取 backend/kb/config.py 全文以核对所有字段（沿用前一刷新结论 + 现 schemas/main 推断；新增 llm_expert_* 字段已记录）",
+          "未读取 backend/kb/processing/llm.py 完整源代码本轮（沿用 2026-05-03 21:41:00 + 2026-05-05 23:15:12 推断；本轮 git status 干净，无新改动）",
+          "未读取 backend/kb/main.py 完整源代码本轮（仅核对头部 imports；body 沿用上一刷新结论）",
+          "未读取 backend/tests/test_processing_fulltext.py 完整 17 例（仅前 30 行核对结构）",
+          "未读取 backend/tests/test_api_smoke.py 完整源代码本轮（沿用 daily-stream 6 例 + chat SSE 5 例 + sources/source_name 7 例的累加结论）",
+          "未读取 backend/kb/config.py 全文以核对所有字段（沿用前一刷新结论 + 现 schemas/main 推断；新增 llm_expert_* + github_token 字段已记录）",
           "未读取 backend/kb/schemas.py / models.py / database.py 本轮（沿用上一刷新结论；本轮 git status 中也未修改）",
           "未读取 backend/kb/daily.py 本轮（仅依赖其 [N/4] banner 格式的契约说明；本轮未改动 daily.py）",
-          "未读取 backend/kb/processing/llm.py 本轮（仅依赖上一轮 fast/expert 双角色记录；本轮未改动 llm.py）"
+          "未读取 backend/tests/conftest.py 内部细节",
+          "未读取 backend/kb/ingestion/arxiv.py / rss.py / sitemap_blog.py / github_trending.py 本轮（沿用前一刷新结论；本轮 git status 干净）",
+          "未读取 backend/kb/processing/embeddings.py 本轮（沿用前一刷新结论）"
         ]
       }
     },
@@ -180,6 +213,7 @@
         "frontend/src/hooks/use-conversation-history.ts",
         "frontend/src/components/chat/chat-right-sidebar.tsx",
         "frontend/src/components/chat/source-picker.tsx",
+        "frontend/src/components/source-filter.tsx",
         "frontend/src/components/layout/app-shell.tsx",
         "frontend/src/components/layout/header.tsx",
         "frontend/src/components/layout/sidebar.tsx",
@@ -196,10 +230,10 @@
         "frontend/Dockerfile"
       ],
       "pages": [
-        "/ (Browse + Search; default sort_by=total_score)",
+        "/ (Browse + Search + SourceFilter; default sort_by=total_score)",
         "/chat (Multi-turn streaming RAG via SSE + Source-anchored mode + Stop button + /chat?paperId= deep link)",
         "/paper/[id] (Universal Score axes; can deep-link to /chat?paperId=)",
-        "/reports (NEW 2026-05-03 22:34:43: Run-Now button + 4-stage progress bar + log panel + Reload + cross-tab in-flight detection via getDailyStatus)",
+        "/reports (Run-Now button + 4-stage progress bar + log panel + Reload + cross-tab in-flight detection via getDailyStatus)",
         "/reports/[id]",
         "/stats"
       ],
@@ -211,73 +245,13 @@
         "kb_backend_url_docker": "http://backend:8000",
         "build_time_env": ["NEXT_PUBLIC_API_URL", "KB_BACKEND_URL", "NPM_REGISTRY"]
       },
-      "api_client": "frontend/src/lib/api.ts (API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''). chat() forwards optional paper_id and history. chatStream(request, {signal?}) async generator for /api/chat/stream. NEW 2026-05-03 22:34:43: getDailyStatus() (GET /api/daily/status) + runDailyStream({signal?}) async generator (POST /api/daily/stream, body '{}', Accept: text/event-stream) + DailyConflictError class (HTTP 409) + _parseDailyFrame (CRITICAL: skips lines starting with ':' to drop SSE keepalive comment frames; without this JSON.parse would throw on every keepalive). _chatPayload(request) shared by chat() and chatStream(). _parseSSEFrame joins consecutive 'data:' lines with '\\n' per SSE spec.",
-      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py + kb/main.py::_sse_event). Adds quality_score / relevance_score / score_rationale, Stats.top_overall?, ChatMessage{role:user|assistant,content}, ChatRequest.paper_id? / history?, ChatStreamEvent discriminated union. NEW 2026-05-03 22:34:43: DailyStatus{running, started_at, current_stage} / DailyStageName='ingestion'|'processing'|'embedding'|'report' / DailyStreamEvent discriminated union (started|stage|log|error|done; stage payload {index:1|2|3|4, name:DailyStageName}).",
+      "api_client": "frontend/src/lib/api.ts (API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''). chat() forwards optional paper_id and history. chatStream(request, {signal?}) async generator for /api/chat/stream. getDailyStatus() (GET /api/daily/status) + runDailyStream({signal?}) async generator (POST /api/daily/stream, body '{}', Accept: text/event-stream) + DailyConflictError class (HTTP 409) + _parseDailyFrame (CRITICAL: skips lines starting with ':' to drop SSE keepalive comment frames + skips empty lines). _chatPayload(request) shared by chat() and chatStream(). _parseSSEFrame joins consecutive 'data:' lines with '\\n' per SSE spec.",
+      "types": "frontend/src/lib/types.ts (mirrors backend kb/schemas.py + kb/main.py::_sse_event). Adds quality_score / relevance_score / score_rationale, Stats.top_overall?, ChatMessage{role:user|assistant,content}, ChatRequest.paper_id? / history?, ChatStreamEvent discriminated union, Source{name,type,count} / SourcesResponse, DailyStatus{running, started_at, current_stage} / DailyStageName='ingestion'|'processing'|'embedding'|'report' / DailyStreamEvent discriminated union (started|stage|log|error|done; stage payload {index:1|2|3|4, name:DailyStageName}).",
       "score_labels": {
         "paper": ["Originality", "Impact"],
         "blog": ["Depth", "Actionability"],
         "talk": ["Depth", "Actionability"],
         "project": ["Innovation", "Maturity"]
-      },
-      "chat_module_2026_05_02": {
-        "page_file": "src/app/chat/page.tsx (Suspense + ChatContent; DisplayMessage extends ChatMessage with renderer-only sources?/error?/streaming?; _stripDisplay strips WELCOME and error/streaming before persistence + before sending to backend)",
-        "history_persistence": "src/hooks/use-conversation-history.ts: localStorage key 'gpgpu-kb.chat.conversations.v1', cap 50 conversations, sorted by updatedAt desc, SSR-safe (returns [] before mount), hydrated flag.",
-        "right_sidebar": "src/components/chat/chat-right-sidebar.tsx: Tabs(History|Source).",
-        "source_picker": "src/components/chat/source-picker.tsx: Dialog + debounced (300ms) searchPapers(q, semantic:false).",
-        "deep_link": "/chat?paperId=NN auto-pin via pinnedPaperIdRef.",
-        "streaming": "chatStream() async generator + abortRef + Stop button (red Square) + finalize 3-state (showError|aborted|done)."
-      },
-      "themed_i18n_shell_2026_05_03_22_34": {
-        "i18n_module": {
-          "files": ["src/lib/i18n/provider.tsx", "src/lib/i18n/translations.ts", "src/lib/i18n/format.ts"],
-          "storage_key": "gpgpu-kb.locale.v1",
-          "default_locale": "en (must match SSR markup html lang='en')",
-          "locales": ["en", "zh"],
-          "key_count": "~110 keys covering: brand / shell / nav / lang / theme / search / browse / card / score / paper / reports.run.* / stats / chat / picker",
-          "translation_key_type": "TranslationKey = keyof typeof translations.en — TS auto-validates t() calls; en is source of truth, missing zh keys silently render the raw key string (no lint check, manual review required)",
-          "interpolation": "_interpolate(template, params) supports {name} placeholders; NO ICU plurals — split into multiple keys if needed",
-          "ssr_strategy": "Always render DEFAULT_LOCALE during SSR / first paint; useEffect on mount reads localStorage and reconciles. Sets document.documentElement.lang = 'zh-CN' | 'en' so a11y / browser translation / :lang() selector follow",
-          "format_helpers": "formatDate / formatLongDate / localeTag wrap Date.toLocaleDateString with locale-aware tags (en-US / zh-CN)"
-        },
-        "theme_module": {
-          "files": ["src/lib/theme/provider.tsx"],
-          "storage_key": "gpgpu-kb.theme.v1",
-          "default_theme": "dark (must match SSR markup html className='dark')",
-          "themes": ["light", "dark"],
-          "fouc_prevention": "app/layout.tsx <head> contains an inline <script dangerouslySetInnerHTML> that synchronously reads localStorage.getItem('gpgpu-kb.theme.v1') and toggles <html class='dark'> BEFORE React mounts. Painted body never flickers. THIS INLINE SCRIPT HARDCODES THE STORAGE KEY LITERAL — change THEME_STORAGE_KEY in provider.tsx requires also editing layout.tsx::THEME_INIT_SCRIPT (no IDE check)",
-          "html_attrs": "<html lang='en' className='h-full antialiased dark' suppressHydrationWarning> — suppressHydrationWarning silences React class/lang mismatch warnings caused by FOUC script + LocaleProvider mount-effect reconciliation",
-          "viewport_themecolor": "viewport.themeColor dual-mode follows OS prefers-color-scheme to tint the address bar; INDEPENDENT of <html class> runtime toggle (OS-level vs UI-level signals)"
-        },
-        "css_overhaul": {
-          "file": "src/app/globals.css",
-          "approach": "@theme inline + oklch CSS variables; replaces all bg-zinc-950 hardcodes with semantic shadcn tokens",
-          "themes_palette": {
-            "cream_linen_root": "Light: parchment cream background (oklch 0.975 0.012 80) + caramel amber primary (oklch 0.65 0.115 60) + chestnut foreground (oklch 0.27 0.025 55). Long-form-reading friendly.",
-            "walnut_hearth_dark": "Dark: walnut bark background (oklch 0.18 0.015 50) instead of pure black + roasted cocoa surfaces + toasted amber primary (oklch 0.78 0.1 70) + oat-mist foreground (oklch 0.92 0.018 80). Cozy fireside dark."
-          },
-          "tokens_mapped": ["--color-card", "--color-primary", "--color-secondary", "--color-muted", "--color-accent", "--color-destructive", "--color-border", "--color-input", "--color-ring", "--color-popover", "--color-sidebar (+ -foreground/-primary/-accent/-border/-ring)", "--color-chart-1..5", "--radius-* scale (sm/md/lg/xl/2xl/3xl/4xl)"],
-          "dark_variant": "@custom-variant dark (&:is(.dark *)) explicitly declares dark variant for Tailwind v4",
-          "coding_convention_change": "From this point on, NEW components MUST NOT use bg-zinc-* / text-zinc-* hardcodes; use semantic tokens (bg-background / text-foreground / bg-card / bg-sidebar / text-muted-foreground / bg-primary text-primary-foreground / etc.). Exceptions: red-600 for Stop button (red is universally 'danger'), emerald-500 for done state."
-        },
-        "shell_components": {
-          "app_shell": "src/components/layout/app-shell.tsx — uses React 19 'derive state in render' pattern: if (pathname !== lastPath) setOpen(false) instead of useEffect side-effect",
-          "header": "src/components/layout/header.tsx — adds <ThemeSwitcher /> + <LanguageSwitcher /> on the right; mobile menu button + brand on the left",
-          "sidebar": "src/components/layout/sidebar.tsx — fully i18n'd via t('nav.*'); version line reads pkg.version from package.json (build-time inlined)",
-          "language_switcher": "src/components/language-switcher.tsx — segmented control (EN / 中) with sliding thumb (style left = activeIndex * 1.75rem); thumb is pointer-events-none so clicks reach buttons; buttons aria-pressed",
-          "theme_switcher": "src/components/theme-switcher.tsx — mirrors LanguageSwitcher; Sun/Moon icons; thumb opacity 0 until hydrated to avoid SSR snapshot painting thumb under wrong tab"
-        }
-      },
-      "reports_run_now_2026_05_03_22_34": {
-        "page_file": "src/app/reports/page.tsx (REWRITTEN to add Run-Now button + SSE progress panel)",
-        "state_machine": "RunPhase = 'idle'|'starting'|'running'|'done'|'error'; RunState = {phase, startedAt, activeIndex, errorMessage, conflict}",
-        "stage_order": "STAGE_ORDER = ['ingestion','processing','embedding','report']; STAGE_LABEL_KEY: Record<DailyStageName, TranslationKey> maps to reports.run.stage.* i18n keys",
-        "log_buffer_cap": "MAX_LOG_LINES = 2000 — appendLog() slices oldest entries when buffer overflows, preventing tab OOM during 100k-line cold-start runs",
-        "mount_flow": "useEffect on mount: listReports(30) + getDailyStatus() — if status.running, set RunState{phase:'running', activeIndex:STAGE_ORDER.indexOf(status.current_stage), conflict:true} so button stays disabled (no reattach to live SSE; just informational). Status fetch failure is non-fatal — keep idle state",
-        "handle_run": "handleRun creates AbortController -> abortRef.current -> for await (const ev of runDailyStream({signal})) -> applyEvent dispatches by ev.type (started/stage/log/error/done). sawTerminal flag tracks whether stream ended cleanly; if false on EOF, set 'connectionLost' error message. On done, listReports(30) refresh.",
-        "error_handling": "try/catch differentiates DailyConflictError (HTTP 409 -> conflict UI), AbortError (silent — user cancel), other Error (red bubble + log panel). finally clears abortRef ONLY if it still points at this handler's controller (prevents older finally from clobbering newer send)",
-        "run_panel_ui": "RunPanel: status header (AlertCircle red / Check emerald / Loader2 amber depending on phase) + relative-time start ('刚刚' / 'X 分钟前' / etc via formatRelativeTime), 4 StagePills (pending/running/done/error 4 colors), collapsible log panel (<pre> whitespace-pre-wrap break-words font-mono with ScrollArea), Reload button on terminal phase",
-        "format_relative_time": "Custom formatRelativeTime(iso, locale) with 4 buckets (just now / Xm / Xh / Xd ago + Chinese counterparts) — avoids Intl.RelativeTimeFormat per-render overhead",
-        "i18n_keys_added": ["reports.run.button", "reports.run.busy", "reports.run.startedAt", "reports.run.alreadyRunning", "reports.run.conflict", "reports.run.failed", "reports.run.connectionLost", "reports.run.complete", "reports.run.reload", "reports.run.viewLogs", "reports.run.hideLogs", "reports.run.logsEmpty", "reports.run.stage.ingestion", "reports.run.stage.processing", "reports.run.stage.embedding", "reports.run.stage.report"]
       },
       "config": "frontend/package.json, tsconfig.json, eslint.config.*, postcss.config.*, playwright.config.ts, next.config.ts, Dockerfile, .dockerignore",
       "tests": "frontend/tests/e2e/ (Playwright, chromium-only, mocked backend). Suggested next additions: ⑤ Reports page Run-Now button with mocked SSE -> 4-stage progression visible; ⑥ HTTP 409 -> conflict UI; ⑦ getDailyStatus().running=true on mount -> button locked; ⑧ language switch -> header/sidebar text updates; ⑨ theme switch -> <html class> toggles + colors don't flicker.",
@@ -312,6 +286,7 @@
         "frontend/src/components/layout/sidebar.tsx",
         "frontend/src/components/language-switcher.tsx",
         "frontend/src/components/theme-switcher.tsx",
+        "frontend/src/components/source-filter.tsx",
         "frontend/src/components/paper-card.tsx",
         "frontend/src/components/search-bar.tsx",
         "frontend/src/components/chat/chat-right-sidebar.tsx",
@@ -326,18 +301,19 @@
       ],
       "claude_md": "frontend/CLAUDE.md",
       "coverage": {
-        "scanned_files": 14,
+        "scanned_files": 0,
         "high_confidence": true,
+        "verification_summary": "Frontend was NOT modified in 2026-05-05 23:15:12 nor 2026-05-06 00:04:43 — verified by reading the root CLAUDE.md changelog narrative + git status (clean) + the explicit 'NO impact on frontend code' notes in both backend changelog entries. No source files re-read this run; all frontend coverage gaps from prior run are unchanged.",
         "gaps": [
           "未深入 src/components/ui/* shadcn 原语集合 (button/card/dialog/badge/skeleton/input/scroll-area/tabs)",
           "未读取 src/app/reports/[id]/page.tsx / stats/page.tsx 内部细节",
           "未读取 next.config.ts 之外的 eslint.config.* / tsconfig.json / postcss.config.*",
           "未枚举 tests/e2e/ 下具体测试用例文件",
-          "src/lib/api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON / chatStream / getDailyStatus / runDailyStream（本轮新增的两个 daily 端点也受守卫）",
-          "未读取 src/components/chat/chat-right-sidebar.tsx 与 source-picker.tsx 本轮（沿用上轮结论；本轮 git status 未修改它们）",
-          "未读取 src/hooks/use-conversation-history.ts 本轮（沿用上轮结论；本轮 git status 未修改它）",
-          "未读取 src/components/paper-card.tsx 与 search-bar.tsx 本轮（本轮 git status 未修改它们）",
-          "未确认 src/app/page.tsx / chat/page.tsx 是否已切换到 t() i18n 调用（仅基于 reports/page.tsx 与 sidebar/header 已 i18n 化推断；其它页面可能仍含字面量字符串待替换）",
+          "src/lib/api.ts 当前未实现 Bearer Token 注入；若后端启用 KB_CHAT_TOKEN，需扩展 fetchJSON / chatStream / getDailyStatus / runDailyStream",
+          "未读取 src/components/chat/chat-right-sidebar.tsx 与 source-picker.tsx 本轮",
+          "未读取 src/hooks/use-conversation-history.ts 本轮",
+          "未读取 src/components/paper-card.tsx 与 search-bar.tsx 与 source-filter.tsx 本轮",
+          "未确认 src/app/page.tsx / chat/page.tsx 是否已切换到 t() i18n 调用（需要全栈 audit）",
           "未读取 src/app/paper/[id]/page.tsx 本轮（推断 SCORE_LABELS 三处镜像不变）"
         ]
       }
@@ -348,10 +324,10 @@
     "readme": "README.md",
     "start_script": "start.sh",
     "ci_workflow": ".github/workflows/ci.yml (3 jobs: backend pytest+cov / frontend tsc+eslint / frontend playwright)",
-    "docker_compose": "docker-compose.yml (backend + frontend + opt-in daily profile; bind-mount ./backend/data -> /app/data)",
-    "env_docker_example": ".env.docker.example (canonical operator config; includes KB_LLM_EXPERT_PROVIDER / KB_LLM_EXPERT_MODEL examples added in 2026-05-03 21:41:00)",
+    "docker_compose": "docker-compose.yml (backend + frontend + opt-in daily profile; bind-mount ./backend/data -> /app/data; build.args.INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-all})",
+    "env_docker_example": ".env.docker.example (canonical operator config; BACKEND_INSTALL_EXTRAS=all default; includes KB_LLM_EXPERT_PROVIDER / KB_LLM_EXPERT_MODEL examples and slim-down notes for fulltext-only / no-extras images)",
     "docs_dir": "docs/ (present but empty/minimal)",
-    "omc_state": ".omc/ (includes .omc/plans/autopilot-chat-enhance.md from 2026-05-02; this run's themed-i18n-shell + daily-stream delta has no separate plan file — implemented inline)",
+    "omc_state": ".omc/ (includes .omc/plans/autopilot-chat-enhance.md from 2026-05-02; subsequent rounds (themed-i18n-shell + daily-stream + universal fulltext loader) implemented inline without separate plan files)",
     "gitignore": ".gitignore"
   },
   "ignore_strategy": {
@@ -365,22 +341,24 @@
       "backend/.venv/**", "backend/data/**", "backend/data/chroma/**",
       ".pytest_cache/**", ".ruff_cache/**", ".mypy_cache/**",
       "**/.omc/state/**", "**/.omc/sessions/**", "**/.omc/logs/**",
-      "frontend/.next/**", "frontend/test-results/**", "frontend/playwright-report/**"
+      "frontend/.next/**", "frontend/test-results/**", "frontend/playwright-report/**", "frontend/playwright/.cache/**"
     ]
   },
   "coverage_summary": {
     "modules_total": 2,
     "modules_with_claude_md": 2,
-    "files_read_this_run": 19,
-    "files_read_cumulative": 119,
-    "estimated_repo_files": "~180 (excluding node_modules/.venv/.next/data; rough estimate; +15 from last run reflecting new lib/i18n + lib/theme + reports run-panel + 2 layout switchers)",
+    "files_read_this_run": 14,
+    "files_read_cumulative": 133,
+    "estimated_repo_files": "~185 (excluding node_modules/.venv/.next/data; rough estimate; +5 from last run reflecting new fulltext.py + backfill_full_text.py + test_processing_fulltext.py rename + minor docker-compose / .env / Dockerfile edits)",
     "coverage_percent_estimate": 88,
     "truncated": false,
-    "notes": "Major delta vs 2026-05-03 21:41:00: (a) NEW frontend/src/lib/i18n/{provider.tsx,translations.ts,format.ts} — full i18n module with LocaleProvider/useLocale/useT, en+zh ~110-key dictionary, locale-aware formatDate/formatLongDate, localStorage 'gpgpu-kb.locale.v1' persistence, SSR-safe with DEFAULT_LOCALE='en' fallback, document.documentElement.lang sync. TranslationKey = keyof typeof translations.en (en is source of truth). (b) NEW frontend/src/lib/theme/provider.tsx — full theme module with ThemeProvider/useTheme, THEME_STORAGE_KEY='gpgpu-kb.theme.v1', DEFAULT_THEME='dark', light+dark only. (c) FOUC-prevention: app/layout.tsx <head> contains an inline <script dangerouslySetInnerHTML> that synchronously reads localStorage.getItem('gpgpu-kb.theme.v1') and toggles <html class='dark'> BEFORE React mounts (storage key literal HARDCODED, must stay in sync with THEME_STORAGE_KEY). suppressHydrationWarning silences React class/lang warnings. viewport.themeColor dual-mode follows OS prefers-color-scheme. (d) NEW Cream Linen / Walnut Hearth oklch dual themes in src/app/globals.css — replaces ALL bg-zinc-950 hardcodes; @theme inline maps shadcn tokens to oklch CSS variables on :root + .dark; @custom-variant dark (&:is(.dark *)) declares dark variant. CODING CONVENTION CHANGE: new components must use semantic tokens (bg-background, bg-card, bg-sidebar, text-foreground, text-muted-foreground) not bg-zinc-*. (e) Header now contains <ThemeSwitcher /> + <LanguageSwitcher /> segmented controls; Sidebar fully i18n'd via t('nav.*'); AppShell uses React 19 derive-state-in-render pattern (if (pathname !== lastPath) setOpen(false)). NEW src/components/{language,theme}-switcher.tsx with mirrored visual design (pill + sliding thumb at left=activeIndex*1.75rem, pointer-events-none thumb). (f) NEW backend POST /api/daily/stream + GET /api/daily/status in backend/kb/main.py — Bearer-token-guarded same as /api/chat[/stream]. _DailyRunState singleton (threading.Lock + _running flag + Queue(maxsize=2000)) atomically claims slot; second concurrent POST gets HTTP 409. _run_daily_in_worker(queue) runs in daemon thread (NO subprocess); does `from kb.daily import run_daily_pipeline` lazy import so test monkeypatch.setattr(daily_mod, 'run_daily_pipeline', ...) is hit. _QueueLogHandler captures root logger; _QueueStdoutWriter via contextlib.redirect_stdout captures kb/daily.py's banner print() lines. finally MUST put_nowait('__terminator__') sentinel or generator hangs forever on queue.get(timeout=15). _STAGE_PATTERN=r'\\[([1-4])/4\\]' matches both English and Chinese banners (kb/daily.py prefix is fixed contract). event_stream(): started -> stage(<=4) -> log(N) -> done|error; 15s idle yield ': keepalive\\n\\n' SSE comment frame; X-Accel-Buffering: no + Cache-Control: no-cache. NO reattach mechanism — SSE ownership belongs to originating POST connection. Browser close doesn't interrupt pipeline (daemon thread continues). (g) NEW frontend/src/lib/api.ts: getDailyStatus() (GET /api/daily/status) + runDailyStream({signal?}) async generator (POST /api/daily/stream, body '{}', Accept: text/event-stream) + DailyConflictError extends Error (HTTP 409) + _parseDailyFrame (CRITICAL: skips lines starting with ':' to drop SSE keepalive comment frames; without this JSON.parse would throw). (h) NEW frontend/src/lib/types.ts: DailyStatus{running,started_at,current_stage} / DailyStageName='ingestion'|'processing'|'embedding'|'report' / DailyStreamEvent discriminated union. (i) frontend/src/app/reports/page.tsx COMPLETELY REWRITTEN: RunPhase state machine ('idle'|'starting'|'running'|'done'|'error') + RunState{phase, startedAt, activeIndex, errorMessage, conflict}. Mount flow: listReports(30) + getDailyStatus() — if status.running set conflict=true (button locked, no reattach). handleRun creates AbortController -> for await (const ev of runDailyStream({signal})) -> applyEvent dispatch (started/stage/log/error/done). MAX_LOG_LINES=2000 buffer cap. RunPanel UI: status header + 4 StagePills (pending/running/done/error 4 colors) + collapsible log panel + Reload button on terminal phase. Custom formatRelativeTime(iso, locale) 4-bucket relative time. (j) Backend tests: NEW 6 daily-pipeline SSE cases in backend/tests/test_api_smoke.py via _drain_daily_sse helper (mirrors _drain_sse but skips ':' keepalive frames) + _patch_daily(monkeypatch, fake_pipeline) helper + _reset_daily_state() helper: idle status / happy 4-stage flow (English banners) / 409 concurrency via threading.Event blocked fake pipeline / pipeline raise -> error frame (no done) / Bearer token guard on both /api/daily/{status,stream} / Chinese banner '[1/4] 数据采集' / '[2/4] 处理（摘要 + 打分）' detected by _STAGE_PATTERN. All deltas verified by reading the actual modified source files in this run."
+    "notes": "2026-05-06 00:04:43 — adaptive incremental refresh, DOCS-ONLY RE-SYNC, NO CODE DRIFT. Verified by direct read of: (1) backend/kb/processing/fulltext.py (404 lines: 3 loaders + _abstract_fallback + _extract_for_paper dispatcher + fetch_full_text + _ensure_cached + prefetch_pending_full_text + _PREFETCH_TYPES tuple + 200K cap + httpx stream + early abort caps); (2) backend/kb/scripts/backfill_full_text.py (124 lines: argparse with --dry-run/--limit/--source-type + _eligible_query filtering is_processed IN (1,2) AND full_text='' + _populate_one worker via _ensure_cached + _BACKFILL_WORKERS=4 ThreadPoolExecutor + as_completed); (3) backend/Dockerfile (84 lines: ARG INSTALL_EXTRAS=all default + grep -qE ',(ml|all),' ST predownload + --timeout-keep-alive 75 CMD); (4) backend/pyproject.toml (52 lines: [fulltext]=['trafilatura>=1.12.0'] + [all]=self-referential aggregate); (5) docker-compose.yml (100 lines: build.args.INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-all} fallback); (6) .env.docker.example (95 lines: BACKEND_INSTALL_EXTRAS=all default + KB_LLM_EXPERT_* examples + KB_CHAT_TOKEN guidance); (7) backend/kb/ingestion/run.py (149 lines: _lookback_for_source + _compute_days_back wrapper + run_ingestion ends with try/except wrapping prefetch_pending_full_text() and storing results['fulltext_prefetched']); (8) backend/kb/main.py top imports (asyncio/contextlib/hmac/re/threading/deque all present); (9) backend/tests/README.md (legacy ~75 estimate; actual count is ~242 from changelog claim — README is stale on the test count number but architecturally correct; no action needed since test count is tracked by the actual test runner); (10) backend/tests/test_processing_fulltext.py (read first 30 lines to confirm renamed file exists with _seed_paper helper). All checks pass. Frontend NOT touched this run — root CLAUDE.md changelog and backend changelog entries explicitly note 'frontend code unchanged' in 2026-05-05 23:15:12 and 2026-05-06 00:04:43 entries; no frontend source files needed to be re-read."
   },
   "next_steps": [
-    "实施 KB_CHAT_TOKEN 时同步扩 frontend/src/lib/api.ts 的 fetchJSON / chatStream / getDailyStatus / runDailyStream（本轮新增的两个 daily 端点也受守卫）：通过 server-side route handler 在 Next 里转发 Bearer，避免暴露 NEXT_PUBLIC_*",
-    "为本轮 SSE / themed i18n 扩展 e2e 用例：⑤ Reports 页 Run-Now 按钮 → mock SSE 4-stage 序列 → 验证 4 个 StagePill 切换；⑥ HTTP 409 → conflict UI；⑦ getDailyStatus().running=true mount 时按钮锁住；⑧ 切语言 → header / sidebar 文案立即跟进；⑨ 切主题 → <html> class 切换 + 颜色不闪",
+    "若引入 reddit / HN / Substack newsletter 等新非论文来源，按 fulltext.py 三不变量加新 loader 分支（流式+早期abort / oversize 返回'' / 失败返回''）并在 _PREFETCH_TYPES 加新 SourceType",
+    "考虑把 _MAX_PDF_BYTES / _MAX_HTML_BYTES / _MAX_README_BYTES / _MAX_EXTRACTED_CHARS / _SCORING_BODY_CAP / _SOURCE_TEXT_PROMPT_CAP / _PREFETCH_WORKERS / Queue(maxsize=2000) / MAX_LOG_LINES 全部提到 settings 里，便于无重启调参",
+    "实施 KB_CHAT_TOKEN 时同步扩 frontend/src/lib/api.ts 的 fetchJSON / chatStream / getDailyStatus / runDailyStream（这两个 daily 端点也受守卫）：通过 server-side route handler 在 Next 里转发 Bearer，避免暴露 NEXT_PUBLIC_*",
+    "为 SSE / themed i18n / fulltext loader 扩 e2e 用例：⑤ Reports 页 Run-Now → mock SSE 4-stage → 4 个 StagePill 切换；⑥ HTTP 409 conflict UI；⑦ getDailyStatus().running=true mount 时按钮锁住；⑧ 切语言 → header/sidebar 文案立即跟进；⑨ 切主题 → <html> class 切换 + 颜色不闪",
     "为 useConversationHistory 添加 vitest 单测覆盖 _isConversation / _safeWrite 配额满 / hydration",
     "为 _parseSSEFrame / _parseDailyFrame 添加 vitest 单测覆盖多行 data: 拼接、event 缺失、JSON 解析失败 silent drop、跳过 ':' keepalive 注释帧",
     "为 i18n _interpolate 添加 vitest 单测覆盖 {name} 替换 / 缺失 placeholder / params 是 number 转 string",
@@ -389,13 +367,11 @@
     "深扫 backend/tests/conftest.py 验证 _init_db / client 夹具如何隔离 SQLite 与 ChromaDB",
     "扫 backend/kb/ingestion/arxiv.py 与 github_trending.py 源码以核实 cs.* 类目列表与 polite-sleep 触发条件",
     "为 docs/ 目录补充实际内容或在根 CLAUDE.md 中标注其用途",
-    "若 source-anchored chat 的 PDF 解析在生产报错率高，考虑加白名单 substring 或 Content-Type 嗅探（避免 HTML 误判）",
-    "把 _MAX_PDF_BYTES / _DOWNLOAD_TIMEOUT_S / _MAX_EXTRACTED_CHARS / _SOURCE_TEXT_PROMPT_CAP / _HISTORY_TURN_CAP / MAX_LOG_LINES / Queue(maxsize=2000) 全部提到 settings 里，便于无重启调参",
     "评估把 chat 系统 prompt 也接到 KB_LANGUAGE 或前端 locale，或加新变量 KB_CHAT_LANGUAGE 独立控制",
     "考虑 SSE 端点真正发 'error' 事件而非静默吞掉 stream_llm 异常（chat 路径）",
-    "扫 src/app/page.tsx / chat/page.tsx 确认所有字面量字符串是否都已替换为 t() 调用（本轮新增 i18n 后需要全栈 audit）",
     "考虑给 daily pipeline SSE 端点加 'reattach' 机制（SSE Last-Event-ID 或单独的 status-broadcast endpoint），让多 tab / 多用户可同时观察一次 in-flight run",
-    "评估在 frontend/src/lib/i18n/ 下加自动校验脚本（预 commit hook：translations.zh 必须含 translations.en 的所有 key）"
+    "评估在 frontend/src/lib/i18n/ 下加自动校验脚本（预 commit hook：translations.zh 必须含 translations.en 的所有 key）",
+    "更新 backend/tests/README.md 的测试计数（当前显示 ~75，实际 ~242）"
   ],
   "changelog": [
     {
@@ -426,27 +402,42 @@
     {
       "timestamp": "2026-05-02T21:18:53Z",
       "action": "incremental_refresh",
-      "summary": "SSE streaming chat: NEW POST /api/chat/stream (text/event-stream; sources -> token... -> done [+ optional error]; placeholder '(LLM produced no output)' on empty; X-Accel-Buffering: no + Cache-Control: no-cache); NEW shared _build_chat_context(req, db) extracted so /api/chat and /api/chat/stream share prompt + sources construction; HTTPException raised BEFORE StreamingResponse so paper_id 404 surfaces as normal HTTP error. Chat system prompts switched to hardcoded Chinese — KB_LANGUAGE no longer affects chat. NEW _sse_event(event, data) helper. NEW stream_llm(prompt) parallel public API; _STREAM_PROVIDERS dict {hermes, anthropic, openai, deepseek}; failures end generator silently; _stream_anthropic uses messages.stream.text_stream; _stream_openai_compatible(api_key, model, base_url=None) shared body; _stream_hermes single-chunk fallback. NEW chatStream(request, {signal?}) async generator in frontend/src/lib/api.ts; ChatStreamEvent discriminated union in types.ts; chat page completely rewritten for streaming with Stop button (red Square), AbortController in abortRef, 3-state finalize. NEW 5 SSE cases in test_api_smoke.py + 5 stream_llm cases in test_processing_llm.py. Suite ~105 -> ~115."
+      "summary": "SSE streaming chat: NEW POST /api/chat/stream + shared _build_chat_context + stream_llm abstraction + chat system prompt hardcoded Chinese + frontend chatStream async generator + Stop button. Suite ~105 -> ~115."
     },
     {
       "timestamp": "2026-05-02T23:32:00Z",
       "action": "incremental_refresh",
-      "summary": "New blog source vLLM Blog (RSS) + LMSYS / SGLang Blog (sitemap-driven via NEW kb/ingestion/sitemap_blog.py: SitemapSource dataclass + xml.etree.ElementTree parsing + per-page og:* meta extraction + 60-articles-per-source cap + loose date format support like 'April 29, 2026'); kb/ingestion/run.py orchestrates as independent stage results['sitemap_blogs']; ~30 unit tests + orchestrator tests upgraded to 4 fetchers; pytest 174/174 pass."
+      "summary": "vLLM Blog (RSS) + LMSYS / SGLang Blog (sitemap-driven via NEW kb/ingestion/sitemap_blog.py); pytest 174/174 pass."
     },
     {
       "timestamp": "2026-05-03T09:44:00Z",
       "action": "incremental_refresh",
-      "summary": "Per-Paper.source_name ingest cold-start: NEW _lookback_for_source(source_name) in kb/ingestion/run.py with optional WHERE source_name=:name filter; cold-start (KB_INGEST_EMPTY_DB_DAYS) when no row for that source_name. _compute_days_back() now wraps _lookback_for_source(None). All 4 fetchers (fetch_recent_papers / fetch_recent_posts / fetch_recent_sitemap_posts / fetch_trending_repos) signature unified to days_back: int | None; lazy-import _lookback_for_source from inside the fetcher body to avoid circular top-level imports. Effect: adding a new RSS feed or SitemapSource auto-triggers 30-day backfill for ONLY that source on next daily run. Tests 174 -> 180 pass."
+      "summary": "Per-Paper.source_name ingest cold-start: _lookback_for_source(source_name) + 4 fetchers unified to days_back: int | None signature. Tests 174 -> 180 pass."
     },
     {
       "timestamp": "2026-05-03T21:41:00Z",
       "action": "incremental_refresh",
-      "summary": "Fast / Expert dual-role LLM: NEW Settings.llm_expert_provider / llm_expert_model (both Optional[str], default None — transparent fallback to fast). NEW _resolve_role(role) -> (provider_name, model_override): role='expert' -> (llm_expert_provider or llm_provider, llm_expert_model); else -> (llm_provider, None). All _call_* / _stream_* providers gain (prompt, *, model: str | None = None) kwarg; model=None falls back to settings.<provider>_model, non-None overrides. _stream_openai_compatible already required model as kwarg. Hermes accepts but ignores model (CLI has no --model flag). call_llm(prompt, role='fast') / stream_llm(prompt, role='fast') resolve role then call _PROVIDERS[provider_name](prompt, model=model_override). _call_llm = call_llm back-compat alias. /api/chat -> call_llm(role='expert'); /api/chat/stream -> stream_llm(role='expert'); summarize_and_score and generate_daily_report stay default fast. Tests: provider-dispatch assertions upgraded to model=None kwarg; 6 NEW role-overlay cases (expert routes to expert provider; fallback to fast when expert unset; model override passed; fast ignores expert model; stream mirrors expert route; stream mirrors expert model override). Suite 180 -> 203 pass. .env.docker.example adds expert role examples (same provider model swap + cross-provider fast/expert pairing). NO breaking changes — historical deployments without KB_LLM_EXPERT_* env behave identically."
+      "summary": "Fast / Expert dual-role LLM: Settings.llm_expert_provider / llm_expert_model + _resolve_role + (prompt, *, model: str | None = None) provider signature + call_llm/stream_llm role kwarg + /api/chat[/stream] uses expert. Tests 180 -> 203 pass."
     },
     {
       "timestamp": "2026-05-03T22:34:43Z",
       "action": "incremental_refresh",
-      "summary": "Themed i18n frontend shell + manual daily-pipeline trigger endpoints (SSE progress). Frontend: (a) NEW frontend/src/lib/i18n/{provider.tsx,translations.ts,format.ts} — full i18n module: LocaleProvider with React Context + localStorage 'gpgpu-kb.locale.v1' persistence; SSR always renders DEFAULT_LOCALE='en' to match SSR markup, mount-effect reconciles to persisted; document.documentElement.lang sync ('zh-CN' / 'en') for a11y / browser translation / :lang() selector; en/zh ~110-key dictionary covering brand/shell/nav/lang/theme/search/browse/card/score/paper/reports.run.*/stats/chat/picker; TranslationKey = keyof typeof translations.en (en is source of truth, missing zh keys silently render raw key — no lint check, manual review); _interpolate supports {name} placeholders (NO ICU plurals); formatDate / formatLongDate / localeTag wrap Date.toLocaleDateString with locale-aware tags. (b) NEW frontend/src/lib/theme/provider.tsx — ThemeProvider with React Context + localStorage 'gpgpu-kb.theme.v1' persistence; THEME_STORAGE_KEY constant, DEFAULT_THEME='dark', THEMES=['light','dark']; useEffect classes.toggle('dark'). (c) FOUC-prevention in app/layout.tsx: inline <script dangerouslySetInnerHTML={{__html: THEME_INIT_SCRIPT}}> in <head> reads localStorage SYNCHRONOUSLY before React mounts and toggles <html class='dark'>; painted body never flickers. THIS INLINE SCRIPT HARDCODES 'gpgpu-kb.theme.v1' LITERAL — must stay in sync with THEME_STORAGE_KEY (no IDE check). <html lang='en' className='h-full antialiased dark' suppressHydrationWarning> silences React class/lang mismatch warnings. viewport.themeColor dual-mode follows OS prefers-color-scheme (independent of <html class> runtime toggle). (d) NEW Cream Linen / Walnut Hearth oklch dual themes in src/app/globals.css — REPLACES all bg-zinc-950 hardcodes; @theme inline maps shadcn tokens (--color-card / --color-primary / --color-secondary / --color-muted / --color-accent / --color-destructive / --color-border / --color-input / --color-ring / --color-popover / --color-sidebar (+ -foreground/-primary/-accent/-border/-ring) / --color-chart-1..5 / --radius-*) to oklch values on :root (Cream Linen: parchment cream + caramel amber + chestnut brown — long-form-reading friendly) and .dark (Walnut Hearth: walnut bark + roasted cocoa + toasted amber + oat-mist — cozy fireside dark). @custom-variant dark (&:is(.dark *)) declares Tailwind v4 dark variant. CODING CONVENTION CHANGE: new components MUST use semantic tokens (bg-background / bg-card / bg-sidebar / text-foreground / text-muted-foreground / bg-primary text-primary-foreground), NOT bg-zinc-* hardcodes. Exceptions: red-600 for Stop button, emerald-500 for done state. (e) AppShell / Header / Sidebar refactor: layout.tsx wraps <ThemeProvider><LocaleProvider><AppShell>; AppShell uses React 19 'derive state in render' pattern (if (pathname !== lastPath) setOpen(false)) instead of useEffect side-effect; Header adds <ThemeSwitcher /> + <LanguageSwitcher /> segmented controls (pill + sliding thumb at left=activeIndex*1.75rem; pointer-events-none thumb; ThemeSwitcher thumb opacity=0 until hydrated to avoid SSR snapshot painting under wrong tab); Sidebar fully i18n'd via t('nav.*') with version line reading pkg.version from package.json. NEW src/components/{language,theme}-switcher.tsx with mirrored visual design (Sun/Moon for theme, EN/中 for language). Backend: (f) NEW POST /api/daily/stream + GET /api/daily/status in backend/kb/main.py — Bearer-token-guarded same as /api/chat[/stream] (any 'expensive / writing / job-triggering' endpoint MUST reuse verify_chat_token going forward — convention). _DailyRunState singleton (threading.Lock + _running flag + Queue(maxsize=2000)) atomically claims slot via try_start(); second concurrent POST gets HTTPException(409, 'A daily pipeline run is already in progress.'). _run_daily_in_worker(queue) runs in daemon thread (NO subprocess); function body does `from kb.daily import run_daily_pipeline` LAZY IMPORT so test monkeypatch.setattr(daily_mod, 'run_daily_pipeline', ...) is hit. _QueueLogHandler attached to root logger captures logging.* lines; _QueueStdoutWriter via contextlib.redirect_stdout captures kb/daily.py's '[N/4] <stage>' banner print() lines. finally MUST queue.put_nowait(('__terminator__', None)) sentinel — without it generator hangs forever on queue.get(timeout=15). _STAGE_PATTERN = re.compile(r'\\[([1-4])/4\\]') + _STAGE_NAMES dict — kb/daily.py prints [N/4] prefix regardless of KB_LANGUAGE so both 'INGESTION' and '数据采集' banners trigger stage events; this is HARD CONTRACT between kb/daily.py banner format and main.py _STAGE_PATTERN. event_stream(): yield started -> loop queue.get(timeout=15): __terminator__ -> emit done if not terminal_emitted, break; __done__/__error__ -> emit + terminal_emitted=True suppresses dup; Empty -> yield ': keepalive\\n\\n' SSE comment frame (frontend _parseDailyFrame must skip ':' lines); log -> _STAGE_PATTERN.search to dedup-emit stage frames + emit log frame. Headers X-Accel-Buffering: no + Cache-Control: no-cache. NO reattach mechanism — SSE ownership belongs to originating POST connection; other tabs poll /api/daily/status for in-flight UI but cannot consume live stream. Browser close doesn't interrupt — daemon thread continues to completion. Frontend reports page: (g) src/app/reports/page.tsx COMPLETELY REWRITTEN with Run-Now button + SSE progress panel: RunPhase = 'idle'|'starting'|'running'|'done'|'error'; RunState{phase, startedAt, activeIndex, errorMessage, conflict}; STAGE_ORDER + STAGE_LABEL_KEY (i18n keys reports.run.stage.*). Mount: listReports(30) + getDailyStatus() — if status.running set conflict=true (button locked, no reattach). handleRun: AbortController -> abortRef -> for await (const ev of runDailyStream({signal})) -> applyEvent dispatches by ev.type. MAX_LOG_LINES=2000 buffer cap; appendLog slices oldest on overflow. RunPanel UI: status header (AlertCircle red / Check emerald / Loader2 amber) + relative-time start ('刚刚' / 'X 分钟前' via custom formatRelativeTime 4-bucket impl) + 4 StagePills (pending/running/done/error 4 colors) + collapsible log panel (<pre> whitespace-pre-wrap break-words font-mono) + Reload button on terminal phase. Error handling differentiates DailyConflictError (HTTP 409 -> conflict UI), AbortError (silent — user cancel), other Error (red bubble + log panel). finally clears abortRef ONLY if abortRef.current === controller. Frontend API client: (h) NEW frontend/src/lib/api.ts: getDailyStatus() (GET /api/daily/status) + runDailyStream({signal?}) async generator (POST /api/daily/stream, body '{}', Accept: text/event-stream) + DailyConflictError extends Error (HTTP 409) + _parseDailyFrame (CRITICAL: skips lines starting with ':' to drop SSE keepalive comment frames + skips empty lines; without these JSON.parse would throw on every keepalive). reader.releaseLock() in try/catch (throws after abort — safe to swallow). (i) NEW frontend/src/lib/types.ts: DailyStatus{running, started_at, current_stage} / DailyStageName='ingestion'|'processing'|'embedding'|'report' / DailyStreamEvent discriminated union (started{started_at} | stage{index:1|2|3|4, name:DailyStageName} | log{line} | error{message} | done). Stats.top_overall unchanged. Tests: (j) NEW 6 daily-pipeline SSE cases in backend/tests/test_api_smoke.py via _drain_daily_sse helper (mirrors _drain_sse but skips ':' keepalive frames) + _patch_daily(monkeypatch, fake_pipeline) helper (monkeypatch.setattr(daily_mod, 'run_daily_pipeline', ...) — worker thread lazy import hits the patch) + _reset_daily_state() helper (force-clear singleton between tests since session-scoped TestClient shares app instance): test_daily_status_idle_by_default / test_daily_stream_emits_started_stages_and_done (English banners, 4 stages in order, log frames contain banner lines) / test_daily_stream_concurrent_returns_409 (threading.Event blocks fake pipeline, second POST gets 409 while first still running, then release.set() to let first finish) / test_daily_stream_pipeline_exception_emits_error (RuntimeError -> error frame, no done frame, message contains 'boom') / test_daily_endpoints_require_token_when_set (KB_CHAT_TOKEN set -> both endpoints return 401 without/with-wrong token, 200/!=401 with correct token) / test_daily_stage_pattern_matches_chinese_banner ('[1/4] 数据采集' / '[2/4] 处理（摘要 + 打分）' / '[3/4] 向量化' / '[4/4] 每日简报' all detected by _STAGE_PATTERN). NO impact on: DB schema / migration / Docker / hermes/anthropic/openai/deepseek provider behavior / chat multi-turn / SSE streaming chat / fast-expert dual role / per-source ingest cold-start / sitemap blog. run_daily_pipeline() function itself is UNCHANGED — it remains both the CLI entry (python -m kb.daily) and the cron container entry (docker compose --profile cron run --rm daily) and now also the /api/daily/stream worker-thread lazy-import target — all three entry points share the same code and SQLite write lock. All deltas verified by reading the actual modified source files in this run."
+      "summary": "Themed i18n frontend shell + manual daily-pipeline trigger endpoints (SSE progress). Frontend: NEW lib/i18n + lib/theme modules; Cream Linen / Walnut Hearth oklch dual themes in globals.css; FOUC-prevention inline script in layout.tsx; Header adds ThemeSwitcher + LanguageSwitcher; Sidebar i18n'd. Backend: NEW POST /api/daily/stream + GET /api/daily/status with Bearer guard + _DailyRunState singleton + _QueueLogHandler + _QueueStdoutWriter + _STAGE_PATTERN. Reports page rewritten with Run-Now button + RunPhase state machine + 4-stage StagePill + log panel + cross-tab in-flight detection. NEW _drain_daily_sse helper + 6 SSE cases."
+    },
+    {
+      "timestamp": "2026-05-03T23:00:00Z",
+      "action": "incremental_refresh",
+      "summary": "Browse 页 Source 名称多选过滤. Backend: NEW GET /api/sources + GET /api/papers?source_name= multi-filter. Frontend: NEW source-filter.tsx component + URL state via window.history.replaceState (workaround for Next 16.2.x router cache regression vercel/next.js#92187). Tests 209 -> 216 pass + 2 e2e cases."
+    },
+    {
+      "timestamp": "2026-05-05T23:15:12Z",
+      "action": "incremental_refresh",
+      "summary": "Universal full-text loader (HTML / GitHub README / PDF) + scoring on full body + chat prompt cap raised to 200K + aggregate [all] extras. Backend: kb/processing/pdf.py renamed to kb/processing/fulltext.py with 3 loaders dispatched on source/url (PDF preserved + HTML via trafilatura + GitHub via REST API auto-stripping .git suffix); all three use httpx stream + early abort (PDF 20MB / HTML 8MB / README 4MB; oversize uniformly returns '' to keep cache untainted). Paper.full_text cap 120K -> 200_000 chars. NEW _ensure_cached(paper_id) single-SessionLocal worker for prefetch. run_ingestion() now ends with try/except calling prefetch_pending_full_text() (4-worker ThreadPoolExecutor; filters source_type IN (BLOG, PROJECT, TALK) AND full_text=''; idempotent; results['fulltext_prefetched'] reported; failures don't poison ingest counts). summarize_and_score now uses paper.full_text or paper.abstract with _SCORING_BODY_CAP=30_000; prompt field renamed Abstract: -> Content:. _SOURCE_TEXT_PROMPT_CAP raised 60K -> 200_000 to match cache cap. NEW [fulltext]=['trafilatura>=1.12.0'] extras + aggregate [all]=['gpgpu-kb[ml]','gpgpu-kb[llm-cloud]','gpgpu-kb[fulltext]'] (self-referential, pip>=23 / setuptools support). Docker default ARG INSTALL_EXTRAS=all (was 'ml,llm-cloud') + ST predownload condition grep -qE ',(ml|all),' compatible with new default + docker-compose.yml ${BACKEND_INSTALL_EXTRAS:-all} fallback + .env.docker.example BACKEND_INSTALL_EXTRAS=all default. NEW kb/scripts/backfill_full_text.py (--dry-run / --limit / --source-type + 4-worker pool + reuses _ensure_cached + targets is_processed IN (1,2) AND full_text=''; does NOT re-score). rescore_non_papers.py adds --include-already-scored flag. Tests 216 -> 242: rename test_processing_pdf.py -> test_processing_fulltext.py expanded to 17 cases (PDF preserved + HTML happy/network-fail/oversize stream-abort + GitHub happy/404/non-github URL/.git stripping + prefetch row selection + idempotence); test_ingestion_run.py adds patch.object(fulltext_mod, 'prefetch_pending_full_text', return_value=0). NO impact on: DB schema / migration / chat multi-turn / source-anchored chat behavior / SSE streaming chat / fast-expert dual role / per-source ingest cold-start / sitemap blog / /api/daily/* / any frontend code."
+    },
+    {
+      "timestamp": "2026-05-06T00:04:43Z",
+      "action": "adaptive_incremental_refresh_docs_only",
+      "summary": "DOCS-ONLY RE-SYNC, NO CODE DRIFT. Adaptive scan verified all 2026-05-05 23:15:12 changelog claims by direct source read: (a) backend/kb/processing/fulltext.py — exists with 3 loaders + _ensure_cached + prefetch_pending_full_text + 200K cap + 4-worker pool + httpx stream + early abort caps (8MB HTML / 20MB PDF / 4MB README); (b) backend/kb/scripts/backfill_full_text.py — exists with --dry-run/--limit/--source-type + _ensure_cached reuse + _BACKFILL_WORKERS=4 + is_processed.in_([1,2]) filter; (c) backend/Dockerfile — ARG INSTALL_EXTRAS=all default + grep -qE ',(ml|all),' ST predownload condition + --timeout-keep-alive 75 CMD; (d) backend/pyproject.toml — [fulltext]=['trafilatura>=1.12.0'] + aggregate [all]=['gpgpu-kb[ml]','gpgpu-kb[llm-cloud]','gpgpu-kb[fulltext]']; (e) docker-compose.yml — build.args.INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-all} fallback; (f) .env.docker.example — BACKEND_INSTALL_EXTRAS=all default + slim-down notes; (g) backend/kb/ingestion/run.py — run_ingestion() ends with try/except calling prefetch_pending_full_text() and storing results['fulltext_prefetched']; (h) backend/kb/main.py top imports include asyncio/contextlib/hmac/re/threading/deque. All checks pass. Frontend NOT touched this run — root CLAUDE.md narrative + backend changelog entries explicitly mark 'frontend code unchanged' in 2026-05-05 23:15:12. Updates applied: only the top-of-file timestamp banner in CLAUDE.md / backend/CLAUDE.md / frontend/CLAUDE.md, a single new changelog row in each, this index.json's generated_at + scanned_files indicators + this changelog entry. Mermaid graph in root CLAUDE.md got minor wording updates (B3/B4/B6/B8 nodes now mention prefetch tail / fulltext (PDF/HTML/GitHub) / backfill_full_text / INSTALL_EXTRAS=all default to match the now-aligned code). Coverage indicators bumped: files_read_this_run=14, scanned_files counts updated to reflect actual reads. NO new modules identified; backend + frontend remain the two top-level claude_md-bearing modules. Next-steps list pruned of resolved items (fulltext loader / [all] extras / Docker default / backfill script / chat prompt 200K / ingestion tail prefetch — all completed in 2026-05-05 23:15:12) and added one new low-priority item (update backend/tests/README.md test count from ~75 to ~242). All deltas described here are documentation only — no .py / .ts / .tsx / .css / .yml / .toml / .md (except CLAUDE.md trio) source files were modified."
     }
   ]
 }

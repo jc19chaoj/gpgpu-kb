@@ -64,6 +64,26 @@ _OWNER_REPO_RE = re.compile(
     r'href="/([^/"\s]+)/([^/"\s#?]+)"',
     re.IGNORECASE,
 )
+# GitHub reserved top-level paths that look like ``/<segment>/<segment>`` but
+# are NOT repos. These appear inside trending ``<article>`` blocks (e.g. the
+# "Sponsor" CTA expands to ``<a href="/sponsors/<owner>">``) and used to be
+# scraped as bogus repo entries — every subsequent README API call then
+# went to ``api.github.com/repos/sponsors/<owner>/readme`` and 404'd.
+#
+# We skip these owner segments in :func:`_scrape_trending` and walk to the
+# next ``href="/x/y"`` match in the same article. The list is intentionally
+# tight (only paths actually observed on trending articles); adding speculative
+# entries would risk hiding real repos owned by accounts named e.g. "topics".
+_RESERVED_OWNER_PATHS: frozenset[str] = frozenset({
+    "sponsors",  # Sponsor button — primary offender
+    "topics",    # ``/topics/<tag>`` — never appears inside an article block
+                 # today, but cheap to guard against future markup tweaks.
+    "orgs",      # ``/orgs/<name>``
+    "users",     # ``/users/<name>``
+    "marketplace",
+    "settings",
+    "trending",  # nested links back to the trending page itself
+})
 _DESCRIPTION_RE = re.compile(
     r'<p\b[^>]*class="[^"]*\bcol-9\b[^"]*"[^>]*>(.*?)</p>',
     re.IGNORECASE | re.DOTALL,
@@ -112,11 +132,24 @@ def _scrape_trending(client: httpx.Client, period: str) -> list[_Scraped]:
     seen: set[tuple[str, str]] = set()
     for art in _ARTICLE_RE.finditer(html):
         block = art.group(1)
-        m = _OWNER_REPO_RE.search(block)
-        if not m:
-            continue
-        owner = unescape(m.group(1)).strip()
-        repo = unescape(m.group(2)).strip()
+        # Walk every ``/owner/repo`` href in document order, skip reserved
+        # paths (``/sponsors/<owner>``, etc.), take the first real one.
+        # ``finditer`` instead of ``search`` because the heading link is
+        # not always the textually-first match — when the article also
+        # has a "Sponsor" CTA or similar action button, the reserved
+        # ``/sponsors/<owner>`` link can come first and would otherwise
+        # be saved as a bogus repo with `(owner="sponsors", repo=<name>)`.
+        owner = ""
+        repo = ""
+        for m in _OWNER_REPO_RE.finditer(block):
+            cand_owner = unescape(m.group(1)).strip()
+            cand_repo = unescape(m.group(2)).strip()
+            if not cand_owner or not cand_repo:
+                continue
+            if cand_owner.lower() in _RESERVED_OWNER_PATHS:
+                continue
+            owner, repo = cand_owner, cand_repo
+            break
         if not owner or not repo:
             continue
         key = (owner, repo)
