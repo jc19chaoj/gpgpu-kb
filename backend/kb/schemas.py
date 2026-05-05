@@ -98,6 +98,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[PaperOut]
+    # Resolved model name actually used to produce the answer (expert role).
+    # Empty string when unknown — the frontend treats it as optional.
+    model: str = ""
 
 
 class SearchRequest(BaseModel):

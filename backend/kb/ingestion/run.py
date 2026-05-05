@@ -126,6 +126,21 @@ def run_ingestion(days_back: int | None = None) -> dict[str, int]:
 
     total = sum(results.values())
     logger.info("[ingestion] Done. %d total new items.", total)
+
+    # Tail step: prefetch full-article HTML / GitHub READMEs into
+    # `Paper.full_text` so the downstream scoring stage scores against
+    # the real body instead of a 200-char og:description. Best-effort —
+    # any failure here must not poison the headline ingest counts above.
+    # Idempotent (skips rows whose `full_text` is already populated).
+    try:
+        from kb.processing.fulltext import prefetch_pending_full_text
+
+        n = prefetch_pending_full_text()
+        results["fulltext_prefetched"] = n
+    except Exception:
+        logger.exception("[ingestion] fulltext prefetch failed (non-fatal)")
+        results["fulltext_prefetched"] = 0
+
     return results
 
 

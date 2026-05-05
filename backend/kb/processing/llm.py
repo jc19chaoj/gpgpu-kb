@@ -9,8 +9,11 @@ Providers (selected via KB_LLM_PROVIDER):
 """
 import json
 import logging
+import random
 import subprocess
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from kb.config import settings
@@ -44,6 +47,28 @@ def _resolve_role(role: str) -> tuple[str, str | None]:
         )
     # "fast" / anything else → default/fast role
     return (settings.llm_provider, None)
+
+
+def resolved_model(role: str = "fast") -> dict[str, str]:
+    """Return the (provider, model) actually used for the given role.
+
+    Surfaces "who answered" so UI can label assistant messages
+    (e.g. /api/chat/stream emits a `model` SSE frame before `sources`).
+    `model_override=None` from `_resolve_role` means we read the
+    per-provider default; hermes has no model concept, so its name is
+    just "hermes".
+    """
+    provider_name, model_override = _resolve_role(role)
+    if model_override:
+        model = model_override
+    else:
+        model = {
+            "anthropic": settings.anthropic_model,
+            "openai": settings.openai_model,
+            "deepseek": settings.deepseek_model,
+            "hermes": "hermes",
+        }.get(provider_name, "") or provider_name
+    return {"provider": provider_name, "model": model}
 
 
 # ─── Provider implementations ─────────────────────────────────────
@@ -151,6 +176,66 @@ _PROVIDERS = {
 }
 
 
+# ─── Retry policy ─────────────────────────────────────────────────
+#
+# Concurrent scoring (8 workers) makes 429 / transient 5xx hits more likely.
+# `call_llm` retries the whole provider call on retryable errors. `stream_llm`
+# only retries if the upstream failure happened BEFORE any chunk was yielded —
+# a partial stream cannot be safely re-played to the client.
+
+_RETRYABLE_NAME_TAGS = (
+    "ratelimit",
+    "timeout",
+    "apiconnection",
+    "connectionerror",
+    "serviceunavailable",
+    "internalserver",
+    "apistatus",  # generic 5xx wrapper in openai/anthropic SDKs
+)
+_NON_RETRYABLE_NAME_TAGS = (
+    "authentication",
+    "permissiondenied",
+    "notfound",
+    "badrequest",
+    "invalidrequest",
+    "unprocessable",
+)
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Heuristic classifier — retry transient infra errors, give up on 4xx.
+
+    Checks (in order):
+      1. HTTP status code attribute (`status_code` / `http_status`):
+         429 or >= 500 → retry; other 4xx → don't.
+      2. Exception class name substring match.
+      3. Standard library network types (ConnectionError / OSError / TimeoutError).
+      4. Default: don't retry — avoids retrying programming bugs.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if isinstance(status, int):
+        if status == 429 or status >= 500:
+            return True
+        if 400 <= status < 500:
+            return False
+    name = exc.__class__.__name__.lower()
+    if any(tag in name for tag in _NON_RETRYABLE_NAME_TAGS):
+        return False
+    if any(tag in name for tag in _RETRYABLE_NAME_TAGS):
+        return True
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
+        return True
+    return False
+
+
+def _sleep_backoff(attempt: int, base: float) -> None:
+    """Exponential backoff with full-jitter: random in [0, base * 2^attempt]."""
+    if base <= 0:
+        return
+    cap = base * (2 ** attempt)
+    time.sleep(random.uniform(0, cap))
+
+
 def call_llm(
     prompt: str,
     role: str = "fast",
@@ -166,6 +251,10 @@ def call_llm(
                                override per-call if they want a tighter
                                or looser cap.
 
+    Retries on transient errors (429 / 5xx / network) with exponential
+    backoff up to `settings.llm_max_retries` times. Auth / 4xx errors and
+    unknown exceptions return "" immediately.
+
     See `_resolve_role` for how expert overlays onto fast.
     """
     provider_name, model_override = _resolve_role(role)
@@ -176,11 +265,28 @@ def call_llm(
             provider_name, role,
         )
         provider = _call_hermes
-    try:
-        return provider(prompt, model=model_override, max_tokens=max_tokens)
-    except Exception:
-        logger.exception("LLM provider %s raised (role=%s)", provider_name, role)
-        return ""
+
+    max_retries = max(0, settings.llm_max_retries)
+    base_backoff = max(0.0, settings.llm_retry_backoff_seconds)
+
+    for attempt in range(max_retries + 1):
+        try:
+            return provider(prompt, model=model_override, max_tokens=max_tokens)
+        except Exception as exc:
+            retryable = _is_retryable_error(exc)
+            is_last = attempt >= max_retries
+            if not retryable or is_last:
+                logger.exception(
+                    "LLM provider %s failed (role=%s, attempt=%d/%d, retryable=%s)",
+                    provider_name, role, attempt + 1, max_retries + 1, retryable,
+                )
+                return ""
+            logger.warning(
+                "LLM provider %s transient error (role=%s, attempt=%d/%d): %s — retrying",
+                provider_name, role, attempt + 1, max_retries + 1, exc,
+            )
+            _sleep_backoff(attempt, base_backoff)
+    return ""
 
 
 # ─── Streaming provider implementations ───────────────────────────
@@ -281,6 +387,10 @@ def stream_llm(prompt: str, role: str = "fast") -> Iterator[str]:
     """Public streaming LLM call. Mirrors `call_llm`'s contract:
     on any failure the generator ends silently — never raises.
 
+    Retry semantics: only retry if the upstream error fires BEFORE any chunk
+    has been yielded to the caller. Once a chunk has been yielded we cannot
+    safely replay the stream from scratch, so we give up and end silently.
+
     Role semantics identical to `call_llm` (see `_resolve_role`).
     """
     provider_name, model_override = _resolve_role(role)
@@ -291,11 +401,34 @@ def stream_llm(prompt: str, role: str = "fast") -> Iterator[str]:
             provider_name, role,
         )
         provider = _stream_hermes
-    try:
-        yield from provider(prompt, model=model_override)
-    except Exception:
-        logger.exception("LLM stream provider %s raised (role=%s)", provider_name, role)
-        # silent end: matches call_llm's empty-string contract
+
+    max_retries = max(0, settings.llm_max_retries)
+    base_backoff = max(0.0, settings.llm_retry_backoff_seconds)
+
+    for attempt in range(max_retries + 1):
+        yielded_any = False
+        try:
+            for chunk in provider(prompt, model=model_override):
+                yielded_any = True
+                yield chunk
+            return
+        except Exception as exc:
+            retryable = _is_retryable_error(exc)
+            is_last = attempt >= max_retries
+            if yielded_any or not retryable or is_last:
+                logger.exception(
+                    "LLM stream provider %s failed (role=%s, attempt=%d/%d, "
+                    "retryable=%s, yielded_any=%s)",
+                    provider_name, role, attempt + 1, max_retries + 1,
+                    retryable, yielded_any,
+                )
+                return
+            logger.warning(
+                "LLM stream provider %s transient error before first chunk "
+                "(role=%s, attempt=%d/%d): %s — retrying",
+                provider_name, role, attempt + 1, max_retries + 1, exc,
+            )
+            _sleep_backoff(attempt, base_backoff)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────
@@ -313,6 +446,14 @@ def _sanitize(text: str | None, max_len: int = 8000) -> str:
     if not text:
         return ""
     return text[:max_len].replace("```", "ʼʼʼ")
+
+
+# Cap on the body slice fed to the SUMMARIZATION prompt. Picked at 30k so
+# it's roomy enough for a typical blog post or README in full while
+# keeping prompt + rubric + system instructions well under any provider's
+# context window. Chat (`_build_chat_context`) has its own larger cap
+# since interactive Q&A wants more material.
+_SCORING_BODY_CAP = 30_000
 
 
 def _lang_instruction() -> str:
@@ -447,7 +588,11 @@ def summarize_and_score(paper_id: int) -> bool:
         authors_str = ", ".join(_sanitize(a, 200) for a in (paper.authors or [])[:8]) or "unknown"
         orgs_str = ", ".join(_sanitize(o, 200) for o in (paper.organizations or [])[:5]) or "unknown"
         title = _sanitize(paper.title, 500)
-        abstract = _sanitize(paper.abstract, 4000)
+        # Prefer the cached full body (HTML article / GitHub README / PDF
+        # text) over the abstract / og:description blurb when available.
+        # Without this, blog/project rows were scored against ~200 chars
+        # of SEO summary, which produced near-uniform scores.
+        body = _sanitize(paper.full_text or paper.abstract, _SCORING_BODY_CAP)
         published = paper.published_date.isoformat() if paper.published_date else "unknown"
 
         source_type_str = paper.source_type.value if hasattr(paper.source_type, "value") else str(paper.source_type)
@@ -467,7 +612,8 @@ Title: {title}
 Authors: {authors_str}
 Organizations: {orgs_str}
 Published: {published}
-Abstract: {abstract}
+Content:
+{body}
 === UNTRUSTED END ===
 
 Write a detailed technical summary of this work. Cover:
@@ -567,8 +713,14 @@ Output ONLY a JSON object on a single line:
         db.close()
 
 
+# Concurrency for the LLM scoring stage. Each `summarize_and_score` call is
+# I/O-bound (LLM HTTP / subprocess) and opens its own SessionLocal, so a
+# thread pool gives near-linear throughput up to provider rate limits.
+_PROCESSING_WORKERS = 8
+
+
 def run_processing(batch_size: int | None = 20) -> int:
-    """Process unprocessed papers. Returns count processed.
+    """Process unprocessed papers in parallel. Returns count processed.
 
     `batch_size=None` removes the cap and processes the entire backlog —
     used for cold-start runs where any limit would starve later-ingested
@@ -585,14 +737,25 @@ def run_processing(batch_size: int | None = 20) -> int:
     finally:
         db.close()
 
-    count = 0
-    for paper_id, title in unprocessed:
+    if not unprocessed:
+        logger.info("Processed 0/0 papers")
+        return 0
+
+    def _worker(paper_id: int, title: str | None) -> bool:
         logger.info("Processing paper %d: %s", paper_id, (title or "")[:80])
         try:
-            if summarize_and_score(paper_id):
-                count += 1
+            return summarize_and_score(paper_id)
         except Exception:
             logger.exception("Failed to process paper %d", paper_id)
+            return False
+
+    count = 0
+    workers = min(_PROCESSING_WORKERS, len(unprocessed))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="kb-proc") as pool:
+        futures = [pool.submit(_worker, pid, title) for pid, title in unprocessed]
+        for fut in as_completed(futures):
+            if fut.result():
+                count += 1
 
     logger.info("Processed %d/%d papers", count, len(unprocessed))
     return count

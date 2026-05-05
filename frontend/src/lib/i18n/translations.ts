@@ -149,6 +149,7 @@ const translations = {
       "Sorry, I couldn't process that query. Is the backend running?",
     "chat.empty": "(LLM produced no output)",
     "chat.banner.anchored": "Anchored to:",
+    "chat.scroll.toBottom": "Jump to latest",
 
     // Chat sidebar
     "chat.tabs.history": "History",
@@ -296,6 +297,7 @@ const translations = {
       "抱歉，无法处理该问题。后端服务是否在运行？",
     "chat.empty": "（模型未输出内容）",
     "chat.banner.anchored": "已锚定来源：",
+    "chat.scroll.toBottom": "回到最新",
 
     "chat.tabs.history": "历史",
     "chat.tabs.source": "来源",

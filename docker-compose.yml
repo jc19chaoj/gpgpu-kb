@@ -15,9 +15,14 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       args:
-        # Set INSTALL_EXTRAS="" to skip the heavy ML stack (ChromaDB +
-        # sentence-transformers ≈ 2 GB). Search will fall back to keyword.
-        INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-ml,llm-cloud}
+        # Default `all` aggregates ml (ChromaDB + sentence-transformers ≈ 2 GB)
+        # + llm-cloud (Anthropic / OpenAI / DeepSeek SDK) + fulltext
+        # (trafilatura, ~10 MB; needed for blog / project article-body
+        # extraction so chat + scoring see real content). Override via
+        # the BACKEND_INSTALL_EXTRAS env var to slim down — set to
+        # "llm-cloud,fulltext" to drop ML (~2 GB lighter), or to "" for
+        # the bare-bones image (full_text prefetch will then no-op).
+        INSTALL_EXTRAS: ${BACKEND_INSTALL_EXTRAS:-all}
     image: gpgpu-kb-backend:latest
     container_name: gpgpu-kb-backend
     restart: unless-stopped

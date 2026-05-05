@@ -62,11 +62,15 @@ export interface ChatRequest {
 export interface ChatResponse {
   answer: string;
   sources: Paper[];
+  // Resolved expert-role model name (e.g. "deepseek-chat",
+  // "claude-sonnet-4-6"). Empty string when unknown.
+  model?: string;
 }
 
 // SSE events emitted by /api/chat/stream. Decoded by `chatStream()` in
 // lib/api.ts; keep in sync with backend `_sse_event(...)` in kb/main.py.
 export type ChatStreamEvent =
+  | { type: "model"; provider: string; name: string }
   | { type: "sources"; sources: Paper[] }
   | { type: "token"; content: string }
   | { type: "error"; message: string }
@@ -75,11 +79,14 @@ export type ChatStreamEvent =
 // Daily pipeline status (snapshot from GET /api/daily/status). Used by the
 // /reports page to render the right initial button state on page load —
 // crucially, a refresh while a run is in-flight should show "running" not
-// "idle".
+// "idle". `last_event_id` lets the client decide whether to reattach via
+// GET /api/daily/stream (`-1` means nothing has ever been buffered).
 export interface DailyStatus {
   running: boolean;
   started_at: string | null;
   current_stage: DailyStageName | null;
+  last_event_id: number;
+  run_id: number;
 }
 
 export type DailyStageName = "ingestion" | "processing" | "embedding" | "report";

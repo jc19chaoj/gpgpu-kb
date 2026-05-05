@@ -28,17 +28,23 @@ logger = logging.getLogger(__name__)
 _NON_PAPER_TYPES = (SourceType.BLOG, SourceType.PROJECT, SourceType.TALK)
 
 
-def _eligible_query(db, source_type: SourceType | None):
+def _eligible_query(db, source_type: SourceType | None, include_already_scored: bool):
     """Rows that pre-date the universal scoring system: non-paper, processed,
-    but with the new score axis still at the column default."""
+    but with the new score axis still at the column default.
+
+    `include_already_scored=True` drops the `quality_score == 0.0` filter
+    so rows with prior scores are re-scored too — useful after running
+    `backfill_full_text` to refresh scores against the newly cached
+    article bodies."""
     types = [source_type] if source_type else list(_NON_PAPER_TYPES)
-    return (
+    q = (
         db.query(Paper.id)
         .filter(Paper.source_type.in_(types))
         .filter(Paper.is_processed == 1)
-        .filter(Paper.quality_score == 0.0)
-        .order_by(Paper.id.asc())
     )
+    if not include_already_scored:
+        q = q.filter(Paper.quality_score == 0.0)
+    return q.order_by(Paper.id.asc())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,6 +56,15 @@ def main(argv: list[str] | None = None) -> int:
         choices=[t.value for t in _NON_PAPER_TYPES],
         default=None,
         help="Only rescore one source type",
+    )
+    parser.add_argument(
+        "--include-already-scored",
+        action="store_true",
+        help=(
+            "Also re-score rows whose quality_score is already non-zero. "
+            "Useful after `backfill_full_text` to refresh scores against "
+            "newly cached article bodies."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -64,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
 
     db = SessionLocal()
     try:
-        q = _eligible_query(db, src_filter)
+        q = _eligible_query(db, src_filter, args.include_already_scored)
         if args.limit is not None:
             q = q.limit(args.limit)
         ids = [row[0] for row in q.all()]

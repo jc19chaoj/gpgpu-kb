@@ -34,14 +34,25 @@ COPY pyproject.toml ./
 RUN mkdir -p kb && : > kb/__init__.py
 
 # INSTALL_EXTRAS controls how heavy the image is.
-#   "ml,llm-cloud" (default) — ChromaDB + sentence-transformers + Anthropic/OpenAI/DeepSeek SDK
-#   "llm-cloud"              — cloud LLM only, semantic search/RAG falls back to keyword
-#   ""                        — minimal: ingestion + LLM-via-CLI only
-ARG INSTALL_EXTRAS=ml,llm-cloud
+#   "all" (default)         — convenience aggregate: ml + llm-cloud + fulltext (ChromaDB + sentence-transformers + Anthropic/OpenAI/DeepSeek SDK + trafilatura)
+#   "llm-cloud,fulltext"    — cloud LLM only, semantic search/RAG falls back to keyword
+#   "fulltext"              — minimal + HTML extraction
+#   ""                      — bare bones: ingestion + LLM-via-CLI only (full_text prefetch will no-op)
+ARG INSTALL_EXTRAS=all
 RUN if [ -z "$INSTALL_EXTRAS" ]; then \
         pip install -e . ; \
     else \
         pip install -e ".[${INSTALL_EXTRAS}]" ; \
+    fi
+
+# Pre-download the SentenceTransformer weights into the image so container
+# recreation doesn't re-fetch ~90 MB on every cold start. Only runs when the
+# `ml` (or aggregate `all`) extra is enabled — otherwise sentence-transformers
+# isn't installed and the import would fail. Model name must match
+# settings.embedding_model (kb/config.py); change both together if you swap.
+ARG KB_EMBEDDING_MODEL=all-MiniLM-L6-v2
+RUN if echo ",${INSTALL_EXTRAS}," | grep -qE ',(ml|all),'; then \
+        python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${KB_EMBEDDING_MODEL}')" ; \
     fi
 
 # Real source goes in last — code edits only invalidate this thin layer.

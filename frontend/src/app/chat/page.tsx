@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Cpu, User, FileText, Loader2, PinIcon, Square } from "lucide-react";
+import { Send, Cpu, User, FileText, Loader2, PinIcon, Square, ChevronDown } from "lucide-react";
 import { chatStream, getPaper } from "@/lib/api";
 import type { ChatMessage, Paper } from "@/lib/types";
 import { Input } from "@/components/ui/input";
@@ -24,6 +24,10 @@ interface DisplayMessage extends ChatMessage {
   streaming?: boolean;
   /** transient: i18n welcome card; content is resolved at render-time from t() */
   welcome?: boolean;
+  /** transient: resolved model name shown next to the assistant role label
+   *  (e.g. "deepseek-chat"). Only populated for messages produced in the
+   *  current session; restored history doesn't carry it. */
+  model?: string;
 }
 
 // Welcome card: kept as a sentinel object whose `content` is overridden at
@@ -55,6 +59,16 @@ function ChatContent() {
   const [loading, setLoading] = useState(false);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Wrapper around <ScrollArea> so we can query the Radix/base-ui viewport
+  // (data-slot="scroll-area-viewport") without forwarding refs through the
+  // shadcn primitive. The viewport is the actual scrollable element.
+  const scrollAreaWrapRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLElement | null>(null);
+  // "Stick to bottom" follows ChatGPT/Claude UX: auto-scroll while the user is
+  // pinned to the latest token; release the lock the moment they scroll up so
+  // they can read earlier turns without being yanked back. The Jump-to-latest
+  // pill restores control by re-engaging stick + smooth-scrolling to bottom.
+  const [stickToBottom, setStickToBottom] = useState(true);
   // Tracks the paperId we've already auto-pinned so React 19's strict-mode
   // double-effect (and any back/forward navigation) doesn't open a fresh
   // conversation twice for the same `?paperId=` deep link.
@@ -80,6 +94,12 @@ function ChatContent() {
     // Switching conversations mid-stream would have the in-flight tokens
     // clobber the newly hydrated messages. Cancel first.
     abortRef.current?.abort();
+    // Reset stick lock when switching conversations — otherwise a release
+    // from the previous session would leave the new one frozen mid-scroll.
+    // Sync-from-external-source pattern is endorsed by the React docs even
+    // though the new lint heuristic is conservative about it.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setStickToBottom(true);
     setMessages([WELCOME, ...history.active.messages.map((m) => ({ ...m }))]);
     // Restore the pinned source by id alone — we only stored the title,
     // so leaving the rest of Paper fields blank is fine for display, but
@@ -119,9 +139,57 @@ function ChatContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [history.activeId]);
 
+  // Resolve the base-ui viewport (the actual `overflow:scroll` element) and
+  // wire a passive listener that detects USER intent to leave the bottom.
+  //
+  // Why "did scrollTop decrease" rather than "distance from bottom"? While
+  // streaming, each new token grows scrollHeight; if we just checked distance,
+  // any content growth would push us over the 64px dead-zone and the lock
+  // would flip off even though the user hasn't moved the wheel. Tracking the
+  // *delta* of scrollTop tells us unambiguously whether the user scrolled up.
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    const viewport = scrollAreaWrapRef.current?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]',
+    );
+    if (!viewport) return;
+    viewportRef.current = viewport;
+    // Disable browser scroll-anchoring on this viewport — when content grows
+    // during streaming, anchoring can yank scrollTop in unpredictable ways
+    // and would otherwise dispatch phantom scroll events that flip the lock.
+    viewport.style.overflowAnchor = "none";
+    let lastScrollTop = viewport.scrollTop;
+    const handler = () => {
+      const top = viewport.scrollTop;
+      const distance =
+        viewport.scrollHeight - top - viewport.clientHeight;
+      if (distance < 16) {
+        // Snapped (or near-snapped) to bottom — re-engage stickiness.
+        setStickToBottom(true);
+      } else if (top < lastScrollTop - 1) {
+        // User scrolled up (1px tolerance for sub-pixel jitter on trackpads).
+        setStickToBottom(false);
+      }
+      lastScrollTop = top;
+    };
+    viewport.addEventListener("scroll", handler, { passive: true });
+    return () => viewport.removeEventListener("scroll", handler);
+  }, []);
+
+  // Auto-scroll while pinned. We delegate to `scrollIntoView` on a sentinel
+  // div at the bottom of the message list — this was the proven working
+  // pattern before the stick rework, and it sidesteps any base-ui internals.
+  // `block: "end"` aligns the sentinel to the viewport bottom regardless of
+  // viewport quirks; `behavior: "auto"` is instant so per-token updates don't
+  // queue smooth animations that lag the cadence.
+  useEffect(() => {
+    if (!stickToBottom) return;
+    scrollRef.current?.scrollIntoView({ block: "end", behavior: "auto" });
+  }, [messages, stickToBottom]);
+
+  const jumpToBottom = () => {
+    setStickToBottom(true);
+    scrollRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+  };
 
   // Deep-link from the paper detail page: `/chat?paperId=123` opens a fresh
   // source-anchored conversation. We strip the query string immediately so
@@ -149,6 +217,7 @@ function ChatContent() {
         router.replace("/chat");
         history.startNew({ paperId: paper.id, paperTitle: paper.title });
         setSelectedPaper(paper);
+        setStickToBottom(true);
         setMessages([WELCOME]);
       } catch {
         // Silent fallback to a normal RAG chat — matches the page's existing
@@ -165,6 +234,7 @@ function ChatContent() {
 
   const handleNewChat = () => {
     abortRef.current?.abort();
+    setStickToBottom(true);
     setMessages([WELCOME]);
     setSelectedPaper(null);
     history.startNew();
@@ -188,6 +258,10 @@ function ChatContent() {
     // Snapshot of prior turns BEFORE the new user/placeholder are appended;
     // this is what the backend should see as `history`.
     const priorTurns = _stripDisplay(messages);
+    // Sending a new turn implies the user wants to follow the response — even
+    // if they were scrolled up before pressing send, the new outgoing message
+    // should reveal itself.
+    setStickToBottom(true);
     setMessages([...messages, userMsg, placeholder]);
     setLoading(true);
 
@@ -196,6 +270,7 @@ function ChatContent() {
 
     let accumulated = "";
     let streamSources: Paper[] | undefined;
+    let streamModel: string | undefined;
     let errored = false;
     let aborted = false;
 
@@ -209,7 +284,15 @@ function ChatContent() {
         },
         { signal: controller.signal },
       )) {
-        if (ev.type === "sources") {
+        if (ev.type === "model") {
+          streamModel = ev.name;
+          const snapshot = streamModel;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last?.streaming) return prev;
+            return [...prev.slice(0, -1), { ...last, model: snapshot }];
+          });
+        } else if (ev.type === "sources") {
           streamSources = ev.sources;
           setMessages((prev) => {
             const last = prev[prev.length - 1];
@@ -262,6 +345,7 @@ function ChatContent() {
             role: "assistant",
             content: finalContent,
             sources: showError ? undefined : streamSources,
+            model: showError ? undefined : streamModel,
             streaming: false,
             error: showError,
           },
@@ -318,6 +402,10 @@ function ChatContent() {
       <div className="flex-1 flex flex-col min-w-0">
         <div className="flex-1 flex flex-col max-w-3xl w-full mx-auto">
           {sourceBanner}
+          <div
+            ref={scrollAreaWrapRef}
+            className="relative flex-1 min-h-0 flex flex-col"
+          >
           <ScrollArea className="flex-1 px-4 sm:px-6">
             <div className="space-y-4 py-4">
               {messages.map((msg, i) => {
@@ -337,8 +425,15 @@ function ChatContent() {
                       )}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-muted-foreground mb-1">
-                        {msg.role === "assistant" ? t("chat.role.assistant") : t("chat.role.you")}
+                      <div className="text-sm font-medium text-muted-foreground mb-1 flex items-center gap-2">
+                        <span>
+                          {msg.role === "assistant" ? t("chat.role.assistant") : t("chat.role.you")}
+                        </span>
+                        {msg.role === "assistant" && msg.model ? (
+                          <span className="text-[11px] font-normal text-muted-foreground/60 truncate">
+                            · {msg.model}
+                          </span>
+                        ) : null}
                       </div>
                       <div className="prose prose-sm dark:prose-invert max-w-none text-foreground/85">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
@@ -382,6 +477,34 @@ function ChatContent() {
               <div ref={scrollRef} />
             </div>
           </ScrollArea>
+          {/* Jump-to-latest pill: surfaces only after the user breaks the
+              auto-scroll lock, restoring it on click. The warm amber ring +
+              backdrop-blur pill sits flush above the input bar so it never
+              competes with reading flow, only invites a single tap. */}
+          {!stickToBottom && (
+            <button
+              type="button"
+              onClick={jumpToBottom}
+              aria-label={t("chat.scroll.toBottom")}
+              className="
+                pointer-events-auto absolute bottom-4 left-1/2 -translate-x-1/2
+                flex items-center gap-1.5 rounded-full
+                border border-border/70 bg-card/85 backdrop-blur-md
+                px-3 py-1.5 text-xs font-medium tracking-wide
+                text-muted-foreground
+                shadow-lg shadow-black/10 ring-1 ring-primary/15
+                transition-all duration-200
+                hover:bg-card hover:text-foreground
+                hover:border-primary/40 hover:ring-primary/30
+                active:scale-[0.97]
+                animate-in fade-in slide-in-from-bottom-2
+              "
+            >
+              <ChevronDown className="h-3.5 w-3.5 text-primary" />
+              <span>{t("chat.scroll.toBottom")}</span>
+            </button>
+          )}
+          </div>
 
           <div className="border-t border-border p-3 sm:p-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-background/80 backdrop-blur-sm">
             <div className="flex items-center gap-2">

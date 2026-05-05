@@ -12,6 +12,7 @@
 > 于 `2026-05-03 09:44:00` 增量刷新（per-`Paper.source_name` ingest 冷启动；测试 174 → 180 pass）。
 > 于 `2026-05-03 21:41:00` 增量刷新（**Fast / Expert 双角色 LLM**：`call_llm` / `stream_llm` 新增 `role="fast"\|"expert"` 参数；`kb/main.py` 的 `/api/chat` + `/api/chat/stream` 显式 `role="expert"`；`summarize_and_score` / `generate_daily_report` 保持默认 fast；测试套件 180 → 203 pass）。
 > 于 **`2026-05-03 22:34:43`** 增量刷新（**手动触发 daily pipeline 端点（SSE 进度）**：① 新增 `GET /api/daily/status` + `POST /api/daily/stream`，**都挂 `verify_chat_token`**；② `_DailyRunState` 单例 + `threading.Lock` 防并发，第二个 POST → HTTP 409；③ `_run_daily_in_worker` 在 daemon thread 内 `run_daily_pipeline()`，**无 subprocess**；④ `_QueueLogHandler` + `_QueueStdoutWriter` 把 logger / banner print 都泵进 `Queue(maxsize=2000)`；⑤ `_STAGE_PATTERN=r"\[([1-4])/4\]"` 兼容中英文 stage banner；⑥ 事件序列 `started → stage(≤4) → log(N) → done|error`，15s idle 发 `: keepalive\n\n` SSE 注释帧；⑦ 测试新增 `_drain_daily_sse` 辅助 + 6 例用例；⑧ 既有 chat / SSE 流式聊天 / fast-expert 双角色 / per-source 冷启动 / sitemap blog 等行为全部不动）。
+> 于 **`2026-05-05 23:15:12`** 增量刷新（**`pdf.py` → `fulltext.py` + HTML / GitHub README loader + 评分用全文 + chat prompt cap 提到 200K + `[all]` 聚合 extras + ingestion 尾步骤 prefetch + 回填脚本**：① **`kb/processing/pdf.py` 重命名为 `fulltext.py`**：三 loader 派发（PDF 保留 / HTML via trafilatura / GitHub via REST API，自动剥 `.git`），均 httpx 流式 + 超限返回 `""`；`Paper.full_text` cap 120K → **200K**；新增 `_ensure_cached(paper_id)` 单 SessionLocal 工人。② **`run_ingestion()` 尾步骤** `prefetch_pending_full_text()` 4 worker 并发，仅非论文 `full_text==""`，幂等。③ **评分用全文**：`summarize_and_score` 用 `paper.full_text or paper.abstract`，`_SCORING_BODY_CAP=30_000`，prompt 字段 `Abstract:` → `Content:`。④ **chat prompt cap 提到 200K**（`kb/main.py::_SOURCE_TEXT_PROMPT_CAP`）。⑤ `pyproject.toml` 新增 `[fulltext]` extras + 聚合 `[all]`；Docker 默认 `INSTALL_EXTRAS=all`；ST 预下载条件 `grep -qE ',(ml\|all),'` 兼容。⑥ 新脚本 `kb/scripts/backfill_full_text.py` 回填旧非论文 `full_text`；`rescore_non_papers.py` 加 `--include-already-scored`。⑦ 测试 216 → 242（重命名 `test_processing_pdf.py` → `test_processing_fulltext.py` + 17 例）。`/api/chat[/stream]` / `/api/daily/*` / DB schema / 前端代码全部不动）。
 
 ---
 
@@ -37,7 +38,7 @@
 | `kb/processing/llm.py` (`run_processing`) | 仅运行 LLM 处理阶段，`batch_size=None` 表示无上限 |
 | `kb/processing/llm.py` (`call_llm` / **`stream_llm`**) | LLM 调用门面（`role="fast"\|"expert"`）：`call_llm` 返回完整字符串（用于 summary/scoring）；**`stream_llm` 增量 yield 文本片段（用于 `/api/chat/stream`）**；任何 provider 失败均返回空 / 静默结束 generator |
 | `kb/processing/embeddings.py` (`index_unindexed_papers`) | 仅运行向量化阶段，`batch_size=None` 表示无上限 |
-| `kb/processing/pdf.py` (`fetch_full_text`) | 下载 + 抽取 PDF 全文，缓存到 `Paper.full_text`；缺失 / 失败 fallback 到 `summary + abstract`（不污染缓存） |
+| `kb/processing/fulltext.py` (`fetch_full_text` / `prefetch_pending_full_text`) | 三路全文 loader：PDF（pypdf）/ HTML（trafilatura）/ GitHub README（REST API）；按 source 派发；缓存到 `Paper.full_text`（200K 字符上限）；缺失 / 失败 fallback 到 `summary + abstract`（不污染缓存）。`prefetch_pending_full_text()` 是采集尾步骤的 4 worker 并发 batcher |
 | `kb/reports.py` (`generate_daily_report`) | 仅生成日报（默认昨天，upsert）；用 fast 角色 LLM |
 | `kb/scripts/rescore_non_papers.py` | 运维脚本：回填非论文行 universal scores（支持 `--dry-run` / `--limit` / `--source-type`） |
 | `run_api.sh` | `uvicorn kb.main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 75` |
@@ -54,7 +55,7 @@ python -m kb.daily --lang zh                       # 命令行覆盖为中文
 python -m kb.ingestion.run                         # 仅采集
 python -m kb.reports                               # 仅生成昨天的报告
 python -m kb.scripts.rescore_non_papers --dry-run  # 列出需要回填的非论文行
-python -m pytest tests/ -x -q                      # 跑测试 (~210 例)
+python -m pytest tests/ -x -q                      # 跑测试 (~242 例)
 # 网页触发完整流水线：在 /reports 页面点击 "Run pipeline now" 按钮
 # (后端调用：POST /api/daily/stream)
 ```
@@ -111,7 +112,7 @@ class ChatRequest(BaseModel):
 `/api/chat` 与 `/api/chat/stream` 都调用 `_build_chat_context(req, db) -> tuple[str, list[PaperOut]]`：
 
 - 计算 `history_block = _format_history(req.history)`（最近 12 条 turn，单条 4 000 字符）。
-- 若 `req.paper_id is not None`：查 paper（404 if missing）→ lazy import `kb.processing.pdf.fetch_full_text` → 拼 source-anchored prompt。
+- 若 `req.paper_id is not None`：查 paper（404 if missing）→ lazy import `kb.processing.fulltext.fetch_full_text` → 拼 source-anchored prompt。**chat 时若 `paper.full_text` 为空会触发现场抓取**（首次访问的旧数据会慢 1-3 秒，但一次性写入缓存）。
 - 否则：`get_embedding_store().search(req.query, top_k=req.top_k)` → 拼 RAG prompt。
 - **整段都在 `=== UNTRUSTED START === / END ===` 块内**。
 - **prompt 系统消息已硬编码为中文**（"你是一名资深的 GPGPU 芯片架构助理 ..."）。
@@ -258,13 +259,15 @@ def _reset_daily_state():
 
 ## 五、关键依赖与配置
 
-`pyproject.toml` 三组可选依赖：
+`pyproject.toml` 五组可选依赖：
 
 | Extra | 提供 | 触发 |
 | --- | --- | --- |
 | 默认 | FastAPI / Uvicorn / SQLAlchemy 2 / Pydantic 2 / arxiv / feedparser / httpx / python-dotenv / **pypdf>=5.0** | 必装 |
 | `[ml]` | chromadb · sentence-transformers（~2GB） | 想要语义检索 / RAG |
 | `[llm-cloud]` | anthropic · openai（DeepSeek 复用 openai SDK，无需新依赖） | 走云端 LLM |
+| `[fulltext]` | trafilatura（~10MB，连带 lxml / dateparser 等） | 想要 blog / project 全文抽取（不装时 HTML loader 静默 fallback 到 abstract） |
+| `[all]` | **聚合**：等价于 `[ml] + [llm-cloud] + [fulltext]` | 端用户便利安装：`pip install -e '.[all]'` |
 | `[dev]` | pytest · pytest-asyncio · httpx · ruff | 测试 / lint |
 
 设置类：`kb/config.py` 的 `Settings(BaseSettings)`，前缀 `KB_`，亦读取 `backend/.env`。完整字段见 `kb/config.py`（详见根 CLAUDE.md "环境变量"表格）。
@@ -295,7 +298,7 @@ def _reset_daily_state():
 | `impact_rationale` | Text | legacy |
 | `quality_score` / `relevance_score` | float | universal axes（0-10） |
 | `score_rationale` | Text | universal 评分理由 |
-| `full_text` | Text | **PDF 抽取后缓存的完整正文**（≤120 000 字符） |
+| `full_text` | Text | **抽取后缓存的完整正文**（PDF / HTML / GitHub README，≤200 000 字符；自 2026-05-05 cap 提升） |
 | `is_processed` | int | **状态机**：`0`=待处理 / `1`=精品收录 / `2`=低分跳过；索引 |
 | `chroma_id` | str(100) | 与 ChromaDB 行的关联键 |
 
@@ -334,9 +337,9 @@ def _reset_daily_state():
 
 | 文件 | 职责 |
 | --- | --- |
-| `llm.py` | provider 抽象（4 种）+ 摘要/打分 + streaming 平行栈 + Fast/Expert 双角色（`_resolve_role`） |
+| `llm.py` | provider 抽象（4 种）+ 摘要/打分（用 `paper.full_text or paper.abstract`，cap 30K）+ streaming 平行栈 + Fast/Expert 双角色（`_resolve_role`） |
 | `embeddings.py` | ChromaDB + sentence-transformers，懒加载单例 |
-| `pdf.py` | PDF 下载 + 抽取，缓存写回 `Paper.full_text` |
+| `fulltext.py` | 三路全文 loader（PDF / HTML / GitHub README）+ `prefetch_pending_full_text()` ingestion 尾步骤；缓存写回 `Paper.full_text`（200K cap） |
 
 ### Provider 矩阵（`call_llm` / `stream_llm`）
 
@@ -382,7 +385,7 @@ def _reset_daily_state():
 
 ## 八、测试与质量
 
-测试套件已落地，详见 `backend/tests/README.md`。**~210 用例，<10 秒，无网络**。
+测试套件已落地，详见 `backend/tests/README.md`。**~242 用例，<35 秒，无网络**。
 
 | 测试文件 | 覆盖 |
 | --- | --- |
@@ -395,7 +398,7 @@ def _reset_daily_state():
 | `test_ingestion_github.py` | auth 头、403 短路、polite sleep |
 | `test_processing_llm.py` | provider 路由 / 4 source_type rubric / 中文 prompt / `stream_llm` 5 例 / **Fast/Expert 角色 overlay 6 例** |
 | `test_processing_embeddings.py` | 单例锁、ML 缺失时优雅降级 |
-| `test_processing_pdf.py` | 缓存 / 下载 / 抽取 / fallback |
+| `test_processing_fulltext.py` | PDF 路径（缓存 / 下载 / 抽取 / fallback）+ HTML 路径（trafilatura mock / stream / oversize abort）+ GitHub README（happy / 404 / non-github / `.git` 剥离）+ `prefetch_pending_full_text` 选行 + 幂等 |
 | `test_reports.py` | happy / upsert / 空数据 / 中文模式 |
 | `fixtures/` | arxiv / rss / github 静态 JSON 样本 |
 
@@ -404,7 +407,7 @@ def _reset_daily_state():
 > - chat LLM mock：`monkeypatch.setattr(main_mod, "call_llm", _fake_call_llm)` / `monkeypatch.setattr(main_mod, "stream_llm", _fake_stream_llm)`，签名要接受 `role` kwarg：`def _fake_call_llm(prompt, role: str = "fast"): ...`。
 > - daily pipeline mock：`monkeypatch.setattr(daily_mod, "run_daily_pipeline", _fake_pipeline)`；worker thread 内 lazy import 才能命中 patch。
 > - daily SSE 解码：`_drain_daily_sse(client)` 跳过 `:` keepalive 注释帧；`_reset_daily_state()` 在每个 daily test 开头清单例。
-> - PDF mock：`monkeypatch.setattr(pdf_mod, "_download_pdf", lambda url: b"...")`。
+> - Fulltext mock：`from kb.processing import fulltext as ft_mod` → `monkeypatch.setattr(ft_mod, "_download_pdf", lambda url: b"...")`（PDF 路径）/ `monkeypatch.setattr(ft_mod, "_fetch_html_article", lambda url: "...")`（HTML 路径）/ `monkeypatch.setattr(ft_mod, "_fetch_github_readme", lambda url: "...")`（GitHub 路径）。HTML 路径走 `client.stream("GET", url)`，FakeClient 的 mock 必须实现 `.stream(method, url)` 而不是 `.get(url)`。
 
 ---
 
@@ -468,13 +471,13 @@ backend/
 ├─ .dockerignore           # 排除 data/ / tests/ / __pycache__ / .env
 ├─ run_api.sh              # uvicorn ... --reload --timeout-keep-alive 75
 ├─ tests/
-│  ├─ README.md            # 测试套件说明 (~210 用例)
+│  ├─ README.md            # 测试套件说明 (~242 用例)
 │  ├─ conftest.py
 │  ├─ test_api_smoke.py    # 含 Bearer Token / 质量门 / universal sort / chat paper_id+history / SSE 5 例 / daily-stream 6 例（本轮新增）
 │  ├─ test_ingestion_*.py
 │  ├─ test_processing_llm.py
 │  ├─ test_processing_embeddings.py
-│  ├─ test_processing_pdf.py
+│  ├─ test_processing_fulltext.py
 │  ├─ test_reports.py
 │  └─ fixtures/
 └─ kb/
@@ -492,11 +495,12 @@ backend/
    │  ├─ github_trending.py
    │  └─ run.py            # _lookback_for_source per-source 冷启动
    ├─ processing/
-   │  ├─ llm.py            # provider 抽象（4 种）+ Fast/Expert 双角色 + stream_llm
+   │  ├─ llm.py            # provider 抽象（4 种）+ Fast/Expert 双角色 + stream_llm + summarize 用 full_text/30K cap
    │  ├─ embeddings.py
-   │  └─ pdf.py
+   │  └─ fulltext.py       # PDF / HTML / GitHub README 三路 loader + prefetch_pending_full_text
    └─ scripts/
-      └─ rescore_non_papers.py
+      ├─ rescore_non_papers.py     # --include-already-scored
+      └─ backfill_full_text.py     # 旧非论文行 full_text 回填（4 worker 并发）
 ```
 
 ---
@@ -516,3 +520,4 @@ backend/
 | 2026-05-03 21:41:00 | 增量刷新 | Fast / Expert 双角色 LLM；`call_llm` / `stream_llm` 新增 `role` 参数；`KB_LLM_EXPERT_PROVIDER` / `KB_LLM_EXPERT_MODEL`；`/api/chat[/stream]` 显式 expert；测试 180 → 203 pass |
 | **2026-05-03 23:00:00** | **增量刷新** | **Browse 页 source_name 过滤后端支持**。① 新端点 `GET /api/sources` (`kb/main.py::list_sources`) — group by `(source_name, source_type)` filtered to `is_processed=1`，按 count desc 返回 `SourceItem` 列表。② `kb/schemas.py` 新增 `SourceItem { name, type, count }` / `SourcesOut { sources: list[SourceItem] }`。③ `list_papers` 新增 `source_name: str \| None = Query(None, max_length=500)` 参数，逗号分隔多值（前 50 项），`Paper.source_name.in_([...])` 与 `source_type` AND 组合；空字符串透明忽略。④ `/api/papers/search` 与既有 chat / reports / stats / `/api/daily/*` 路径不动。⑤ 测试：`tests/test_api_smoke.py` +7 例（端点 happy path + 排序 + 排除 `is_processed!=1` + single source + multi source + 空字符串忽略 + 与 source_type AND）；新增 helper `_seed_namespaced_source_papers(prefix)` 用 prefix 后缀的 source_name 解决 session-scoped DB 跨 test 数据累积；套件总计 209 → 216 pass。 |
 | **2026-05-03 22:34:43** | **增量刷新** | **手动触发 daily pipeline + SSE 进度（新）**。① **新端点（`backend/kb/main.py`）**：`GET /api/daily/status`（返回 `_DailyRunState.status()` 快照 `{running, started_at, current_stage}`）+ `POST /api/daily/stream`（SSE 流，事件序列 `started → stage(≤4) → log(N) → done\|error`，15s idle 发 `: keepalive\n\n` SSE comment 帧；header `X-Accel-Buffering: no` + `Cache-Control: no-cache`；并发第二个 POST → HTTP 409）。**两端点都挂 `dependencies=[Depends(verify_chat_token)]`**——任何"昂贵 / 写入 / 触发任务"端点都必须复用同款 Bearer 守卫。② **执行架构**：`_DailyRunState` 单例（`threading.Lock` + `_running` flag + `Queue(maxsize=2000)`），`try_start()` 原子拿锁防并发；`_run_daily_in_worker(queue)` 在 daemon thread 内 `from kb.daily import run_daily_pipeline; run_daily_pipeline()`（**lazy import** 让测试 `monkeypatch.setattr(daily_mod, "run_daily_pipeline", ...)` 在 worker 启动后才解析到 patch）。**无 subprocess**——daemon thread 直接占用主 backend 进程的工作时间，等价于"`python -m kb.daily` 在前台跑"。`_QueueLogHandler` 注入 root logger 把 `logging.*` 行泵进 queue；`_QueueStdoutWriter` 经 `contextlib.redirect_stdout` 把 banner `print()` 也泵进 queue（`kb/daily.py` 的 `[N/4] <stage>` 启动 banner 是 print 而非 log）。`finally` 里**必发 `("__terminator__", None)` sentinel** 让 generator break——否则 generator 永远悬挂在 `queue.get(timeout=15)` 等不到 sentinel。③ **Stage 检测**：`_STAGE_PATTERN = re.compile(r"\[([1-4])/4\]")` + `_STAGE_NAMES = {1:"ingestion",2:"processing",3:"embedding",4:"report"}`。`kb/daily.py` 不管 `KB_LANGUAGE` 设啥都打 `[N/4]` 前缀（仅 stage 名翻译，banner 格式是固定契约），所以中英文 banner 都能识别——测试 `test_daily_stage_pattern_matches_chinese_banner` 直接断言 `[1/4] 数据采集` / `[2/4] 处理（摘要 + 打分）` / `[3/4] 向量化` / `[4/4] 每日简报` 全 4 个都被切到对应 stage 帧。④ **Generator 流程**：`yield _sse_event("started", {started_at})` → 循环 `queue.get(timeout=15)`：① `__terminator__` → `terminal_emitted=False` 时 emit `done`，break；② `__done__` / `__error__` → emit + `terminal_emitted=True` 抑制重复；③ `Empty` → `yield ": keepalive\n\n"`（前端 `_parseDailyFrame` 显式跳过 `:` 开头的注释帧）；④ `log` → 用 `_STAGE_PATTERN.search(line)` 切 stage（去重靠 `last_stage_emitted`），然后 emit `log`。⑤ **测试**（`backend/tests/test_api_smoke.py`）：新增 `_drain_daily_sse(client)` 辅助（与 `_drain_sse` 镜像但显式跳过 `:` keepalive 帧）+ `_patch_daily(monkeypatch, fake_pipeline)` 辅助（`monkeypatch.setattr(daily_mod, "run_daily_pipeline", ...)`，worker thread 内 lazy import 命中 patch）+ `_reset_daily_state()` 辅助（每个 daily test 开头强制清单例 `_DailyRunState` 状态，因为 session-scoped TestClient 跨 test 共享 app 实例）。6 例：`test_daily_status_idle_by_default`（GET `/api/daily/status` → `{running:false, started_at:null, current_stage:null}`）/ `test_daily_stream_emits_started_stages_and_done`（fake pipeline print 4 个英文 stage banner，断言 events 序列 `started → 4×stage（index 1..4）→ done`，且 `log` 帧含 banner 行）/ `test_daily_stream_concurrent_returns_409`（用 `threading.Event` 让 fake pipeline 阻塞 → background thread drain 第一个流 → 主 thread 检查 `getDailyStatus().running=true` + 第二个 POST → HTTP 409 + `release.set()` 让第一个流 done）/ `test_daily_stream_pipeline_exception_emits_error`（fake pipeline `raise RuntimeError("boom")` → events 含 `error` 不含 `done`，`message` 含 "boom"）/ `test_daily_endpoints_require_token_when_set`（`KB_CHAT_TOKEN` 设置后两端点都 401，正确 token 不 401）/ `test_daily_stage_pattern_matches_chinese_banner`（中文 banner 也被切 4 个 stage）。⑥ **不影响**：`/api/chat` / `/api/chat/stream` 多轮 / source-anchored / fast-expert 双角色 / SSE 流式 chat / per-source ingest 冷启动 / sitemap blog / DB schema / migration / Docker / 已有 provider 行为全部不动。`run_daily_pipeline()` 函数本身**没有改动**——它既是 CLI（`python -m kb.daily`）的入口、也是 cron 容器（`docker compose --profile cron run --rm daily`）的入口、本轮起还是 `/api/daily/stream` 的 worker thread lazy import 目标，**三种入口共用同一份代码与 SQLite 写锁**。所有 delta 已通过直接读取 `backend/kb/main.py` / `backend/tests/test_api_smoke.py` 源码核对。 |
+| **2026-05-05 23:15:12** | **增量刷新** | **Universal full-text loader（HTML / GitHub README / PDF）+ 评分用全文 + chat prompt cap 提到 200K + `[all]` 聚合 extras + ingestion 尾步骤 prefetch + 回填脚本**。① **`backend/kb/processing/pdf.py` → `fulltext.py`**（rename + 重写）：三 loader 按 source 派发——`_extract_for_paper(paper)` 内 if-cascade：`_looks_like_pdf_url(paper.pdf_url or paper.url)` → `_download_pdf` + pypdf；`paper.source_type == PROJECT and "github.com/" in paper.url` → `_fetch_github_readme(url)`（`https://api.github.com/repos/{owner}/{repo}/readme` + `Accept: application/vnd.github.raw`，自动剥 `.git` 后缀，失败/404 返回 `""`）；其它有 url 的行 → `_fetch_html_article(url)` 走 trafilatura（先 `import trafilatura`，未装则 logger.error 静默返回 `""`）。三路均 **`httpx.Client` 流式 + 早期 abort**：HTML 8MB（mirrors `_download_pdf`）/ PDF 20MB / README 4MB；超限**统一返回 `""` 不污染缓存**（README 之前是字节截断，UTF-8 边界 + 三路语义不一致，已改成对齐策略）。`Paper.full_text` cap 120K → **200K 字符**，配合 chat prompt cap 同步上调（见 ④）。② **新增 `_ensure_cached(paper_id) -> bool`**（fulltext.py，prefetch 内部用）：单 SessionLocal 完成"读 paper → 跳过已缓存 → `_extract_for_paper` → 写入 → 返回 bool"，避免 prefetch 旧版的"`fetch_full_text` + 第二次查询确认 cached"双 session 模式（reviewer #1 提出，已重构）。`fetch_full_text(paper_id)` 公开 API 与 chat 调用契约不变（含 abstract fallback）。③ **`run_ingestion()` 尾步骤** `prefetch_pending_full_text(batch_size=None)`（fulltext.py）：`SourceType.in_([BLOG, PROJECT, TALK])` AND `full_text == ""`（**注意**：不过滤 `is_processed`——idempotent 的依据是 `full_text` 列本身），4 worker `ThreadPoolExecutor`（`_PREFETCH_WORKERS=4`，比 `_PROCESSING_WORKERS=8` 保守，避免击穿小博客站点 rate-limit）。包在 `kb/ingestion/run.py` 末尾的 try/except 内，失败不阻塞 ingest 总数。④ **评分用全文**（`kb/processing/llm.py::summarize_and_score`）：`abstract = _sanitize(paper.abstract, 4000)` → `body = _sanitize(paper.full_text or paper.abstract, _SCORING_BODY_CAP)`；新增 `_SCORING_BODY_CAP = 30_000`（30K chars ≈ 7K tokens，给 rubric / 系统消息留足空间，**不要直接套 chat 的 200K**——summarize 同时还要写 ~3-5 段输出，token 预算紧）。Prompt 字段 `Abstract: {abstract}` → `Content:\n{body}`。**修这个的动机**：blog / project 行之前打分基于 200 字 og:description / GitHub trending blurb，导致同质化严重；现在喂全文，差异化打分才有可能。⑤ **chat prompt cap 提到 200K**（`kb/main.py::_SOURCE_TEXT_PROMPT_CAP = 200_000`，原 60K）：与 `_MAX_EXTRACTED_CHARS` 对齐，让一篇满血缓存的文章在 source-anchored chat 端不被裁剪——200K chars ≈ 50K tokens，仍在 Claude 4.x / GPT-4o 200K context 以内。**约定**：`_SOURCE_TEXT_PROMPT_CAP` 应保持 ≤ `_MAX_EXTRACTED_CHARS`，否则上游就被裁过、prompt 端再 cap 没意义。⑥ **新依赖与 extras（`pyproject.toml`）**：新增 `[fulltext]` extras（`trafilatura>=1.12.0`，连带 lxml / dateparser / babel / tld 等），实测装包 ~10MB；新增**聚合 `[all]` extras**——`gpgpu-kb[ml]` + `gpgpu-kb[llm-cloud]` + `gpgpu-kb[fulltext]` 自引用（pip ≥ 23 / setuptools 都支持）。`pip install -e '.[all]'` 是给端用户的便利路径替代三行。⑦ **Docker 部署默认改 `INSTALL_EXTRAS=all`**：`backend/Dockerfile` ARG 默认值 + `docker-compose.yml` `${BACKEND_INSTALL_EXTRAS:-all}` 兜底 + `.env.docker.example` 默认值 + `README.md` "Production" 章节示例同步更新；`Dockerfile` 内 sentence-transformers 预下载条件 `grep -q ',ml,'` → `grep -qE ',(ml\|all),'` 兼容新默认（否则 `INSTALL_EXTRAS=all` 时 ML 模型不会被预下载，首次冷启会卡 ~90MB 下载）。⑧ **新运维脚本 `kb/scripts/backfill_full_text.py`**：一次性回填旧非论文行 `full_text`（`--dry-run` / `--limit` / `--source-type`，4 worker `ThreadPoolExecutor` + `as_completed`，**不重新评分**避免 LLM 账单激增；用户先跑这个，再视情况手动跑 rescore）。⑨ `rescore_non_papers.py` 新增 `--include-already-scored` 标志：drop `quality_score == 0.0` filter，配合 backfill 后人工触发重评。⑩ **测试套件 216 → 242 (+26)**：重命名 `test_processing_pdf.py` → `test_processing_fulltext.py` 并扩到 17 例：原 5 例 PDF 路径全保留 + 新 9 例（HTML happy / 网络失败 / oversize 流式 abort 用 `_StreamResp` mock + GitHub happy / 404 / non-github URL / `.git` 剥离 + prefetch 选行 + 幂等）。`test_ingestion_run.py::_spy_run_ingestion` 加一行 `patch.object(fulltext_mod, "prefetch_pending_full_text", return_value=0)`，确保 spy 不触发真实网络（即使 session-scoped DB 累积了 blog 行）。⑪ **AI 协作约定（编码规范）**：从此**新加非 PDF 全文 loader 必须遵循三条不变量**——① 流式下载 + 早期 abort（任何 cap 不能在 `resp.content` 已 buffered 后才检查，否则 8MB cap 形同虚设）；② 超限统一返回 `""`，不写入 cache，不做字节截断（避免 UTF-8 边界 + 三路语义对齐）；③ 失败永远返回 `""`，让上层 `_abstract_fallback` 兜底，**绝不抛异常给 caller**。**新加抓取目标**（如 reddit、HN 等）应作为 `_extract_for_paper` 内的新分支，按 `source_type` / URL 模式 dispatch；同时在 `_PREFETCH_TYPES` tuple 里加新 `SourceType` 才会被 ingest tail 抓取。**`_SCORING_BODY_CAP` 取舍**：30K 是经过 token 预算（cap + rubric + 系统消息 < 8K tokens 输入）的当前甜点，调高需重新评估 LLM provider 的 max input。**Mock 约定更新**：HTML 路径走 `client.stream("GET", url)`，FakeClient 必须实现 `.stream(method, url)` 返回 `_StreamResp`（含 `__enter__` / `__exit__` / `iter_bytes()` / `raise_for_status()`），而不是旧版 `.get(url)`——见 `tests/test_processing_fulltext.py::_StreamResp` 公共助手。**chat prompt cap 修改**：`_SOURCE_TEXT_PROMPT_CAP` 与 `_MAX_EXTRACTED_CHARS` 应保持对齐或前者 ≤ 后者；前者 > 后者时是 dead code。⑫ **不影响**：DB schema / migration（`Paper.full_text` 列已存在，仅运行时 cap 上调）/ chat 多轮 / source-anchored chat 行为契约（仍按需 lazy fetch + 写缓存）/ SSE 流式聊天 / fast-expert 双角色 / per-source ingest 冷启动 / sitemap blog / `/api/daily/*` / 前端任何代码全部不动。所有 delta 已通过直接读取 `backend/kb/processing/fulltext.py` / `backend/kb/processing/llm.py` / `backend/kb/main.py` / `backend/kb/ingestion/run.py` / `backend/kb/scripts/{backfill_full_text,rescore_non_papers}.py` / `backend/pyproject.toml` / `backend/Dockerfile` / `docker-compose.yml` / `.env.docker.example` / `README.md` / `backend/tests/test_processing_fulltext.py` / `backend/tests/test_ingestion_run.py` 源码核对。 |

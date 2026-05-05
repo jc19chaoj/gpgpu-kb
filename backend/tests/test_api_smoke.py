@@ -544,9 +544,17 @@ def test_chat_stream_emits_sources_token_done(client, monkeypatch):
     assert "STREAMING_BODY_TOKEN" in captured["prompt"]
 
     events = [name for name, _ in frames]
-    assert events[0] == "sources"
+    # `model` is the very first frame so the UI can label the assistant turn
+    # before any source / token data arrives.
+    assert events[0] == "model"
+    assert events[1] == "sources"
     assert events[-1] == "done"
     assert "token" in events
+    # Model frame carries provider + model name; under the test default
+    # KB_LLM_PROVIDER=hermes both fall back to "hermes".
+    model_payload = next(d for n, d in frames if n == "model")
+    assert model_payload.get("model")
+    assert model_payload.get("provider")
     # Sources frame contains exactly the chosen paper.
     sources_payload = next(d for n, d in frames if n == "sources")
     assert len(sources_payload["sources"]) == 1
@@ -664,18 +672,53 @@ def _patch_daily(monkeypatch, fake_pipeline):
 
 
 def _reset_daily_state():
-    """Force-clear the daily run singleton between tests so 409s from one
-    test don't leak into the next. The session-scoped TestClient shares the
-    app instance with all tests."""
+    """Force-clear the daily run singleton between tests so 409s and
+    leftover events from one test don't leak into the next. The
+    session-scoped TestClient shares the app instance across tests."""
     from kb.main import _daily_state
 
-    # Purposely bypass the public end() so we also drop a stale Queue if a
-    # previous test crashed mid-run.
-    with _daily_state._lock:
+    with _daily_state._cond:
         _daily_state._running = False
         _daily_state._started_at = None
         _daily_state._current_stage = None
-        _daily_state._queue = None
+        _daily_state._terminal_emitted = False
+        _daily_state._events.clear()
+        _daily_state._next_id = 0
+        # _run_id is monotonic across the process — don't reset it so
+        # tests that observe it can detect run boundaries.
+        # Wake any subscribers stuck on wait_for() so they exit promptly.
+        _daily_state._cond.notify_all()
+
+
+def _drain_get_daily_sse(client, since: int = -1) -> tuple[int, str, list[tuple[str, dict]]]:
+    """GET /api/daily/stream?since=<n> and parse the SSE body. Mirrors
+    `_drain_daily_sse` but for the reattach endpoint."""
+    import json as _json
+
+    with client.stream("GET", f"/api/daily/stream?since={since}") as r:
+        st = r.status_code
+        ct = r.headers.get("content-type", "")
+        if st != 200:
+            "".join(r.iter_text())
+            return st, ct, []
+        body = "".join(r.iter_text())
+
+    frames: list[tuple[str, dict]] = []
+    for raw in body.split("\n\n"):
+        if not raw.strip():
+            continue
+        if all(line.startswith(":") or not line for line in raw.split("\n")):
+            continue
+        ev = ""
+        data = ""
+        for line in raw.split("\n"):
+            if line.startswith("event:"):
+                ev = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data += line[len("data:"):].strip()
+        if ev:
+            frames.append((ev, _json.loads(data) if data else {}))
+    return st, ct, frames
 
 
 def test_daily_status_idle_by_default(client):
@@ -683,7 +726,11 @@ def test_daily_status_idle_by_default(client):
     r = client.get("/api/daily/status")
     assert r.status_code == 200
     body = r.json()
-    assert body == {"running": False, "started_at": None, "current_stage": None}
+    assert body["running"] is False
+    assert body["started_at"] is None
+    assert body["current_stage"] is None
+    assert body["last_event_id"] == -1
+    assert "run_id" in body
 
 
 def test_daily_stream_emits_started_stages_and_done(client, monkeypatch):
@@ -841,6 +888,146 @@ def test_daily_stage_pattern_matches_chinese_banner(client, monkeypatch):
     assert status_code == 200
     stages = [d for n, d in frames if n == "stage"]
     assert [s["index"] for s in stages] == [1, 2, 3, 4]
+
+
+def test_daily_attach_with_no_run_returns_immediately(client):
+    """GET /api/daily/stream with nothing buffered must close cleanly with
+    no events — fresh-backend / first-page-load case must not hang."""
+    _reset_daily_state()
+    st, ct, frames = _drain_get_daily_sse(client, since=-1)
+    assert st == 200
+    assert "text/event-stream" in ct
+    assert frames == []
+
+
+def test_daily_attach_after_completion_replays_buffered_events(client, monkeypatch):
+    """A GET /api/daily/stream after a run finishes must replay the full
+    event buffer (started + stages + logs + terminal) so a user opening
+    /reports right after a run sees the final state instead of empty
+    'idle'."""
+    _reset_daily_state()
+
+    def _fake_pipeline():
+        print("[1/4] INGESTION")
+        print("hello world")
+        print("[2/4] PROCESSING")
+
+    _patch_daily(monkeypatch, _fake_pipeline)
+
+    # Run the pipeline to completion via the POST stream.
+    status_code, _, frames = _drain_daily_sse(client)
+    assert status_code == 200
+    assert frames[-1][0] == "done"
+
+    # Status should now report not-running but with last_event_id > 0.
+    snap = client.get("/api/daily/status").json()
+    assert snap["running"] is False
+    assert snap["last_event_id"] >= 2
+
+    # Reattach via GET — the buffer should still hold everything.
+    st2, ct2, frames2 = _drain_get_daily_sse(client, since=-1)
+    assert st2 == 200
+    assert "text/event-stream" in ct2
+    events2 = [n for n, _ in frames2]
+    assert events2[0] == "started"
+    assert events2[-1] == "done"
+    stages = [d for n, d in frames2 if n == "stage"]
+    assert [s["index"] for s in stages] == [1, 2]
+    log_lines = [d["line"] for n, d in frames2 if n == "log"]
+    assert any("hello world" in line for line in log_lines)
+
+
+def test_daily_attach_tails_running_pipeline(client, monkeypatch):
+    """GET reattach during an in-flight run must drain buffered events
+    AND keep tailing until the worker terminates — this is the page-
+    refresh / dropped-network case the user actually experiences."""
+    _reset_daily_state()
+
+    import threading
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_pipeline():
+        print("[1/4] INGESTION")
+        started.set()
+        # Hold the worker open until the test releases it so the GET
+        # subscriber really attaches mid-run, not after.
+        release.wait(timeout=10)
+        print("[4/4] DAILY REPORT")
+
+    _patch_daily(monkeypatch, _fake_pipeline)
+
+    first_result: dict[str, object] = {}
+
+    def _drain_first():
+        try:
+            first_result["status"], _, first_result["frames"] = _drain_daily_sse(client)
+        finally:
+            release.set()
+
+    t1 = threading.Thread(target=_drain_first, daemon=True)
+    t1.start()
+
+    attach_result: dict[str, object] = {}
+
+    def _drain_attach():
+        attach_result["status"], _, attach_result["frames"] = (
+            _drain_get_daily_sse(client, since=-1)
+        )
+
+    try:
+        assert started.wait(timeout=5), "fake pipeline did not start"
+
+        # Status snapshot mid-run must reflect the active run.
+        snap = client.get("/api/daily/status").json()
+        assert snap["running"] is True
+        assert snap["current_stage"] == "ingestion"
+        assert snap["last_event_id"] >= 1
+
+        # Reattach via GET while the worker is paused.
+        t2 = threading.Thread(target=_drain_attach, daemon=True)
+        t2.start()
+
+        # Release the worker so the pipeline finishes and both streams
+        # drain to `done`.
+        release.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+    finally:
+        release.set()
+
+    assert first_result.get("status") == 200
+    assert attach_result.get("status") == 200
+
+    # Both streams must end in `done` and see the same stage transitions.
+    attach_frames = attach_result["frames"]  # type: ignore[index]
+    events = [n for n, _ in attach_frames]
+    assert events[0] == "started"
+    assert events[-1] == "done"
+    stages = [d for n, d in attach_frames if n == "stage"]
+    assert [s["index"] for s in stages] == [1, 4]
+
+
+def test_daily_attach_get_endpoint_requires_token(client, monkeypatch):
+    """The reattach endpoint inherits the same Bearer guard as the rest
+    of the daily endpoints."""
+    _reset_daily_state()
+    from kb import config
+
+    monkeypatch.setattr(config.settings, "chat_token", "daily-test-token")
+    try:
+        with client.stream("GET", "/api/daily/stream") as r:
+            assert r.status_code == 401
+            "".join(r.iter_text())
+        with client.stream(
+            "GET",
+            "/api/daily/stream",
+            headers={"Authorization": "Bearer daily-test-token"},
+        ) as r:
+            assert r.status_code != 401
+            "".join(r.iter_text())
+    finally:
+        monkeypatch.setattr(config.settings, "chat_token", None)
 
 
 # ─── Source list endpoint (browse page tag filter) ────────────────

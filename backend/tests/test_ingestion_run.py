@@ -201,13 +201,19 @@ def _spy_run_ingestion(run_mod, **call_kwargs):
             return []
         return spy
 
+    # Also short-circuit the fulltext prefetch tail so the test never
+    # touches the network, even if the session-scoped DB happens to
+    # contain blog/project rows from prior tests with empty full_text.
+    from kb.processing import fulltext as fulltext_mod
+
     with patch.object(run_mod, "fetch_recent_papers", side_effect=make_spy("arxiv")), \
          patch.object(run_mod, "fetch_recent_posts", side_effect=make_spy("rss")), \
          patch.object(run_mod, "fetch_recent_sitemap_posts", side_effect=make_spy("sitemap_blogs")), \
          patch.object(run_mod, "fetch_trending_repos", side_effect=make_spy("github")), \
          patch.object(run_mod, "save_papers", return_value=0), \
          patch.object(run_mod, "save_posts", return_value=0), \
-         patch.object(run_mod, "save_repos", return_value=0):
+         patch.object(run_mod, "save_repos", return_value=0), \
+         patch.object(fulltext_mod, "prefetch_pending_full_text", return_value=0):
         run_mod.run_ingestion(**call_kwargs)
 
     return captured

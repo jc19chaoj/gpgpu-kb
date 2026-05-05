@@ -163,6 +163,12 @@ function _parseSSEFrame(raw: string): ChatStreamEvent | null {
   if (!event) return null;
   try {
     const parsed = data ? JSON.parse(data) : {};
+    if (event === "model")
+      return {
+        type: "model",
+        provider: parsed.provider ?? "",
+        name: parsed.model ?? parsed.name ?? "",
+      };
     if (event === "sources") return { type: "sources", sources: parsed.sources ?? [] };
     if (event === "token") return { type: "token", content: parsed.content ?? "" };
     if (event === "error") return { type: "error", message: parsed.message ?? "" };
@@ -212,7 +218,46 @@ export async function* runDailyStream(
     throw new Error(`API error: ${resp.status} ${resp.statusText}`);
   }
 
-  const reader = resp.body.getReader();
+  yield* _consumeDailySSE(resp.body);
+}
+
+/**
+ * Reattach to the active (or most recent) daily pipeline run *without*
+ * starting a new one. Replays buffered events with id > `since` from the
+ * backend's in-memory ring buffer, then tails live events until the run
+ * hits a terminal frame.
+ *
+ * Used by /reports on mount when `getDailyStatus().running === true` so a
+ * page refresh / dropped network connection during a run can be recovered
+ * — re-opening this stream replays the events the dead POST connection
+ * would have delivered.
+ *
+ * Pass `since=-1` (default) for a full replay; pass the last seen id to
+ * resume from a known offset. Like `runDailyStream`, cancelling the fetch
+ * via `signal` does NOT abort the pipeline server-side.
+ */
+export async function* attachDailyStream(
+  options?: { since?: number; signal?: AbortSignal },
+): AsyncGenerator<DailyStreamEvent> {
+  const since = options?.since ?? -1;
+  const resp = await fetch(
+    `${API_BASE}/api/daily/stream?since=${encodeURIComponent(String(since))}`,
+    {
+      method: "GET",
+      headers: { Accept: "text/event-stream" },
+      signal: options?.signal,
+    },
+  );
+  if (!resp.ok || !resp.body) {
+    throw new Error(`API error: ${resp.status} ${resp.statusText}`);
+  }
+  yield* _consumeDailySSE(resp.body);
+}
+
+async function* _consumeDailySSE(
+  body: ReadableStream<Uint8Array>,
+): AsyncGenerator<DailyStreamEvent> {
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 

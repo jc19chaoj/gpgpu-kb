@@ -28,6 +28,21 @@ llm-cloud = [
     "anthropic>=0.40.0",
     "openai>=1.50.0",
 ]
+# HTML article extraction (kb.processing.fulltext). Required for
+# blog / project full_text prefetch + source-anchored chat on non-PDF
+# rows; without it those rows fall back to abstract+summary.
+fulltext = [
+    "trafilatura>=1.12.0",
+]
+# Convenience aggregate: everything an end-user needs for the full-fat
+# install (semantic search + cloud LLM + HTML extraction). Use this when
+# you don't want to remember the individual extras:
+#     pip install -e '.[all]'
+all = [
+    "gpgpu-kb[ml]",
+    "gpgpu-kb[llm-cloud]",
+    "gpgpu-kb[fulltext]",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

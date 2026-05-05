@@ -7,9 +7,9 @@ import logging
 import os
 import re
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from queue import Empty, Full, Queue
 
 from fastapi import FastAPI, Depends, Header, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,7 @@ from kb.config import settings
 from kb.database import get_db, init_db
 from kb.models import Paper, DailyReport, SourceType
 from kb.processing.embeddings import get_embedding_store
-from kb.processing.llm import call_llm, stream_llm
+from kb.processing.llm import call_llm, resolved_model, stream_llm
 from kb.schemas import (
     PaperOut,
     PaperListOut,
@@ -227,7 +227,10 @@ def get_paper(paper_id: int, db: Session = Depends(get_db)):
 
 # Cap source text injected into the prompt to keep request bodies sane on
 # both the LLM client side (token budget) and our own request size limits.
-_SOURCE_TEXT_PROMPT_CAP = 60_000
+# Matches `kb.processing.fulltext._MAX_EXTRACTED_CHARS` so a fully-cached
+# article round-trips through chat without losing material at the prompt
+# stage. (200k chars ≈ 50k tokens, well within Claude / GPT-4o context.)
+_SOURCE_TEXT_PROMPT_CAP = 200_000
 # How many recent turns of history to keep when stuffing into the prompt.
 _HISTORY_TURN_CAP = 12
 
@@ -268,9 +271,9 @@ def _build_chat_context(req: ChatRequest, db: Session) -> tuple[str, list[PaperO
         if paper is None:
             raise HTTPException(status_code=404, detail="Paper not found")
 
-        # Lazy import — keeps `pypdf` off the import path of unrelated tests
-        # and lets us mock at module load time.
-        from kb.processing.pdf import fetch_full_text
+        # Lazy import — keeps `pypdf` / `trafilatura` off the import path
+        # of unrelated tests and lets us mock at module load time.
+        from kb.processing.fulltext import fetch_full_text
 
         full_text = fetch_full_text(paper.id) or paper.summary or paper.abstract or ""
         full_text = full_text[:_SOURCE_TEXT_PROMPT_CAP]
@@ -345,13 +348,18 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)):
     HTTP clients that can't consume SSE."""
     prompt, sources = _build_chat_context(req, db)
     answer = call_llm(prompt, role="expert") or "(LLM produced no output)"
-    return ChatResponse(answer=answer, sources=sources)
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        model=resolved_model("expert").get("model", ""),
+    )
 
 
 @app.post("/api/chat/stream", dependencies=[Depends(verify_chat_token)])
 def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
     """Streaming chat. Emits SSE events:
-      - `sources` : once at the start, payload {"sources": [PaperOut, ...]}
+      - `model`   : once at the very start, payload {"provider": "...", "model": "..."}
+      - `sources` : once after model, payload {"sources": [PaperOut, ...]}
       - `token`   : zero or more, payload {"content": "<chunk>"}
       - `error`   : at most one, payload {"message": "..."} (terminal)
       - `done`    : exactly one terminator, payload {}
@@ -365,9 +373,13 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
     # error. If this call moves into event_stream() the 404 would be
     # swallowed inside an already-sent 200 response.
     prompt, sources = _build_chat_context(req, db)
+    model_info = resolved_model("expert")
 
     def event_stream():
-        # 1) sources first so the UI can render attribution before any token.
+        # 0) model first so the UI can label the assistant turn before
+        #    any source / token frames arrive.
+        yield _sse_event("model", model_info)
+        # 1) sources so the UI can render attribution before any token.
         yield _sse_event(
             "sources",
             {"sources": [s.model_dump(mode="json") for s in sources]},
@@ -502,9 +514,16 @@ def get_stats(db: Session = Depends(get_db)):
 # Runs `kb.daily.run_daily_pipeline()` *in-process* on a background thread
 # (no subprocess) and streams progress as SSE so the /reports page can show
 # stage transitions + live logs. A global lock allows only one concurrent
-# run — the second POST gets HTTP 409. `GET /api/daily/status` lets the UI
-# render the right initial state on page load (e.g. button disabled if a
-# run is already in flight from a previous tab/refresh).
+# run — the second POST gets HTTP 409.
+#
+# Reattach support: events are appended to a bounded ring buffer with
+# monotonic ids guarded by a single Condition. The POST endpoint starts a
+# new run and tails the buffer; the GET endpoint just tails (replay-from-
+# since + live) without starting a run, so a refresh / dropped network
+# connection during a run can be recovered by reopening the GET stream.
+# The buffer survives across runs until the next try_start() — a client
+# opening the page right after a pipeline finishes still sees the terminal
+# event and final stage state.
 
 # Stage detection: the pipeline prints "[N/4] <name>" headers via print()
 # (see kb/daily.py). Match the index regardless of language so both en and
@@ -519,80 +538,152 @@ _STAGE_NAMES: dict[int, str] = {
 
 
 class _DailyRunState:
-    """Singleton tracking the active daily pipeline run.
+    """Multi-subscriber event log for the daily pipeline.
 
-    All mutations happen under `_lock`. The Queue itself is thread-safe,
-    so the SSE generator can drain it without holding the lock.
+    All events go through a bounded `deque[(id, name, payload)]` ring
+    buffer guarded by a single `Condition`. Subscribers (POST starter and
+    GET reattach) each hold a private `last_id` cursor; on each iteration
+    they pull new events via `replay_since(last_id)` and either bail
+    (run finished) or block on the condition for the next event. This
+    decouples the pipeline worker from SSE clients — the worker emits
+    without caring how many tabs are watching, and a fresh tab can resume
+    mid-run by replaying the buffer.
     """
+
+    _MAX_EVENTS = 5000  # ~5x typical pipeline log volume; oldest dropped on overflow
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._running = False
         self._started_at: datetime | None = None
         self._current_stage: int | None = None
-        self._queue: Queue | None = None
+        self._terminal_emitted = False
+        self._events: deque[tuple[int, str, dict]] = deque(maxlen=self._MAX_EVENTS)
+        self._next_id = 0
+        self._run_id = 0  # increments per try_start; observable in /status
 
-    def try_start(self) -> Queue | None:
-        """Atomically claim the run slot. Returns the worker's event queue,
-        or None if another run is already in flight."""
-        with self._lock:
+    def try_start(self) -> bool:
+        """Atomically claim the run slot. Resets the event buffer for the
+        new run and seeds a `started` event so subscribers connecting
+        immediately after still see the start marker. Returns False if a
+        run is already in flight."""
+        with self._cond:
             if self._running:
-                return None
+                return False
             self._running = True
             self._started_at = datetime.now(timezone.utc)
             self._current_stage = None
-            # Bounded queue so a slow SSE consumer can't push the worker
-            # thread into unbounded memory growth.
-            self._queue = Queue(maxsize=2000)
-            return self._queue
+            self._terminal_emitted = False
+            self._events.clear()
+            self._next_id = 0
+            self._run_id += 1
+            self._append_locked(
+                "started",
+                {"started_at": self._started_at.isoformat()},
+            )
+            return True
 
-    def set_stage(self, index: int) -> None:
-        with self._lock:
-            self._current_stage = index
+    def _append_locked(self, name: str, payload: dict) -> int:
+        # Caller MUST hold self._cond (== self._lock). Returns assigned id.
+        evt_id = self._next_id
+        self._next_id += 1
+        self._events.append((evt_id, name, payload))
+        self._cond.notify_all()
+        return evt_id
 
-    def end(self) -> None:
-        with self._lock:
-            self._running = False
-
-    def status(self) -> dict[str, object]:
-        with self._lock:
+    def record_log_line(self, line: str) -> None:
+        """Buffer a `log` event; if the line carries a `[N/4]` banner that
+        moves us to a new stage, emit a `stage` event right before the log
+        line so subscribers see the transition cleanly. Lines arriving
+        after the run has terminated are dropped — defensive against
+        stale handlers post-removal."""
+        m = _STAGE_PATTERN.search(line)
+        with self._cond:
             if not self._running:
-                return {"running": False, "started_at": None, "current_stage": None}
+                return
+            if m:
+                stage_idx = int(m.group(1))
+                if 1 <= stage_idx <= 4 and stage_idx != self._current_stage:
+                    self._current_stage = stage_idx
+                    self._append_locked(
+                        "stage",
+                        {"index": stage_idx, "name": _STAGE_NAMES[stage_idx]},
+                    )
+            self._append_locked("log", {"line": line})
+
+    def record_terminal(self, name: str, payload: dict) -> None:
+        """Emit a terminal `done` or `error` event and clear the running
+        flag. Idempotent — the worker's `finally` safety-net call won't
+        produce a duplicate."""
+        with self._cond:
+            if self._terminal_emitted:
+                self._running = False
+                self._cond.notify_all()
+                return
+            self._terminal_emitted = True
+            self._running = False
+            self._append_locked(name, payload)
+
+    def replay_since(
+        self, since: int
+    ) -> tuple[list[tuple[int, str, dict]], int, bool, bool]:
+        """Snapshot under lock: events with id > since, the latest id
+        observed, the running flag, and whether a terminal has been
+        recorded. Returns a list copy so callers can iterate without
+        holding the lock during the network write."""
+        with self._lock:
+            events = [e for e in self._events if e[0] > since]
+            return events, self._next_id - 1, self._running, self._terminal_emitted
+
+    def wait_for(self, last_id: int, timeout: float) -> bool:
+        """Block until an event with id > last_id is appended, or until
+        timeout. Returns True if a new event arrived (caller should drain),
+        False if the wait timed out (caller should send a keepalive)."""
+        with self._cond:
+            if self._next_id - 1 > last_id:
+                return True
+            return self._cond.wait(timeout=timeout)
+
+    def snapshot(self) -> dict[str, object]:
+        """Cheap snapshot for `/api/daily/status`. `last_event_id` lets
+        clients decide whether to reattach via `GET /api/daily/stream`
+        even when `running=false` (e.g. show the terminal state from a
+        recently completed run)."""
+        with self._lock:
             return {
-                "running": True,
-                "started_at": self._started_at.isoformat() if self._started_at else None,
-                "current_stage": _STAGE_NAMES.get(self._current_stage) if self._current_stage else None,
+                "running": self._running,
+                "started_at": self._started_at.isoformat()
+                if self._started_at
+                else None,
+                "current_stage": _STAGE_NAMES.get(self._current_stage)
+                if self._current_stage
+                else None,
+                "last_event_id": self._next_id - 1,
+                "run_id": self._run_id,
             }
 
 
 _daily_state = _DailyRunState()
 
 
-class _QueueLogHandler(logging.Handler):
-    """Mirror logger output into the worker's event queue. Bounded queue
-    means we drop overflow rather than block the worker thread."""
-
-    def __init__(self, queue: Queue) -> None:
-        super().__init__()
-        self._queue = queue
+class _LogLineHandler(logging.Handler):
+    """Mirror logger output into the daily run's event buffer."""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             line = self.format(record)
         except Exception:
             return
-        try:
-            self._queue.put_nowait(("log", line))
-        except Full:
-            pass
+        _daily_state.record_log_line(line)
 
 
-class _QueueStdoutWriter:
-    """File-like sink that flushes complete lines to the queue. Used with
-    contextlib.redirect_stdout to capture the pipeline's banner prints."""
+class _StdoutLineWriter:
+    """File-like sink that forwards complete lines to the event buffer.
+    Used with `contextlib.redirect_stdout` to capture pipeline banner
+    `print()` output, which is how `[N/4]` stage headers reach us."""
 
-    def __init__(self, queue: Queue) -> None:
-        self._queue = queue
+    def __init__(self) -> None:
         self._buffer = ""
 
     def write(self, s: str) -> int:
@@ -602,66 +693,80 @@ class _QueueStdoutWriter:
         while "\n" in self._buffer:
             line, _, self._buffer = self._buffer.partition("\n")
             if line.strip():
-                try:
-                    self._queue.put_nowait(("log", line))
-                except Full:
-                    pass
+                _daily_state.record_log_line(line)
         return len(s)
 
     def flush(self) -> None:
-        # Don't drain the partial line: pipeline statements always end
-        # with "\n", so a trailing partial means the current write is mid
-        # multi-line block — splitting now would chop a header in two.
+        # Pipeline statements always end with "\n", so a trailing partial
+        # means the current write is mid multi-line block — splitting now
+        # would chop a header in two.
         pass
 
 
-def _run_daily_in_worker(queue: Queue) -> None:
-    """Run the daily pipeline; emit logs to `queue`. Daemon thread.
-
-    Always pushes the `__terminator__` sentinel in `finally` so the SSE
-    generator's read loop can break even if intermediate puts were dropped
-    due to a full queue.
-    """
-    handler = _QueueLogHandler(queue)
+def _run_daily_in_worker() -> None:
+    """Run the daily pipeline on a daemon thread; emit logs and a terminal
+    event into `_daily_state`. The `finally` safety net guarantees a
+    terminal is recorded even on unexpected exits, so subscriber loops
+    don't hang waiting for an event that never comes."""
+    handler = _LogLineHandler()
     handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)
 
-    stdout_sink = _QueueStdoutWriter(queue)
+    stdout_sink = _StdoutLineWriter()
     try:
         with contextlib.redirect_stdout(stdout_sink):
             from kb.daily import run_daily_pipeline
 
             run_daily_pipeline()
-        try:
-            queue.put_nowait(("__done__", {}))
-        except Full:
-            pass
+        _daily_state.record_terminal("done", {})
     except Exception as exc:
         logger.exception("Daily pipeline failed")
-        try:
-            queue.put_nowait(("__error__", {"message": str(exc) or exc.__class__.__name__}))
-        except Full:
-            pass
+        _daily_state.record_terminal(
+            "error", {"message": str(exc) or exc.__class__.__name__}
+        )
     finally:
         root.removeHandler(handler)
-        _daily_state.end()
-        try:
-            queue.put_nowait(("__terminator__", None))
-        except Full:
-            pass
+        # Idempotent safety net: success / error paths above already win,
+        # but if some unexpected exit skipped both, this guarantees
+        # subscribers see a terminal and stop waiting.
+        _daily_state.record_terminal("done", {})
+
+
+def _stream_daily_events(since: int):
+    """SSE generator: replay buffered events with id > `since`, then tail
+    live until the run reaches a terminal (or there's nothing in flight).
+    Sends an SSE comment frame every ~15s during idle so middleboxes
+    (nginx, cpolar) don't kill the connection on long pipeline stretches."""
+    last_id = since
+    while True:
+        events, _max_id, running, _terminal = _daily_state.replay_since(last_id)
+        for evt_id, name, payload in events:
+            yield _sse_event(name, payload)
+            last_id = evt_id
+
+        # Drained everything visible. If the run is no longer in flight,
+        # the terminal event was either replayed above (caught up) or
+        # there's nothing buffered (fresh backend) — either way we're done.
+        if not running:
+            return
+
+        got = _daily_state.wait_for(last_id, timeout=15)
+        if not got:
+            yield ": keepalive\n\n"
 
 
 @app.get("/api/daily/status", dependencies=[Depends(verify_chat_token)])
 def daily_status() -> dict[str, object]:
-    """Cheap query so /reports can render the right initial button state
-    (disabled + "running since X" if a previous tab kicked off a run)."""
-    return _daily_state.status()
+    """Cheap query so /reports can render the right initial state on page
+    load (running flag, current stage, and last_event_id so the client can
+    decide whether to reattach via GET /api/daily/stream)."""
+    return _daily_state.snapshot()
 
 
 @app.post("/api/daily/stream", dependencies=[Depends(verify_chat_token)])
 def daily_stream():
-    """Kick off `kb.daily.run_daily_pipeline()` in a background thread and
+    """Kick off `kb.daily.run_daily_pipeline()` on a daemon thread and
     stream progress as SSE.
 
     Events:
@@ -671,64 +776,38 @@ def daily_stream():
       - `done`    (1)  : {} terminal
       - `error`   (≤1) : {message} terminal (mutually exclusive with done)
 
-    HTTP 409 if another run is already in flight — the UI should fall back
-    to the status endpoint to render "running since X" instead.
+    HTTP 409 if another run is already in flight — clients should fall
+    back to `GET /api/daily/stream` to reattach to the in-flight run.
     """
-    queue = _daily_state.try_start()
-    if queue is None:
+    if not _daily_state.try_start():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A daily pipeline run is already in progress.",
         )
 
-    started_at_raw = _daily_state.status()["started_at"]
-    threading.Thread(target=_run_daily_in_worker, args=(queue,), daemon=True).start()
-
-    def event_stream():
-        yield _sse_event("started", {"started_at": started_at_raw})
-        last_stage_emitted: int | None = None
-        terminal_emitted = False
-        while True:
-            try:
-                kind, payload = queue.get(timeout=15)
-            except Empty:
-                # SSE comment frame: keeps middlebox idle timers happy
-                # without being decoded as a real event by the client.
-                yield ": keepalive\n\n"
-                continue
-
-            if kind == "__terminator__":
-                if not terminal_emitted:
-                    yield _sse_event("done", {})
-                break
-            if kind == "__done__":
-                terminal_emitted = True
-                yield _sse_event("done", payload if isinstance(payload, dict) else {})
-                continue
-            if kind == "__error__":
-                terminal_emitted = True
-                yield _sse_event(
-                    "error",
-                    payload if isinstance(payload, dict) else {"message": "unknown error"},
-                )
-                continue
-
-            # kind == "log"
-            line = payload if isinstance(payload, str) else str(payload)
-            m = _STAGE_PATTERN.search(line)
-            if m:
-                stage_idx = int(m.group(1))
-                if stage_idx != last_stage_emitted:
-                    last_stage_emitted = stage_idx
-                    _daily_state.set_stage(stage_idx)
-                    yield _sse_event(
-                        "stage",
-                        {"index": stage_idx, "name": _STAGE_NAMES[stage_idx]},
-                    )
-            yield _sse_event("log", {"line": line})
-
+    threading.Thread(target=_run_daily_in_worker, daemon=True).start()
     return StreamingResponse(
-        event_stream(),
+        _stream_daily_events(since=-1),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/daily/stream", dependencies=[Depends(verify_chat_token)])
+def daily_stream_attach(since: int = Query(-1, ge=-1)):
+    """Reattach to the active (or most recent) daily pipeline run without
+    starting a new one. Replays events with id > `since` from the in-memory
+    ring buffer, then tails live events until the run hits a terminal.
+
+    Pass `since=-1` (default) for a full replay; pass the last seen id to
+    resume from a dropped connection. If no run is in flight and nothing
+    is buffered, the stream closes immediately with no events.
+    """
+    return StreamingResponse(
+        _stream_daily_events(since=since),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

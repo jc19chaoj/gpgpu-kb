@@ -991,3 +991,205 @@ def test_stream_llm_expert_model_override(monkeypatch):
     list(llm_mod.stream_llm("p", role="expert"))
 
     assert seen_models == ["deepseek-reasoner"]
+
+
+# ─── Retry policy ─────────────────────────────────────────────────
+
+
+class _FakeRateLimitError(Exception):
+    """Mimics openai/anthropic RateLimitError class-name pattern."""
+
+
+class _FakeBadRequestError(Exception):
+    """Mimics openai/anthropic BadRequestError class-name pattern."""
+
+
+class _FakeAPIStatusError(Exception):
+    def __init__(self, status_code: int, message: str = "status err"):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _zero_backoff(monkeypatch):
+    """Helper: kill sleep so retry tests don't actually wait."""
+    from kb import config
+
+    monkeypatch.setattr(config.settings, "llm_retry_backoff_seconds", 0.0)
+
+
+def test_is_retryable_error_classifies_429_and_5xx_as_retryable():
+    from kb.processing import llm as llm_mod
+
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(429)) is True
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(500)) is True
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(503)) is True
+
+
+def test_is_retryable_error_classifies_4xx_as_non_retryable():
+    from kb.processing import llm as llm_mod
+
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(400)) is False
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(401)) is False
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(403)) is False
+    assert llm_mod._is_retryable_error(_FakeAPIStatusError(404)) is False
+
+
+def test_is_retryable_error_classifies_by_class_name():
+    from kb.processing import llm as llm_mod
+
+    assert llm_mod._is_retryable_error(_FakeRateLimitError("x")) is True
+    assert llm_mod._is_retryable_error(_FakeBadRequestError("x")) is False
+
+
+def test_is_retryable_error_handles_stdlib_network_errors():
+    from kb.processing import llm as llm_mod
+
+    assert llm_mod._is_retryable_error(ConnectionError("reset")) is True
+    assert llm_mod._is_retryable_error(TimeoutError("slow")) is True
+    # Unknown exception class — conservative default is False.
+    assert llm_mod._is_retryable_error(KeyError("missing")) is False
+
+
+def test_call_llm_retries_then_succeeds(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 3)
+
+    calls = {"n": 0}
+
+    def flaky(prompt, *, model=None, max_tokens):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _FakeRateLimitError("429")
+        return "ok"
+
+    monkeypatch.setitem(llm_mod._PROVIDERS, "hermes", flaky)
+    assert llm_mod.call_llm("p") == "ok"
+    assert calls["n"] == 3
+
+
+def test_call_llm_retryable_eventually_gives_up(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 2)
+
+    calls = {"n": 0}
+
+    def always_429(prompt, *, model=None, max_tokens):
+        calls["n"] += 1
+        raise _FakeRateLimitError("429")
+
+    monkeypatch.setitem(llm_mod._PROVIDERS, "hermes", always_429)
+    assert llm_mod.call_llm("p") == ""
+    # 1 initial attempt + 2 retries = 3
+    assert calls["n"] == 3
+
+
+def test_call_llm_non_retryable_gives_up_immediately(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 5)
+
+    calls = {"n": 0}
+
+    def always_400(prompt, *, model=None, max_tokens):
+        calls["n"] += 1
+        raise _FakeBadRequestError("bad input")
+
+    monkeypatch.setitem(llm_mod._PROVIDERS, "hermes", always_400)
+    assert llm_mod.call_llm("p") == ""
+    assert calls["n"] == 1  # no retry
+
+
+def test_call_llm_zero_retries_keeps_single_attempt(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 0)
+
+    calls = {"n": 0}
+
+    def always_429(prompt, *, model=None, max_tokens):
+        calls["n"] += 1
+        raise _FakeRateLimitError("429")
+
+    monkeypatch.setitem(llm_mod._PROVIDERS, "hermes", always_429)
+    assert llm_mod.call_llm("p") == ""
+    assert calls["n"] == 1
+
+
+def test_stream_llm_retries_when_failure_before_any_chunk(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 3)
+
+    calls = {"n": 0}
+
+    def flaky_stream(prompt, *, model=None):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise _FakeRateLimitError("429")
+        yield "hel"
+        yield "lo"
+
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "hermes", flaky_stream)
+    chunks = list(llm_mod.stream_llm("p"))
+    assert chunks == ["hel", "lo"]
+    assert calls["n"] == 2
+
+
+def test_stream_llm_does_not_retry_after_first_chunk(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 3)
+
+    calls = {"n": 0}
+
+    def fail_after_first(prompt, *, model=None):
+        calls["n"] += 1
+        yield "first-chunk"
+        raise _FakeRateLimitError("429 mid-stream")
+
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "hermes", fail_after_first)
+    chunks = list(llm_mod.stream_llm("p"))
+    # Got the one chunk, then silent end. NO retry — would otherwise
+    # double-emit "first-chunk" to the client.
+    assert chunks == ["first-chunk"]
+    assert calls["n"] == 1
+
+
+def test_stream_llm_non_retryable_gives_up_immediately(monkeypatch):
+    from kb import config
+    from kb.processing import llm as llm_mod
+
+    _zero_backoff(monkeypatch)
+    monkeypatch.setattr(config.settings, "llm_provider", "hermes")
+    monkeypatch.setattr(config.settings, "llm_max_retries", 5)
+
+    calls = {"n": 0}
+
+    def always_400(prompt, *, model=None):
+        calls["n"] += 1
+        raise _FakeBadRequestError("bad input")
+        yield  # pragma: no cover — make this a generator
+
+    monkeypatch.setitem(llm_mod._STREAM_PROVIDERS, "hermes", always_400)
+    assert list(llm_mod.stream_llm("p")) == []
+    assert calls["n"] == 1

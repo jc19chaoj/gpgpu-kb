@@ -15,11 +15,15 @@ pip install -e .
 mkdir -p data
 python -c "from kb.database import init_db; init_db()"
 
-# (Optional) Install ML deps for semantic search / RAG chat
-pip install -e '.[ml]'
+# (Optional) One-shot full install: ML + cloud LLM + HTML extraction.
+# This is what most users want; it covers semantic search/RAG, cloud
+# providers, and full-article fetching for blog/project rows.
+pip install -e '.[all]'
 
-# (Optional) Cloud LLM providers (Anthropic / OpenAI)
-pip install -e '.[llm-cloud]'
+# Or pick individual extras:
+#   '.[ml]'        — ChromaDB + sentence-transformers (semantic search / RAG)
+#   '.[llm-cloud]' — Anthropic / OpenAI / DeepSeek SDKs
+#   '.[fulltext]'  — trafilatura (blog / project article-body extraction)
 
 # Start backend
 ./run_api.sh
@@ -239,11 +243,14 @@ docker run --rm -v gpgpu-kb_kb_data:/data -v "$PWD":/backup alpine \
    docker compose build --build-arg NEXT_PUBLIC_API_URL=https://kb.example.com frontend
    ```
 2. **Slim the backend** by skipping the ML stack (~2 GB) when you don't need
-   semantic search/RAG:
+   semantic search/RAG. Default is `all` (ml + llm-cloud + fulltext); set
+   `BACKEND_INSTALL_EXTRAS` to drop pieces:
    ```bash
-   BACKEND_INSTALL_EXTRAS=llm-cloud docker compose build backend
+   BACKEND_INSTALL_EXTRAS=llm-cloud,fulltext docker compose build backend
    ```
-   Search will fall back to keyword `LIKE` matching automatically.
+   Search will fall back to keyword `LIKE` matching automatically. Drop
+   `fulltext` too only if you don't care about blog/project full-article
+   extraction (those rows then fall back to og:description blurbs).
 3. **Always set `KB_CHAT_TOKEN`** when exposing the API publicly, otherwise
    `/api/chat` is an open LLM proxy. Front the frontend with HTTPS (Caddy /
    Traefik / Cloudflare Tunnel) — the bundled images do not terminate TLS.

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DailyConflictError,
+  attachDailyStream,
   getDailyStatus,
   listReports,
   runDailyStream,
@@ -77,50 +78,7 @@ export default function ReportsPage() {
   const [logs, setLogs] = useState<string[]>([]);
   const [showLogs, setShowLogs] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-  const logEndRef = useRef<HTMLDivElement | null>(null);
-
-  // Initial load: fetch reports + check for an in-flight run from another tab.
-  useEffect(() => {
-    let cancelled = false;
-    listReports(30).then((rows) => {
-      if (!cancelled) setReports(rows);
-    }).finally(() => {
-      if (!cancelled) setLoading(false);
-    });
-
-    getDailyStatus().then((status) => {
-      if (cancelled || !status.running) return;
-      // Another tab / a previous session started a run we can't reattach
-      // to (the SSE stream is owned by the original POST connection). Show
-      // the user that something is in flight; the button stays disabled.
-      const stageIdx = status.current_stage
-        ? STAGE_ORDER.indexOf(status.current_stage)
-        : -1;
-      setRun({
-        phase: "running",
-        startedAt: status.started_at,
-        activeIndex: stageIdx,
-        errorMessage: null,
-        conflict: true,
-      });
-    }).catch(() => {
-      // Status endpoint failure is non-fatal — keep idle state.
-    });
-
-    return () => {
-      cancelled = true;
-      // If the user navigates away mid-run, drop the SSE connection. The
-      // pipeline keeps running on the server; reopening /reports will
-      // detect it via getDailyStatus.
-      abortRef.current?.abort();
-    };
-  }, []);
-
-  // Auto-scroll logs to the bottom as new lines arrive (only if the panel
-  // is open — no point scrolling a hidden scroll container).
-  useEffect(() => {
-    if (showLogs) logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs, showLogs]);
+  const logContainerRef = useRef<HTMLDivElement | null>(null);
 
   const appendLog = useCallback((line: string) => {
     setLogs((prev) => {
@@ -131,6 +89,114 @@ export default function ReportsPage() {
       return next;
     });
   }, []);
+
+  // Drains an SSE stream and applies each event to the run state. Returns
+  // whether the stream ended on a terminal frame (vs a dropped connection).
+  // Shared by mount-time reattach and the Run-Now button so they handle
+  // events identically — the only thing that differs is which fetch the
+  // generator wraps.
+  const consumeAndApply = useCallback(async (
+    stream: AsyncGenerator<DailyStreamEvent>,
+    signal: AbortSignal,
+  ): Promise<boolean> => {
+    let sawTerminal = false;
+    for await (const ev of stream) {
+      if (signal.aborted) break;
+      applyEvent(ev, { setRun, appendLog });
+      if (ev.type === "done" || ev.type === "error") sawTerminal = true;
+    }
+    return sawTerminal;
+  }, [appendLog]);
+
+  // Initial load: fetch reports + reattach to an in-flight run if there
+  // is one (page refresh / dropped network during a pipeline run). We
+  // request a full replay (`since=-1`) so the buffered `started` /
+  // `stage` / `log` events repopulate the UI before we tail live.
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    listReports(30).then((rows) => {
+      if (!cancelled) setReports(rows);
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+
+    (async () => {
+      let status;
+      try {
+        status = await getDailyStatus();
+      } catch {
+        // Status endpoint failure (network / 401) is non-fatal — leave
+        // the page in idle state so the report list is still usable.
+        return;
+      }
+      if (cancelled || !status.running) return;
+
+      const stageIdx = status.current_stage
+        ? STAGE_ORDER.indexOf(status.current_stage)
+        : -1;
+      setRun({
+        phase: "running",
+        startedAt: status.started_at,
+        activeIndex: stageIdx,
+        errorMessage: null,
+        conflict: false,
+      });
+      // Reset the local log buffer; the `since=-1` replay will refill it
+      // with everything the in-flight run has emitted so far.
+      setLogs([]);
+      setShowLogs(true);
+
+      try {
+        const sawTerminal = await consumeAndApply(
+          attachDailyStream({ since: -1, signal: controller.signal }),
+          controller.signal,
+        );
+        if (cancelled) return;
+        if (!sawTerminal) {
+          setRun((prev) => prev.phase === "running" ? {
+            ...prev,
+            phase: "error",
+            errorMessage: t("reports.run.connectionLost"),
+          } : prev);
+        } else {
+          listReports(30).then(setReports).catch(() => { /* leave stale */ });
+        }
+      } catch (err) {
+        if ((err as { name?: string }).name === "AbortError") return;
+        if (cancelled) return;
+        setRun((prev) => ({
+          ...prev,
+          phase: "error",
+          errorMessage:
+            (err instanceof Error && err.message)
+              ? err.message
+              : t("reports.run.failed"),
+        }));
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      // Drop the SSE connection on unmount. The pipeline keeps running
+      // on the server; reopening /reports will detect it and reattach.
+      abortRef.current?.abort();
+    };
+  }, [consumeAndApply, t]);
+
+  // Auto-scroll logs to the bottom as new lines arrive. Set scrollTop on
+  // the container directly instead of scrollIntoView, which would also
+  // scroll every ancestor (including the page) to bring the sentinel into
+  // view.
+  useEffect(() => {
+    if (!showLogs) return;
+    const el = logContainerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [logs, showLogs]);
 
   const handleRun = useCallback(async () => {
     if (run.phase === "starting" || run.phase === "running") return;
@@ -149,34 +215,46 @@ export default function ReportsPage() {
     abortRef.current = controller;
 
     try {
-      let sawTerminal = false;
-      for await (const ev of runDailyStream({ signal: controller.signal })) {
-        applyEvent(ev, { setRun, appendLog });
-        if (ev.type === "done" || ev.type === "error") sawTerminal = true;
+      let sawTerminal: boolean;
+      try {
+        sawTerminal = await consumeAndApply(
+          runDailyStream({ signal: controller.signal }),
+          controller.signal,
+        );
+      } catch (err) {
+        if (err instanceof DailyConflictError) {
+          // Another tab/client already started the run — reattach to it
+          // instead of leaving the user with a dead-end error UI.
+          setRun({
+            phase: "running",
+            startedAt: null,
+            activeIndex: -1,
+            errorMessage: null,
+            conflict: false,
+          });
+          setLogs([]);
+          sawTerminal = await consumeAndApply(
+            attachDailyStream({ since: -1, signal: controller.signal }),
+            controller.signal,
+          );
+        } else {
+          throw err;
+        }
       }
+
       if (!sawTerminal) {
-        // Stream ended without a `done` / `error` frame — the connection
-        // dropped mid-flight. The server-side run may still be live.
+        // Stream ended without `done`/`error` — connection dropped
+        // mid-flight. The server-side run may still be live; a refresh
+        // will reattach via the mount effect's status check.
         setRun((prev) => prev.phase === "running" ? {
           ...prev,
           phase: "error",
           errorMessage: t("reports.run.connectionLost"),
         } : prev);
       } else {
-        // Refresh the list so the freshly generated report appears.
         listReports(30).then(setReports).catch(() => { /* leave stale */ });
       }
     } catch (err) {
-      if (err instanceof DailyConflictError) {
-        setRun({
-          phase: "error",
-          startedAt: null,
-          activeIndex: -1,
-          errorMessage: t("reports.run.conflict"),
-          conflict: true,
-        });
-        return;
-      }
       if ((err as { name?: string }).name === "AbortError") {
         // User-initiated cancel (component unmount). Don't flip to error.
         return;
@@ -192,7 +270,7 @@ export default function ReportsPage() {
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
     }
-  }, [run.phase, t, appendLog]);
+  }, [run.phase, t, consumeAndApply]);
 
   const startedRelative = run.startedAt ? formatRelativeTime(run.startedAt, locale) : null;
   const isBusy = run.phase === "starting" || run.phase === "running";
@@ -232,7 +310,7 @@ export default function ReportsPage() {
             setRun(INITIAL_RUN_STATE);
           }}
           startedRelative={startedRelative}
-          logEndRef={logEndRef}
+          logContainerRef={logContainerRef}
         />
       )}
 
@@ -279,7 +357,7 @@ interface RunPanelProps {
   onToggleLogs: () => void;
   onReload: () => void;
   startedRelative: string | null;
-  logEndRef: React.RefObject<HTMLDivElement | null>;
+  logContainerRef: React.RefObject<HTMLDivElement | null>;
 }
 
 function RunPanel({
@@ -289,7 +367,7 @@ function RunPanel({
   onToggleLogs,
   onReload,
   startedRelative,
-  logEndRef,
+  logContainerRef,
 }: RunPanelProps) {
   const { t } = useLocale();
   const isError = run.phase === "error";
@@ -365,7 +443,10 @@ function RunPanel({
         </div>
 
         {showLogs && (
-          <div className="rounded border border-border bg-zinc-950/60 px-3 py-2 max-h-72 overflow-y-auto">
+          <div
+            ref={logContainerRef}
+            className="rounded border border-border bg-zinc-950/60 px-3 py-2 max-h-72 overflow-y-auto overscroll-contain"
+          >
             {logs.length === 0 ? (
               <p className="text-xs text-muted-foreground italic">
                 {t("reports.run.logsEmpty")}
@@ -375,7 +456,6 @@ function RunPanel({
                 {logs.join("\n")}
               </pre>
             )}
-            <div ref={logEndRef} />
           </div>
         )}
       </CardContent>

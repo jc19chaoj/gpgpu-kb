@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     llm_expert_provider: str | None = None
     llm_expert_model: str | None = None
     llm_timeout_seconds: int = 180
+    # Retry policy for transient provider failures (rate limits, 5xx, network).
+    # `call_llm` and `stream_llm` retry up to llm_max_retries times with
+    # exponential backoff (base * 2^attempt + jitter). Auth / 4xx errors are
+    # NOT retried. Streaming retries only fire if the failure happens before
+    # any chunk has been yielded — partial streams cannot be safely re-played.
+    llm_max_retries: int = 3
+    llm_retry_backoff_seconds: float = 2.0
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-4-6"
     openai_api_key: str | None = None
