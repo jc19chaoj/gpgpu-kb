@@ -42,6 +42,8 @@ FEEDS = [
     ("https://huggingface.co/blog/feed.xml", "Hugging Face Blog"),
     ("https://developer.nvidia.com/blog/feed", "NVIDIA Developer Blog"),
     ("https://research.nvidia.com/rss.xml", "NVIDIA Research"),
+    # ML frameworks
+    ("https://pytorch.org/blog/feed/", "PyTorch Blog"),
     # Inference engines
     # vLLM uses Jekyll under vllm.ai; the rss.xml lives under /blog/.
     ("https://vllm.ai/blog/rss.xml", "vLLM Blog"),

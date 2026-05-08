@@ -21,7 +21,7 @@
 **GPGPU Knowledge Base** 是一个面向 GPGPU 芯片架构方向的"自更新研究知识库"。它周期性地收集、总结并打分高影响力的：
 
 - ArXiv 论文（cs.AR / cs.AI / cs.LG / cs.CL / cs.ET / cs.DC / cs.PF / cs.SE / cs.NE）
-- 业界与个人技术博客（**12 个精选 RSS 源** + **sitemap-driven 抓取**，当前内置 1 个 sitemap 源：LMSYS / SGLang Blog）
+- 业界与个人技术博客（**13 个精选 RSS 源** + **sitemap-driven 抓取**，当前内置 1 个 sitemap 源：LMSYS / SGLang Blog）
 - GitHub 趋势开源项目（围绕 gpu / cuda / triton / mlir / transformer / llm / inference 等关键词）
 
 并对外提供：

@@ -21,7 +21,7 @@
 
 后端承担五件事：
 
-1. **采集（ingestion）**：从 ArXiv / RSS（12 个源）/ sitemap_blog（1 个源）/ GitHub Search 拉取近期内容，按 `Paper.url` 唯一索引去重写入 SQLite；回看窗自动适配 per-`source_name` 上次成功时间。
+1. **采集（ingestion）**：从 ArXiv / RSS（13 个源）/ sitemap_blog（1 个源）/ GitHub Search 拉取近期内容，按 `Paper.url` 唯一索引去重写入 SQLite；回看窗自动适配 per-`source_name` 上次成功时间。
 2. **处理（processing）**：调用 LLM 对每条记录生成 ~3-5 段技术摘要，并按 `source_type` 切换 rubric 打两维 0-10 分（universal axes：`quality_score` / `relevance_score`）；之后用 sentence-transformers 生成嵌入并写入 ChromaDB；**source-anchored chat 触发时按需下载 PDF 抽全文，缓存在 `Paper.full_text`**。
 3. **服务（API）**：FastAPI 暴露浏览 / 详情 / 搜索 / **多轮 + source-anchored RAG 聊天（一次性 + SSE 流式两种端点，使用 expert 角色 LLM）** / 日报 / 统计 / 健康检查端点；**本轮新增**：手动触发 daily pipeline + SSE 实时进度的两个端点（`/api/daily/status` + `/api/daily/stream`）。
 4. **报告（reports）**：每天聚合当日已处理论文与博客/项目，产出一份 Markdown 简报存入 `daily_reports`（按 `max(quality, relevance)` 排序）。
@@ -211,7 +211,7 @@ event: <name>\ndata: <json>\n\n
 | 文件 | 职责 |
 | --- | --- |
 | `arxiv.py` | 9 个 cs.* 类目逐一查 |
-| `rss.py` | **12 个精选 RSS 源** |
+| `rss.py` | **13 个精选 RSS 源** |
 | `sitemap_blog.py` | sitemap-driven blog scraper（当前 1 个源：LMSYS / SGLang Blog） |
 | `github_trending.py` | GitHub Search API 按 17 个关键词 |
 | `run.py` | 编排 + per-source 冷启动（`_lookback_for_source(source_name)`）+ **末尾 `prefetch_pending_full_text()` 尾步骤** |
@@ -377,7 +377,7 @@ backend/
    ├─ reports.py           # 日报生成（fast 角色）
    ├─ ingestion/
    │  ├─ arxiv.py
-   │  ├─ rss.py            # 12 源
+   │  ├─ rss.py            # 13 源
    │  ├─ sitemap_blog.py
    │  ├─ github_trending.py
    │  └─ run.py            # _lookback_for_source per-source 冷启动 + 末尾 prefetch_pending_full_text() 尾步骤
